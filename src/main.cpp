@@ -5,6 +5,9 @@
 // 需要在此替换成自己的手柄蓝牙MAC地址
 XboxSeriesXControllerESP32_asukiaaa::Core
     xboxController("28:ea:0b:d9:0b:9f");
+//速度曲线
+    float B = 0.00355;
+unsigned long t0;
 
 String xbox_string()
 {
@@ -128,11 +131,21 @@ void demoVibration_2()
   delay(50);
 }
 
+// 近似 tanh 函数（泰勒展开 or 速算）
+float tanh_approx(float x) {
+  if (x < -4) return -1.0;
+  if (x > 4)  return 1.0;
+  return x * (27 + x * x) / (27 + 9 * x * x);  // 一个简单而有效的近似
+}
+
 void setup()
 {
   Serial.begin(115200);
   Serial.println("Starting NimBLE Client");
   xboxController.begin();
+  //速度曲线
+  Serial.begin(9600);
+  t0 = millis();  // 记录初始时间
 }
 
 void loop()
@@ -159,4 +172,32 @@ void loop()
       ESP.restart();
     }
   }
+
+   // 1. 获取当前时间 t（秒）
+  float t = (millis() - t0) / 1000.0;
+
+  // 2. 从模拟口读取控制量 k（0~1023 映射到 0~1）
+int triglt = xboxController.xboxNotif.trigLT;
+  float k = triglt / 1023.0;
+
+  // 3. 计算 A
+  float A = 0.7456 * k - 0.118;
+
+  float v = 0.0;
+  if (A > 0) {
+    float vmax = sqrt(A / B);
+    float alpha = sqrt(A * B);
+    v = vmax * tanh_approx(alpha * t);
+  }
+
+  // 4. 打印输出
+  Serial.print("k=");
+  Serial.print(k, 3);
+  Serial.print(", t=");
+  Serial.print(t, 2);
+  Serial.print("s, v=");
+  Serial.print(v, 3);
+  Serial.println(" m/s");
 }
+
+
