@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
+#include <cmath>
+
 
 // Required to replace with your xbox address
 // 需要在此替换成自己的手柄蓝牙MAC地址
@@ -8,6 +10,12 @@ XboxSeriesXControllerESP32_asukiaaa::Core
 //速度曲线
     float B = 0.00355;
 unsigned long t0;
+float k = 0; 
+float t = 0; 
+float v = 0; 
+
+
+
 
 String xbox_string()
 {
@@ -144,7 +152,6 @@ void setup()
   Serial.println("Starting NimBLE Client");
   xboxController.begin();
   //速度曲线
-  Serial.begin(9600);
   t0 = millis();  // 记录初始时间
 }
 
@@ -177,7 +184,7 @@ void loop()
   float t = (millis() - t0) / 1000.0;
 
   // 2. 从模拟口读取控制量 k（0~1023 映射到 0~1）
-int triglt = xboxController.xboxNotif.trigLT;
+ int triglt = xboxController.xboxNotif.trigLT;
   float k = triglt / 1023.0;
 
   // 3. 计算 A
@@ -187,17 +194,15 @@ int triglt = xboxController.xboxNotif.trigLT;
   if (A > 0) {
     float vmax = sqrt(A / B);
     float alpha = sqrt(A * B);
-    v = vmax * tanh_approx(alpha * t);
+    v = vmax * tanh(alpha * t);
   }
 
-  // 4. 打印输出
-  Serial.print("k=");
-  Serial.print(k, 3);
-  Serial.print(", t=");
-  Serial.print(t, 2);
-  Serial.print("s, v=");
-  Serial.print(v, 3);
-  Serial.println(" m/s");
+  String output = "k=" + String(k, 3) +
+                ", t=" + String(t, 2) + "s" +
+                ", v=" + String(v, 3) + " m/s";
+
+
+Serial.println(output);
+
+  delay(500);  // 每500ms更新一次
 }
-
-
