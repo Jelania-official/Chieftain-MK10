@@ -23,12 +23,6 @@ const double Kp = 2.0;
 const double Ki = 0.1;
 const double Kd = 0.5;
 
-// 定义PID变量
-double currentError = 0;
-double integral = 0;
-double derivative = 0;
-double previousError = 0;
-
 
 // 行走部分驱动引脚（输出）
 #define AIN1 25
@@ -132,6 +126,8 @@ void handleXboxController() {
     }
   } else {
     Serial.println("not connected");
+    RdriveMotor(0);//停止电机
+    LdriveMotor(0);
 
     // 如果失败次数太多，自动重启
     if (xboxController.getCountFailedConnection() > 2) {
@@ -210,13 +206,10 @@ double calculatePID(PIDController& pid, double targetSpeed, double actualSpeed) 
 
 
 //油门模拟（加倒挡）
-void simulateThrottle() {
+void simulateThrottle(float dt) {
   if (!xboxController.isConnected()) return;
 
   unsigned long currentTime = millis();
-  float dt = (currentTime - prevTime) / 1000.0;
-  if (dt <= 0) dt = 0.05;
-  prevTime = currentTime;
 
   // 读取扳机值（归一化到0~1）
   float k = xboxController.xboxNotif.trigLT / 1023.0;   // 油门（前进）
@@ -276,7 +269,7 @@ void simulateThrottle() {
 
 
 //加入转向和自转
-void updateWheelSpeed() {
+void updateWheelSpeed(float dt) {
   // 获取摇杆水平值
   int rawYaw = xboxController.xboxNotif.joyLHori; // 范围 0~65535
   float yawCenter = 32767.5;
@@ -298,9 +291,6 @@ void updateWheelSpeed() {
   float a = 1.4 * k - rollingResistance;
 
   static float spinV = 0.0;
-  float dt = (millis() - prevTime) / 1000.0;
-  if (dt <= 0) dt = 0.05;
-  prevTime = millis();
 
   spinV += a * dt;
   if (spinV > 1.22) spinV = 1.22;
@@ -329,8 +319,6 @@ void updateWheelSpeed() {
 
 //电机正反转驱动
 void RdriveMotor(double speed) {
-  // 启动 TB6612（必须 STBY=1 才能工作）
-  digitalWrite(STBY, HIGH);
 
   // 限幅
   speed = constrain(speed, -255, 255);
@@ -353,8 +341,6 @@ void RdriveMotor(double speed) {
 }
 
 void LdriveMotor(double speed) {
-  // 启动 TB6612（必须 STBY=1 才能工作）
-  digitalWrite(STBY, HIGH);
 
   // 限幅
   speed = constrain(speed, -255, 255);
@@ -423,12 +409,19 @@ void loop()
   handleXboxController();
 
 
+  //计算时间
+  unsigned long currentTime = millis();
+  float dt = (currentTime - prevTime) / 1000.0;
+  if (dt <= 0) dt = 0.05;
+  prevTime = currentTime;
+
+
  //模拟油门
-  simulateThrottle();
+  simulateThrottle(dt);
 
 
  // 更新左右轮速度目标（转向）
-  updateWheelSpeed();
+  updateWheelSpeed(dt);
 
 
  //PID 
