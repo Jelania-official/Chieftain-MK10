@@ -28,21 +28,41 @@ double derivative = 0;
 double previousError = 0;
 
 
-// PWM输出引脚
-#define pwmPin 33
+// 行走部分驱动引脚（输出）
+#define AIN1 25
+#define AIN2 26
+#define PWMA 33
+#define STBY 32  // 启动控制引脚
+
+#define BIN1 25
+#define BIN2 26
+#define PWMB 33
+
 
 /***************** 编码器参数 *****************/
 #define R1 18    // 右轮编码器引脚A
 #define R2 19    // 右轮编码器引脚B
+volatile long Rcounter = 0; // 右轮脉冲计数
+float RcurrentSpeed = 0;      // 当前转速(RPM)
+
 #define L1 18    // 右轮编码器引脚A
 #define L2 19    // 右轮编码器引脚B
-volatile long Rcounter = 0; // 右轮脉冲计数
-unsigned long lastEncoderTime = 0;
-float currentSpeed = 0;      // 当前转速(RPM)
+volatile long Lcounter = 0; // 右轮脉冲计数
+float LcurrentSpeed = 0;      // 当前转速(RPM)
+
+unsigned long RlastEncoderTime = 0;
+unsigned long LlastEncoderTime = 0;
 const int encoderPPR = 7;    // 编码器每转脉冲数
 const int gearRatio = 59;   // 减速比
 
-void IRAM_ATTR encoderISR();
+
+// PWM 通道、频率、分辨率
+#define CHANNEL_A 0  // 控制 PWMA（右轮）
+#define CHANNEL_B 1  // 控制 PWMB（左轮）
+#define PWM_FREQ 10000       // 10kHz，适合电机
+#define PWM_RESOLUTION 8     // 8位，0~255
+
+/*********************************************/
 
 
 //输出手柄输入
@@ -76,7 +96,7 @@ String xbox_string()
 
 
 // 编码器中断服务函数
-void IRAM_ATTR encoderISR() {
+void IRAM_ATTR RencoderISR() {
   if (digitalRead(R2) == HIGH) {
     Rcounter++;  // 顺时针
   } else {
@@ -84,21 +104,42 @@ void IRAM_ATTR encoderISR() {
   }
 }
 
+void IRAM_ATTR LencoderISR() {
+  if (digitalRead(L2) == HIGH) {
+    Lcounter++;  // 顺时针
+  } else {
+    Lcounter--;  // 逆时针
+  }
+}
 
 
 // 获取真实转速(RPM)
-float getSpeed() {
+float RgetSpeed() {
     unsigned long currentTime = millis();
-    unsigned long deltaTime = currentTime - lastEncoderTime;
+    unsigned long deltaTime = currentTime - RlastEncoderTime;
     
     if(deltaTime >= 100) {  // 每100ms计算一次转速
-        currentSpeed = (Rcounter / (float)encoderPPR / gearRatio) * (60000.0 / deltaTime);
+        RcurrentSpeed = (Rcounter / (float)encoderPPR / gearRatio) * (60000.0 / deltaTime);
         Rcounter = 0;
-        lastEncoderTime = currentTime;
+        RlastEncoderTime = currentTime;
     }
     
-    return currentSpeed;
+    return RcurrentSpeed;
 }
+
+float LgetSpeed() {
+    unsigned long currentTime = millis();
+    unsigned long deltaTime = currentTime - LlastEncoderTime;
+    
+    if(deltaTime >= 100) {  // 每100ms计算一次转速
+        LcurrentSpeed = (Lcounter / (float)encoderPPR / gearRatio) * (60000.0 / deltaTime);
+        Lcounter = 0;
+        LlastEncoderTime = currentTime;
+    }
+    
+    return LcurrentSpeed;
+}
+
 
 
 //PID计算
@@ -114,9 +155,9 @@ double calculatePID(double targetSpeed, double actualSpeed) {
 
     double output = Kp * currentError + Ki * integral + Kd * derivative;
 
-    // 输出限幅（0~255，对应PWM范围）
+    // 输出限幅（-255~255，对应PWM范围）
     if (output > 255) output = 255;
-    if (output < 0) output = 0;
+    if (output < -255) output = -255;
 
     return output;
 }
@@ -189,6 +230,59 @@ void handleXboxController() {
 }
 
 
+//电机正反转驱动
+void RdriveMotor(double speed) {
+  // 启动 TB6612（必须 STBY=1 才能工作）
+  digitalWrite(STBY, HIGH);
+
+  // 限幅
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0) {
+    digitalWrite(AIN1, LOW);   // 正转 AIN1=0 AIN2=1
+    digitalWrite(AIN2, HIGH);
+    ledcWrite(CHANNEL_A, speed);
+  } else if (speed < 0) {
+    digitalWrite(AIN1, HIGH);  // 反转 AIN1=1 AIN2=0
+    digitalWrite(AIN2, LOW);
+    ledcWrite(CHANNEL_A, -speed);
+
+  } else {
+    // 停止
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(CHANNEL_A, 0);
+  }
+}
+
+void LdriveMotor(double speed) {
+  // 启动 TB6612（必须 STBY=1 才能工作）
+  digitalWrite(STBY, HIGH);
+
+  // 限幅
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0) {
+    digitalWrite(BIN1, LOW);   // 正转 BIN1=0 BIN2=1
+    digitalWrite(BIN2, HIGH);
+    ledcWrite(CHANNEL_B, speed);
+  } else if (speed < 0) {
+    digitalWrite(BIN1, HIGH);  // 反转 BIN1=1 BIN2=0
+    digitalWrite(BIN2, LOW);
+    ledcWrite(CHANNEL_B, -speed);
+  } else {
+    // 停止
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+    ledcWrite(CHANNEL_B, 0);
+  }
+}
+
+
+/*************************************************/
+
+
+
 
 void setup()
 {
@@ -199,10 +293,30 @@ void setup()
     // 初始化编码器
    pinMode(R1, INPUT_PULLUP);
    pinMode(R2, INPUT_PULLUP);
-   attachInterrupt(digitalPinToInterrupt(R1), encoderISR, RISING);
+   attachInterrupt(digitalPinToInterrupt(R1), RencoderISR, RISING);
     
-    // 初始化PWM引脚
-   pinMode(pwmPin, OUTPUT);
+   pinMode(L1, INPUT_PULLUP);
+   pinMode(L2, INPUT_PULLUP);
+   attachInterrupt(digitalPinToInterrupt(L1), LencoderISR, RISING);
+
+
+    // 初始化电机驱动引脚
+   pinMode(AIN1, OUTPUT);
+   pinMode(AIN2, OUTPUT);
+   pinMode(STBY, OUTPUT);
+
+   pinMode(BIN1, OUTPUT);
+   pinMode(BIN2, OUTPUT);
+
+   digitalWrite(STBY, HIGH); // 使能芯片
+
+   // PWM 初始化
+   ledcSetup(CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
+   ledcAttachPin(PWMA, CHANNEL_A);
+
+   ledcSetup(CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
+   ledcAttachPin(PWMB, CHANNEL_B);
+
     
 }
 
@@ -214,25 +328,33 @@ void loop()
  handleXboxController();
 
 
-
  //模拟油门
   simulateThrottle();
 
 
 
  //PID 
-  float currentSpeed = getSpeed();
- double pwmOutput = calculatePID(v, currentSpeed);
- analogWrite(pwmPin, pwmOutput);
+  float RcurrentSpeed = RgetSpeed();
+  double RpwmOutput = calculatePID(Rv, RcurrentSpeed);
+  RdriveMotor(RpwmOutput);
+
+  float LcurrentSpeed = LgetSpeed();
+  double LpwmOutput = calculatePID(Lv, LcurrentSpeed);
+  LdriveMotor(LpwmOutput);
 
 
  // 调试信息
- Serial.print("转速: ");
- Serial.print(currentSpeed);
- Serial.print(" RPM | PID输出: ");
- Serial.println(pwmOutput);
+ Serial.print("右轮转速: ");
+ Serial.print(RcurrentSpeed);
+ Serial.print(" RPM | RPID输出: ");
+ Serial.println(RpwmOutput);
 
+Serial.print("左轮转速: ");
+ Serial.print(LcurrentSpeed);
+ Serial.print(" RPM | LPID输出: ");
+ Serial.println(LpwmOutput);
 
 
   delay(50);  // 每50ms更新一次
 }
+
