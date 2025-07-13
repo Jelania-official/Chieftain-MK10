@@ -1,22 +1,51 @@
 #include <Arduino.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
-#include <cmath>
+#include <Ticker.h>
+#define PI 3.1415926
 
 
-// Required to replace with your xbox address
 // 需要在此替换成自己的手柄蓝牙MAC地址
 XboxSeriesXControllerESP32_asukiaaa::Core
     xboxController("28:ea:0b:d9:0b:9f");
+
+
 //速度曲线
-    float B = 0.00355;
-unsigned long t0;
-float k = 0; 
-float t = 0; 
-float v = 0; 
+float v = 0.0;
+unsigned long prevTime = 0;
+const float vmax = 13.3; // 主战坦克极限速度
+const float brakeCoeff = 1.5;   // 刹车强度系数（建议在 1.2 ~ 2.0）
 
 
+// PID参数
+const double Kp = 2.0;
+const double Ki = 0.1;
+const double Kd = 0.5;
+
+// 定义PID变量
+double currentError = 0;
+double integral = 0;
+double derivative = 0;
+double previousError = 0;
 
 
+// PWM输出引脚
+#define pwmPin 33
+
+/***************** 编码器参数 *****************/
+#define R1 18    // 右轮编码器引脚A
+#define R2 19    // 右轮编码器引脚B
+#define L1 18    // 右轮编码器引脚A
+#define L2 19    // 右轮编码器引脚B
+volatile long Rcounter = 0; // 右轮脉冲计数
+unsigned long lastEncoderTime = 0;
+float currentSpeed = 0;      // 当前转速(RPM)
+const int encoderPPR = 7;    // 编码器每转脉冲数
+const int gearRatio = 59;   // 减速比
+
+void IRAM_ATTR encoderISR();
+
+
+//输出手柄输入
 String xbox_string()
 {
   String str = String(xboxController.xboxNotif.btnY) + "," +
@@ -40,169 +69,170 @@ String xbox_string()
                String(xboxController.xboxNotif.joyRHori) + "," +
                String(xboxController.xboxNotif.joyRVert) + "," +
                String(xboxController.xboxNotif.trigLT) + "," +
+               String(v) + "," +
                String(xboxController.xboxNotif.trigRT) + "\n";
   return str;
 };
 
-/*
-支持四种振动模式
-left：上左电机动
-right：上右电机动
-center：下左电机和下右电机一起动，频率高力量小
-shake：下左电机和下右电机一起动，频率低力量大
 
-测试结果：
-四种模式都可以调振动力度
-下左电机和下右电机是绑定的，只能一起动，但是提供了两种振动模式，个人猜测是两种模式的原理是给电机不同的电压
-可以随意搭配使用，但center和shake一起用的话执行的应该是shake
-*/
-
-// 配置参考
-// repo.v.select.center = 0;
-// repo.v.select.left = 0;
-// repo.v.select.right = 0;
-// repo.v.select.shake = 0;
-// repo.v.power.center = 0; // x% power
-// repo.v.power.left = 0;
-// repo.v.power.right = 30;
-// repo.v.power.shake = 0;
-// repo.v.timeActive = 0; // 振动 x/100 秒，最大2.56秒(uint8_t)
-// repo.v.timeSilent = 0;   // 静止 x/100 秒
-// repo.v.countRepeat = 0;  // 循环次数 x+1
-
-// 官方例程
-void demoVibration()
-{
-  XboxSeriesXHIDReportBuilder_asukiaaa::ReportBase repo;
-  Serial.println("full power for 1 sec");
-  xboxController.writeHIDReport(repo);
-  delay(2000);
-
-  repo.v.select.center = true;
-  repo.v.select.left = false;
-  repo.v.select.right = false;
-  repo.v.select.shake = false;
-  repo.v.power.center = 30; // 30% power
-  repo.v.timeActive = 50;   // 0.5 second
-  Serial.println("run center 30\% power in half second");
-  xboxController.writeHIDReport(repo);
-  delay(2000);
-
-  repo.v.select.center = false;
-  repo.v.select.left = true;
-  repo.v.power.left = 30;
-  Serial.println("run left 30\% power in half second");
-  xboxController.writeHIDReport(repo);
-  delay(2000);
-
-  repo.v.select.left = false;
-  repo.v.select.right = true;
-  repo.v.power.right = 30;
-  Serial.println("run right 30\% power in half second");
-  xboxController.writeHIDReport(repo);
-  delay(2000);
-
-  repo.v.select.right = false;
-  repo.v.select.shake = true;
-  repo.v.power.shake = 30;
-  Serial.println("run shake 30\% power in half second");
-  xboxController.writeHIDReport(repo);
-  delay(2000);
-
-  repo.v.select.shake = false;
-  repo.v.select.center = true;
-  repo.v.power.center = 50;
-  repo.v.timeActive = 20;
-  repo.v.timeSilent = 20;
-  repo.v.countRepeat = 2;
-  Serial.println("run center 50\% power in 0.2 sec 3 times");
-  xboxController.writeHIDReport(repo);
-  delay(2000);
+// 编码器中断服务函数
+void IRAM_ATTR encoderISR() {
+  if (digitalRead(R2) == HIGH) {
+    Rcounter++;  // 顺时针
+  } else {
+    Rcounter--;  // 逆时针
+  }
 }
 
-// 振动反馈，根据扳机按压力度调整振动力度
-void demoVibration_2()
-{
-  XboxSeriesXHIDReportBuilder_asukiaaa::ReportBase repo;
-  static uint16_t TrigMax = XboxControllerNotificationParser::maxTrig;
-  String str_1;
-  repo.setAllOff();
-  repo.v.select.left = true;
-  repo.v.select.right = true;
-  repo.v.power.left = (uint8_t)((float)xboxController.xboxNotif.trigLT / (float)TrigMax * 100);
-  repo.v.power.right = (uint8_t)((float)xboxController.xboxNotif.trigRT / (float)TrigMax * 100);
-  repo.v.timeActive = 50;
-  xboxController.writeHIDReport(repo);
-  str_1 = String(repo.v.power.left) + "," + String(repo.v.power.right) + "\n";
 
-  Serial.print(str_1);
-  delay(50);
+
+// 获取真实转速(RPM)
+float getSpeed() {
+    unsigned long currentTime = millis();
+    unsigned long deltaTime = currentTime - lastEncoderTime;
+    
+    if(deltaTime >= 100) {  // 每100ms计算一次转速
+        currentSpeed = (Rcounter / (float)encoderPPR / gearRatio) * (60000.0 / deltaTime);
+        Rcounter = 0;
+        lastEncoderTime = currentTime;
+    }
+    
+    return currentSpeed;
 }
 
-// 近似 tanh 函数（泰勒展开 or 速算）
-float tanh_approx(float x) {
-  if (x < -4) return -1.0;
-  if (x > 4)  return 1.0;
-  return x * (27 + x * x) / (27 + 9 * x * x);  // 一个简单而有效的近似
+
+//PID计算
+double calculatePID(double targetSpeed, double actualSpeed) {
+    currentError = targetSpeed - actualSpeed;
+
+    integral += currentError;
+    if (integral > 1000) integral = 1000;
+    if (integral < -1000) integral = -1000;
+
+    double derivative = currentError - previousError;
+    previousError = currentError;
+
+    double output = Kp * currentError + Ki * integral + Kd * derivative;
+
+    // 输出限幅（0~255，对应PWM范围）
+    if (output > 255) output = 255;
+    if (output < 0) output = 0;
+
+    return output;
 }
+
+
+//模拟油门
+void simulateThrottle() {
+  if (!xboxController.isConnected()) return;
+
+  unsigned long currentTime = millis();
+  float dt = (currentTime - prevTime) / 1000.0;
+  if (dt <= 0) dt = 0.05;
+  prevTime = currentTime;
+
+  // 输入控制量
+  float k = xboxController.xboxNotif.trigLT / 1023.0;   // 推进
+  float brake = xboxController.xboxNotif.trigRT / 1023.0; // 刹车
+
+  // 推力为非线性：油门深度越大，推力非线性上升
+  float k_adj = pow(k, 2.0);
+
+  // 低速滚阻：速度越低，滚阻越大（模拟履带 + 慢起步）
+  float rollingResistance = (v < 4.0) ? 0.5 : 0.338;
+
+  // 加速度公式（推力 - 阻力 - 滚阻 - 刹车）
+  float a = 1.4 * k_adj - 0.006 * v * v - rollingResistance - brakeCoeff * brake;
+
+  // 更新速度
+  v = v + a * dt;
+
+  // 限制最低速度为0
+  if (v < 0) v = 0;
+
+  // 限制最高速度
+  if (v > vmax) v = vmax;
+
+  // 打印输出
+  String output = "k=" + String(k, 3) +
+                  ", brake=" + String(brake, 3) +
+                  ", a=" + String(a, 3) +
+                  ", v=" + String(v, 3) + " m/s";
+  Serial.println(output);
+}
+
+
+// 手柄通信维护
+void handleXboxController() {
+ 
+  xboxController.onLoop();
+
+  // 判断是否连接成功
+  if (xboxController.isConnected()) {
+    if (xboxController.isWaitingForFirstNotification()) {
+      Serial.println("waiting for first notification");
+    } else {
+      Serial.print(xbox_string());
+
+      // 可选功能：振动演示
+      // demoVibration();
+      // demoVibration_2();
+    }
+  } else {
+    Serial.println("not connected");
+
+    // 如果失败次数太多，自动重启
+    if (xboxController.getCountFailedConnection() > 2) {
+      ESP.restart();
+    }
+  }
+}
+
+
 
 void setup()
 {
   Serial.begin(115200);
   Serial.println("Starting NimBLE Client");
   xboxController.begin();
-  //速度曲线
-  t0 = millis();  // 记录初始时间
+
+    // 初始化编码器
+   pinMode(R1, INPUT_PULLUP);
+   pinMode(R2, INPUT_PULLUP);
+   attachInterrupt(digitalPinToInterrupt(R1), encoderISR, RISING);
+    
+    // 初始化PWM引脚
+   pinMode(pwmPin, OUTPUT);
+    
 }
+
+
 
 void loop()
 {
-  xboxController.onLoop();
-  if (xboxController.isConnected())
-  {
-    if (xboxController.isWaitingForFirstNotification())
-    {
-      Serial.println("waiting for first notification");
-    }
-    else
-    {
-      Serial.print(xbox_string());
-      // demoVibration();
-      // demoVibration_2();
-    }
-  }
-  else
-  {
-    Serial.println("not connected");
-    if (xboxController.getCountFailedConnection() > 2)
-    {
-      ESP.restart();
-    }
-  }
-
-   // 1. 获取当前时间 t（秒）
-  float t = (millis() - t0) / 1000.0;
-
-  // 2. 从模拟口读取控制量 k（0~1023 映射到 0~1）
- int triglt = xboxController.xboxNotif.trigLT;
-  float k = triglt / 1023.0;
-
-  // 3. 计算 A
-  float A = 0.7456 * k - 0.118;
-
-  float v = 0.0;
-  if (A > 0) {
-    float vmax = sqrt(A / B);
-    float alpha = sqrt(A * B);
-    v = vmax * tanh(alpha * t);
-  }
-
-  String output = "k=" + String(k, 3) +
-                ", t=" + String(t, 2) + "s" +
-                ", v=" + String(v, 3) + " m/s";
+ //  管理手柄通信和按键数据
+ handleXboxController();
 
 
-Serial.println(output);
 
-  delay(500);  // 每500ms更新一次
+ //模拟油门
+  simulateThrottle();
+
+
+
+ //PID 
+  float currentSpeed = getSpeed();
+ double pwmOutput = calculatePID(v, currentSpeed);
+ analogWrite(pwmPin, pwmOutput);
+
+
+ // 调试信息
+ Serial.print("转速: ");
+ Serial.print(currentSpeed);
+ Serial.print(" RPM | PID输出: ");
+ Serial.println(pwmOutput);
+
+
+
+  delay(50);  // 每50ms更新一次
 }
