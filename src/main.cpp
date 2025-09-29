@@ -10,8 +10,9 @@ XboxSeriesXControllerESP32_asukiaaa::Core
 
 
 //速度曲线
-float Rv = 0.0;
+float v = 0.0;
 float Lv = 0.0;
+float Rv = 0.0;
 
 unsigned long prevTime = 0;
 const float vmax = 14.5; // 主战坦克极限速度
@@ -28,11 +29,10 @@ const double Kd = 0.5;
 #define AIN1 25
 #define AIN2 26
 #define PWMA 33
-#define STBY 32  // 启动控制引脚
 
-#define BIN1 25
-#define BIN2 26
-#define PWMB 33
+#define BIN1 27
+#define BIN2 14
+#define PWMB 32
 
 
 /***************** 编码器参数 *****************/
@@ -41,8 +41,8 @@ const double Kd = 0.5;
 volatile long Rcounter = 0; // 右轮脉冲计数
 float RcurrentSpeed = 0;      // 当前转速(RPM)
 
-#define L1 18    // 右轮编码器引脚A
-#define L2 19    // 右轮编码器引脚B
+#define L1 21    // 左轮编码器引脚A
+#define L2 22    // 左轮编码器引脚B
 volatile long Lcounter = 0; // 右轮脉冲计数
 float LcurrentSpeed = 0;      // 当前转速(RPM)
 
@@ -102,7 +102,7 @@ String xbox_string()
                String(xboxController.xboxNotif.joyRHori) + "," +
                String(xboxController.xboxNotif.joyRVert) + "," +
                String(xboxController.xboxNotif.trigLT) + "," +
-               String(Rv) + "," +
+               String(v) + "," +
                String(xboxController.xboxNotif.trigRT) + "\n";
   return str;
 };
@@ -118,7 +118,6 @@ void handleXboxController() {
     if (xboxController.isWaitingForFirstNotification()) {
       Serial.println("waiting for first notification");
     } else {
-      Serial.print(xbox_string());
 
       // 可选功能：振动演示
       // demoVibration();
@@ -126,8 +125,6 @@ void handleXboxController() {
     }
   } else {
     Serial.println("not connected");
-    RdriveMotor(0);//停止电机
-    LdriveMotor(0);
 
     // 如果失败次数太多，自动重启
     if (xboxController.getCountFailedConnection() > 2) {
@@ -216,7 +213,7 @@ void simulateThrottle(float dt) {
   float brake = xboxController.xboxNotif.trigRT / 1023.0; // 刹车（右扳机）
 
   // 判断是否静止（速度非常小）
-  bool isStopped = (Rv < 0.1);
+  bool isStopped = (v < 0.1);
 
   // 判断右扳机是否超过阈值
   if (brake > rtThreshold) {
@@ -236,26 +233,26 @@ void simulateThrottle(float dt) {
 
   // 根据是否倒车模式计算加速度和速度
   float k_adj = pow(k, 2.0);
-  float rollingResistance = (abs(Rv) < 3.0) ? 0.5 : 0.338;// 低速滚阻：速度越低，滚阻越大（模拟履带 + 慢起步）
+  float rollingResistance = (abs(v) < 3.0) ? 0.5 : 0.338;// 低速滚阻：速度越低，滚阻越大（模拟履带 + 慢起步）
   float a = 0.0;
 
   if (!reverseMode) {
     // 正常前进模式
-    a = 1.4 * k_adj - 0.006 * Rv * Rv - rollingResistance - brakeCoeff * brake;// 加速度公式（推力 - 阻力 - 滚阻 - 刹车）
-    if (Rv < 0.5) a *= 0.5;  // 起步迟钝
-    Rv = Rv + a * dt;
-    if (Rv < 0) Rv = 0;
-    if (Rv > vmax) Rv = vmax;
+    a = 1.4 * k_adj - 0.006 * v * v - rollingResistance - brakeCoeff * brake;// 加速度公式（推力 - 阻力 - 滚阻 - 刹车）
+    if (v < 0.5) a *= 0.5;  // 起步迟钝
+    v = v + a * dt;
+    if (v < 0) v = 0;
+    if (v > vmax) v = vmax;
   } else {
     // 倒车模式：加速度用同样公式，但油门变成倒车时的刹车，速度取负值表示倒车
     // 注意此时k（油门）不再代表推力，而是“倒车时的刹车”，即用k替代brake
     // 这里做个简单处理：用k代替刹车，推力为负方向
-    a = 1.4 * pow(brake, 2.0) - 0.006 * Rv * Rv - rollingResistance - brakeCoeff * k; 
-    if (Rv > -reverseVmax) {
-      Rv = Rv + a * dt;
-      if (Rv < -reverseVmax) Rv = -reverseVmax;
+    a = -1.4 * pow(brake, 2.0) + 0.006 * v * v + rollingResistance + brakeCoeff * k; 
+    if (v > -reverseVmax) {
+      v = v + a * dt;
+      if (v < -reverseVmax) v = -reverseVmax;
     }
-    if (Rv > 0) Rv = 0; // 倒车时速度不能正
+    if (v > 0) v = 0; // 倒车时速度不能正
   }
 
   // 输出调试信息
@@ -263,7 +260,7 @@ void simulateThrottle(float dt) {
                   ", LT=" + String(k, 3) +
                   ", RT=" + String(brake, 3) +
                   ", a=" + String(a, 3) +
-                  ", Rv=" + String(Rv, 3) + " m/s";
+                  ", v=" + String(v, 3) + " m/s";
   Serial.println(output);
 }
 
@@ -282,7 +279,7 @@ void updateWheelSpeed(float dt) {
   }
 
   // 判断是否进入原地转向模式
-  bool isSpinMode = abs(Rv) < 0.1 && abs(yaw) > 0.2;
+  bool isSpinMode = abs(v) < 0.1 && abs(yaw) > 0.2;
 
   if (isSpinMode) {
   // 原地转向逻辑：摇杆偏移量决定转速大小
@@ -305,13 +302,13 @@ void updateWheelSpeed(float dt) {
     float turnRatio = constrain(yaw, -1.0, 1.0);
     float turnFactor = 0.5; // 可调差速比例（建议在 0.4~0.7）
 
-    Lv = Rv * (1.0 - turnFactor * turnRatio); // 左履带
-    Rv = Rv * (1.0 + turnFactor * turnRatio); // 右履带
+    Lv = v * (1.0 - turnFactor * turnRatio); // 左履带
+    Rv = v * (1.0 + turnFactor * turnRatio); // 右履带
 
     // 限速处理，避免某侧履带速度超过 vmax
     float maxV = reverseMode ? reverseVmax : vmax;
     Lv = constrain(Lv, -maxV, maxV);
-    Rv = constrain(Rv, -maxV, maxV);
+    Rv = constrain(v, -maxV, maxV);
   }
 }
 
@@ -384,12 +381,9 @@ void setup()
     // 初始化电机驱动引脚
    pinMode(AIN1, OUTPUT);
    pinMode(AIN2, OUTPUT);
-   pinMode(STBY, OUTPUT);
 
    pinMode(BIN1, OUTPUT);
    pinMode(BIN2, OUTPUT);
-
-   digitalWrite(STBY, HIGH); // 使能芯片
 
    // PWM 初始化
    ledcSetup(CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
@@ -397,8 +391,6 @@ void setup()
 
    ledcSetup(CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
    ledcAttachPin(PWMB, CHANNEL_B);
-
-    
 }
 
 
