@@ -62,7 +62,7 @@ const float wheelRPMToSpeed = 13.3 / 540.0;  // ≈ 0.02463 m/s per RPM
 //加入倒车
 bool reverseMode = false;           // 是否倒车模式
 unsigned long rtPressedStartTime = 0; // 右扳机按下开始时间（毫秒）
-const float rtThreshold = 0.5;      // 右扳机按下阈值（0~1之间）
+const float rtThreshold = 0.2;      // 右扳机按下阈值（0~1之间）
 const unsigned long rtHoldDuration = 2000; // 持续按下时间，单位ms（2秒）
 const float reverseVmax = 6.0;  // 倒车限速6 m/s
 
@@ -226,10 +226,11 @@ void simulateThrottle(float dt) {
       }
     }
   } else {
-    // 右扳机松开，清空计时，退出倒车模式
+    // 右扳机松开，清空计时
     rtPressedStartTime = 0;
-    reverseMode = false;
-  }
+if (reverseMode && k > rtThreshold) {
+  reverseMode = false;
+}  }   //再次按左扳机，退出倒车
 
   // 根据是否倒车模式计算加速度和速度
   float k_adj = pow(k, 2.0);
