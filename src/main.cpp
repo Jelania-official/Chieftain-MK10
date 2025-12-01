@@ -1,7 +1,11 @@
 #include <Arduino.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include <Ticker.h>
+#include <math.h>
+#include <HardwareSerial.h>
 #define PI 3.1415926
+#include "AS201.h"
+
 
 
 // 需要在此替换成自己的手柄蓝牙MAC地址
@@ -23,7 +27,8 @@ const float brakeCoeff = 1.5;   // 刹车强度系数（建议在 1.2 ~ 2.0）
 const double Kp = 2.0;
 const double Ki = 0.1;
 const double Kd = 0.5;
-
+double RpwmOutput = 0;
+double LpwmOutput = 0;
 
 // 行走部分驱动引脚（输出）
 #define AIN1 25
@@ -74,6 +79,13 @@ struct PIDController {
 PIDController pidR;
 PIDController pidL;
 
+
+//双稳
+AS201 imu_chassis(16, 17, Serial2);  // 车体 IMU
+AS201 imu_turret(4, 5, Serial1);     // 炮塔 IMU
+
+SensorData* chassisData;  
+SensorData* turretData;  
 
 /*********************************************/
 
@@ -228,7 +240,7 @@ void simulateThrottle(float dt) {
   } else {
     // 右扳机松开，清空计时
     rtPressedStartTime = 0;
-if (reverseMode && k > rtThreshold) {
+if (v > -0.1 && reverseMode && k > rtThreshold) {
   reverseMode = false;
 }  }   //再次按左扳机，退出倒车
 
@@ -249,10 +261,10 @@ if (reverseMode && k > rtThreshold) {
     // 注意此时k（油门）不再代表推力，而是“倒车时的刹车”，即用k替代brake
     // 这里做个简单处理：用k代替刹车，推力为负方向
     a = -1.4 * pow(brake, 2.0) + 0.006 * v * v + rollingResistance + brakeCoeff * k; 
-    if (v > -reverseVmax) {
-      v = v + a * dt;
-      if (v < -reverseVmax) v = -reverseVmax;
-    }
+     
+    v = v + a * dt;
+    if (v < -reverseVmax) v = -reverseVmax;
+    
     if (v > 0) v = 0; // 倒车时速度不能正
   }
 
@@ -369,29 +381,39 @@ void setup()
   Serial.println("Starting NimBLE Client");
   xboxController.begin();
 
-    // 初始化编码器
-   pinMode(R1, INPUT_PULLUP);
-   pinMode(R2, INPUT_PULLUP);
-   attachInterrupt(digitalPinToInterrupt(R1), RencoderISR, RISING);
+  // 初始化编码器
+  pinMode(R1, INPUT_PULLUP);
+  pinMode(R2, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(R1), RencoderISR, RISING);
     
-   pinMode(L1, INPUT_PULLUP);
-   pinMode(L2, INPUT_PULLUP);
-   attachInterrupt(digitalPinToInterrupt(L1), LencoderISR, RISING);
+  pinMode(L1, INPUT_PULLUP);
+  pinMode(L2, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(L1), LencoderISR, RISING);
 
 
-    // 初始化电机驱动引脚
-   pinMode(AIN1, OUTPUT);
-   pinMode(AIN2, OUTPUT);
+  // 初始化电机驱动引脚
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
 
-   pinMode(BIN1, OUTPUT);
-   pinMode(BIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
 
-   // PWM 初始化
-   ledcSetup(CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
-   ledcAttachPin(PWMA, CHANNEL_A);
+  // PWM 初始化
+  ledcSetup(CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(PWMA, CHANNEL_A);
 
-   ledcSetup(CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
-   ledcAttachPin(PWMB, CHANNEL_B);
+  ledcSetup(CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(PWMB, CHANNEL_B);
+  
+  // 初始化双稳
+  imu_chassis.begin(115200);
+  imu_turret.begin(115200);
+
+  // 将全局引用指向 IMU 内部 data
+  chassisData = &imu_chassis.getData();
+  turretData  = &imu_turret.getData();
+
+
 }
 
 
@@ -408,7 +430,7 @@ void loop()
   if (dt <= 0) dt = 0.05;
   prevTime = currentTime;
 
-
+ if (xboxController.isConnected() && !xboxController.isWaitingForFirstNotification()) {
  //模拟油门
   simulateThrottle(dt);
 
@@ -419,15 +441,26 @@ void loop()
 
  //PID 
   float RcurrentSpeed = RgetSpeed();
-  double RpwmOutput = calculatePID(pidR, Rv, RcurrentSpeed);
+  RpwmOutput = calculatePID(pidR, Rv, RcurrentSpeed);
   RdriveMotor(RpwmOutput);
 
   float LcurrentSpeed = LgetSpeed();
-  double LpwmOutput = calculatePID(pidL, Lv, LcurrentSpeed);
+  LpwmOutput = calculatePID(pidL, Lv, LcurrentSpeed);
   LdriveMotor(LpwmOutput);
+ }
+else {
+  // 未连接时强制停止所有电机
+    v = 0; Lv = 0; Rv = 0;
+    RdriveMotor(0);
+    LdriveMotor(0);
+    
+  // 重置PID积分项，避免积分饱和
+    pidR.integral = 0;
+    pidL.integral = 0;
+    pidR.previousError = 0;
+    pidL.previousError = 0;}
 
-
- // 调试信息
+  // 调试信息
  Serial.print("右轮转速: ");
  Serial.print(RcurrentSpeed);
  Serial.print(" RPM | RPID输出: ");
@@ -438,6 +471,9 @@ void loop()
  Serial.print(" RPM | LPID输出: ");
  Serial.println(LpwmOutput);
 
+  // 双稳数据更新
+  imu_chassis.update();
+  imu_turret.update();
 
   delay(50);  // 每50ms更新一次
 }
