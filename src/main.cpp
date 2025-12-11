@@ -6,6 +6,8 @@
 #define PI 3.1415926
 #include "AS201.h"
 #include <Servo.h>
+#include <SimpleFOC.h>
+
 
 
 
@@ -74,12 +76,12 @@ const float wheelRPMToSpeed = 13.3 / 540.0;  // ≈ 0.02463 m/s per RPM
 const float reverseVmax = 6.0;  // 倒车限速6 m/s
 
 
-struct PIDController {
+struct motorPID {
   double previousError = 0.0;
   double integral = 0.0;
 };
-  PIDController pidR;
-PIDController pidL;
+  motorPID pidR;
+motorPID pidL;
 
 
 //双稳
@@ -114,6 +116,7 @@ const float pitchMaxVel = 40.0;
   // 输入角度范围（单位：度）
   const float ANGLE_MIN = 0.0;
   const float ANGLE_MAX = 180.0;
+  float servo_center_angle = 90.0; // 舵机实际中位
 
   // 对应舵机 PWM 范围（单位：微秒）
   // 根据产品规格，通常数字舵机 PWM: 1000~2000us 对应 0~180°
@@ -122,13 +125,115 @@ const float pitchMaxVel = 40.0;
 
   // 如果目标角度和舵机角度存在偏差，可调整校准参数
   float angleOffset = 0.0;      // 角度偏移，用于零点校准
-float angleScale  = 1.0;      // 线性比例系数，用于非 1:1 映射
+  float angleScale  = 1.0;      // 线性比例系数，用于非 1:1 映射
+
+  // ---------------- PID 参数 ----------------
+  // 位置环
+  float P_pos = 2.0;
+  float I_pos = 0.0;
+  float D_pos = 0.2;
+
+  // 速度环
+  float P_vel = 1.2;
+  float I_vel = 0.0;
+  float D_vel = 0.05;
+
+  // PID 状态变量
+  float pos_err_last = 0;
+  float vel_err_last = 0;
+  float pos_int = 0;
+float vel_int = 0;
+
+
+//无刷电机控制
+  // ======================================================
+  //                串级 PID 结构体与函数
+  // ======================================================
+  
+  // 单级 PID 结构体
+  typedef struct
+  {
+    float kp, ki, kd;
+    float error, lastError;
+    float integral, maxIntegral;
+    float output, maxOutput;
+  } PID;
+
+  // 串级 PID 结构体
+  typedef struct
+  {
+    PID outer;    // 位置环
+    PID inner;    // 速度环
+    float output; // 最终 Uq 电压
+  } CascadePID;
+
+  // 初始化单级 PID
+  void PID_Init(PID *pid, float p, float i, float d, float maxI, float maxOut)
+  {
+    pid->kp = p;
+    pid->ki = i;
+    pid->kd = d;
+    pid->error = pid->lastError = 0;
+    pid->integral = 0;
+    pid->maxIntegral = maxI;
+    pid->maxOutput = maxOut;
+    pid->output = 0;
+  }
+
+  // 一次 PID 计算
+  void PID_Calc(PID *pid, float ref, float fdb, float dt)
+  {
+    pid->lastError = pid->error;
+    pid->error = ref - fdb;
+    float P = pid->kp * pid->error;
+    pid->integral += pid->ki * pid->error;
+    // 积分限幅
+    if (pid->integral > pid->maxIntegral)
+        pid->integral = pid->maxIntegral;
+    if (pid->integral < -pid->maxIntegral)
+        pid->integral = -pid->maxIntegral;
+    float I = pid->integral;
+    float D = pid->kd * (pid->error - pid->lastError)/dt;
+    pid->output = P + I + D;
+    // 输出限幅
+    if (pid->output > pid->maxOutput)
+        pid->output = pid->maxOutput;
+    if (pid->output < -pid->maxOutput)
+        pid->output = -pid->maxOutput;
+  }
+
+  // 串级调用
+  void PID_CascadeCalc(CascadePID *cp, float posRef, float posFdb, float velFdb,float dt)
+  {
+    PID_Calc(&cp->outer, posRef, posFdb, dt);
+    PID_Calc(&cp->inner, cp->outer.output, velFdb, dt);
+    cp->output = cp->inner.output;
+  }
+
+  // ======================================================
+  //               SimpleFOC + IMU 双环控制参数
+  // ======================================================
+
+  // ---- 驱动管脚，根据你的情况修改 ----
+  const int pinPWM_A = 32;
+  const int pinPWM_B = 33;
+  const int pinPWM_C = 25;
+  const int pinEn    = 12;
+
+  // ---- SimpleFOC 对象 ----
+  BLDCMotor motor = BLDCMotor(7); // 7 极对数
+  BLDCDriver3PWM driver = BLDCDriver3PWM(pinPWM_A, pinPWM_B, pinPWM_C, pinEn);
+  MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+
+  // ---- 串级 PID 实例 ----
+  CascadePID yawPID;
+
 
 
 
 //输出手柄输入
-String xbox_string()
-{
+  String xbox_string()
+  {
   String str = String(xboxController.xboxNotif.btnY) + "," +
                String(xboxController.xboxNotif.btnX) + "," +
                String(xboxController.xboxNotif.btnB) + "," +
@@ -184,15 +289,15 @@ void handleXboxController() {
   }
 }
 
-// 编码器中断服务函数
-  void IRAM_ATTR RencoderISR() {
+// 编码器中断服务程序
+void IRAM_ATTR RencoderISR() {
   bool a = digitalRead(R1);
   bool b = digitalRead(R2);
   if (a == b) Rcounter++;
   else Rcounter--;
-  }
+}
 
-  void IRAM_ATTR LencoderISR() {
+void IRAM_ATTR LencoderISR() {
   bool a = digitalRead(L1);
   bool b = digitalRead(L2);
   if (a == b) Lcounter--;
@@ -209,8 +314,8 @@ float RgetSpeed() {
     Rcounter = 0;
     RlastEncoderTime = currentTime;
   }
-  float RlinearSpeed = RRPM * wheelRPMToSpeed;
-  return RlinearSpeed;
+  float RWheelSpeed = RRPM * wheelRPMToSpeed;
+  return RWheelSpeed;
 }
 
 float LgetSpeed() {
@@ -222,13 +327,14 @@ float LgetSpeed() {
       Lcounter = 0;
       LlastEncoderTime = currentTime;
     }
-    float LlinearSpeed = LRPM * wheelRPMToSpeed;
-    return LlinearSpeed;
+    float LWhellSpeed = LRPM * wheelRPMToSpeed;
+    return LWhellSpeed;
 }
 
 //PID计算
-double calculatePID(PIDController& pid, double targetSpeed, double actualSpeed, double dt) {
+double motor_calculatePID(motorPID& pid, double targetSpeed, double actualSpeed, double dt) {
   if (dt <= 0) dt = 0.001; // 防护
+  if (abs(targetSpeed) < 0.015) targetSpeed = 0;
   double currentError = targetSpeed - actualSpeed;
   pid.integral += currentError * dt;  // 积分按时间累加
 
@@ -250,7 +356,7 @@ double calculatePID(PIDController& pid, double targetSpeed, double actualSpeed, 
 
 
 //油门模拟（加倒挡）
-void simulateThrottle(float dt) {
+  void simulateThrottle(float dt) {
   if (!xboxController.isConnected()) return;
 
   unsigned long currentTime = millis();
@@ -313,7 +419,7 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
 }
 
 //加入转向和自转
-void updateWheelSpeed(float dt) {
+  void updateWheelSpeed(float dt) {
   // 获取摇杆水平值
   int rawYaw = xboxController.xboxNotif.joyLHori; // 范围 0~65535
   float yawCenter = 32767.5;
@@ -358,7 +464,7 @@ void updateWheelSpeed(float dt) {
 }
 
 //电机正反转驱动
-void RdriveMotor(double speed) {
+  void RdriveMotor(double speed) {
 
   // 限幅
   speed = constrain(speed, -255, 255);
@@ -380,7 +486,7 @@ void RdriveMotor(double speed) {
   }
 }
 
-void LdriveMotor(double speed) {
+  void LdriveMotor(double speed) {
 
   // 限幅
   speed = constrain(speed, -255, 255);
@@ -388,11 +494,11 @@ void LdriveMotor(double speed) {
   if (speed < 0) {
     digitalWrite(BIN1, LOW);   // 反转 BIN1=0 BIN2=1
     digitalWrite(BIN2, HIGH);
-    ledcWrite(CHANNEL_B, speed);
+    ledcWrite(CHANNEL_B, -speed);
   } else if (speed > 0) {
     digitalWrite(BIN1, HIGH);  // 轮子正转 BIN1=1 BIN2=0
     digitalWrite(BIN2, LOW);
-    ledcWrite(CHANNEL_B, -speed);
+    ledcWrite(CHANNEL_B, speed);
   } else {
     // 停止
     digitalWrite(BIN1, LOW);
@@ -402,7 +508,7 @@ void LdriveMotor(double speed) {
 }
 
 // A 键按下 → 切换双稳开关 → 如果是 ON 则保存炮闩IMU角度，右摇杆控制 + 灵敏度调节
-void GunPosition(bool A_pressed, float dt)
+  void GunPosition(bool A_pressed, float dt)
 {
     // 上升沿触发：上次未按，这次按下
     if (A_pressed && !lastAState) {
@@ -490,24 +596,84 @@ void GunPosition(bool A_pressed, float dt)
 }
 
 // 舵机控制初始化
-void initPitchServo(int pin) {
+  void initPitchServo(int pin) {
     pitchServo.attach(pin);  // 连接舵机信号线
 }
 
-// 舵机控制函数 输入：目标角度 targetAngle 输出：PWM 控制舵机
-void setPitchAngle(float targetAngle) {
-    // 1. 校准和比例调整
-    float calibratedAngle = (targetAngle + angleOffset) * angleScale;
+//舵机控制：双环 PID 角度范围 -10°～30° 中位角度 = 0°
+  void ServoPID(float dt)
+{
+    // -------- 1. 读取 IMU pitch 和 pitch 角速度（X轴）--------
+    float pitch_turret  = turretData->pitch;
+    float pitch_chassis = chassisData->pitch;
 
-    // 2. 限制角度在舵机可行范围内
-    if (calibratedAngle < ANGLE_MIN) calibratedAngle = ANGLE_MIN;
-    if (calibratedAngle > ANGLE_MAX) calibratedAngle = ANGLE_MAX;
+    float gyro_chassis = chassisData->gx;
+    float gyro_turret  = turretData->gx;
 
-    // 3. 映射到 PWM 输出
+    // -------- 2. 位置环：角度误差 --------
+    float err_pos = turret_saved_pitch - pitch_turret;
+
+    pos_int += err_pos * dt;
+    float d_pos = (err_pos - pos_err_last) / dt;
+    pos_err_last = err_pos;
+
+    float u_pos = P_pos * err_pos + I_pos * pos_int + D_pos * d_pos;
+
+    // -------- 3. 速度环目标 = 抵消车体角速度 + 位置环输出 --------
+    float target_vel = -gyro_chassis + u_pos;
+
+    // -------- 4. 速度环：速度误差 --------
+    float err_vel = target_vel - gyro_turret;
+
+    vel_int += err_vel * dt;
+    float d_vel = (err_vel - vel_err_last) / dt;
+    vel_err_last = err_vel;
+
+    float u_vel = P_vel * err_vel + I_vel * vel_int + D_vel * d_vel;
+
+    // -------- 5. 将速度输出转换为角度输出（内部单位：度）--------
+    static float controlAngle = 0.0;   // 0° = 舵机中位
+    controlAngle += u_vel * dt;
+
+    // 限制控制范围（你要求：-10° 到 30°）
+    controlAngle = constrain(controlAngle, -10.0f, 30.0f);
+
+    // -------- 6. 将 -10~30° 转换为舵机 PWM --------
+    // 这里我们假设舵机中位是 PWM 中值(1500us)
+    float servoAnglePhysical = controlAngle + servo_center_angle;  
+    // 示例：servo_center_angle = 90°
+
+    // 校准参数处理
+    float calibratedAngle = (servoAnglePhysical + angleOffset) * angleScale;
+
+    // 限舵机物理范围
+    calibratedAngle = constrain(calibratedAngle, ANGLE_MIN, ANGLE_MAX);
+
+    // 转换 PWM
     int pwm = map(calibratedAngle, ANGLE_MIN, ANGLE_MAX, PWM_MIN, PWM_MAX);
 
-    // 4. 写入舵机
+    // 如果双稳关闭，控制角度归零
+    if(!switchState) controlAngle = 0;
+
+
+    // 输出
     pitchServo.writeMicroseconds(pwm);
+}
+
+
+// 无刷电机 yaw 稳定器更新函数
+  void YawStabilizer(float turretYaw, float chassisGyro, float targetYawDeg, float dt)
+{
+    // ---- 1) 角度输入处理 ----
+    float posRef = targetYawDeg * DEG_TO_RAD; // 目标角度（rad）
+    float posFdb = turretYaw;                 // 炮塔 yaw（rad）
+    float velFdb = chassisGyro;               // 车体 yaw 角速度（rad/s）
+
+    // ---- 2) 串级 PID ----
+    PID_CascadeCalc(&yawPID, posRef, posFdb, velFdb, dt);
+
+    // ---- 3) 输出给 SimpleFOC torque 模式 ----
+    motor.target = yawPID.output;  // Uq 电压
 }
 
 
@@ -517,7 +683,6 @@ void setPitchAngle(float targetAngle) {
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("Starting NimBLE Client");
   xboxController.begin();
 
   // 初始化编码器
@@ -556,6 +721,55 @@ void setup()
   // 初始化舵机
   initPitchServo(13); // 舵机信号接在 GPIO13
 
+  // 无刷电机控制初始化
+    // ========== SimpleFOC 初始化 ==========
+    // 1) 驱动初始化
+    driver.voltage_power_supply = 12.0;
+    driver.init();
+
+    // 2) 传感器初始化
+    sensor.init();
+    motor.linkSensor(&sensor);
+
+    // 3) 链接驱动与电机
+    motor.linkDriver(&driver);
+    motor.voltage_limit = 12.0;
+
+    // 4) 选择 torque 模式，不使用库内置 PID
+    motor.controller = MotionControlType::torque;
+    // 禁掉库内速度 PI，避免与您的 inner PID 干扰
+    motor.PID_velocity.P = 0;
+    motor.PID_velocity.I = 0;
+    motor.PID_velocity.D = 0;
+    motor.LPF_velocity.Tf = 0.01; // 低通滤波时间常数
+
+    // 5) FOC 初始化
+    motor.init();
+    motor.initFOC();
+
+
+    // ========== 串级 PID 参数 ==========
+    // 外环：位置 → 输出目标角速度(rad/s)
+    PID_Init(&yawPID.outer,
+      6.0,     // kp
+      0.0,     // ki
+      0.5,     // kd
+      0.0,     // max I
+    20.0);   // max output rad/s
+
+    // 内环：角速度 → 输出力矩电压
+    PID_Init(&yawPID.inner,
+      0.3,     // kp
+      0.01,    // ki
+      0.0,     // kd
+      3.0,     // max I
+    6.0);    // max Uq
+
+
+
+
+
+
 }
 
 
@@ -590,11 +804,11 @@ void loop()
 
     //PID 
     RcurrentSpeed = RgetSpeed();
-    ROutput = calculatePID(pidR, Rv, RcurrentSpeed, dt);
+    ROutput = motor_calculatePID(pidR, Rv, RcurrentSpeed, dt);
     RdriveMotor(ROutput);
 
     LcurrentSpeed = LgetSpeed();
-    LOutput = calculatePID(pidL, Lv, LcurrentSpeed, dt);
+    LOutput = motor_calculatePID(pidL, Lv, LcurrentSpeed, dt);
     LdriveMotor(LOutput);
   }
 
@@ -631,11 +845,25 @@ void loop()
     GunPosition(A_pressed, dt);
 
     // 在系统里随时使用开关状态 switchState
-    if (switchState) {
-      // 模式 ON：例如 PID 保持炮塔角度
-    } 
-    else {
-      // 模式 OFF：例如自由控制
-    }
+      if (switchState) {
+        ServoPID(dt);
+        // 模式 ON：例如 PID 保持炮塔角度
+    
+
+        // 无刷电机 yaw 稳定器
+        motor.loopFOC();  // 必须调用
+
+        // ====== 读取 IMU 数据（你自己有这些变量） ======
+        float turretYaw   = turretData->yaw;     // °
+        float chassisGyro = chassisData->gy;     // °/s
+        float targetYaw   = turret_saved_yaw;    // °
+
+        // ====== 主控制函数 ======
+        YawStabilizer(turretYaw, chassisGyro, targetYaw, dt);
+        motor.move(motor.target);
+      } 
+      else {
+        // 模式 OFF：例如自由控制
+      }
 
 }
