@@ -57,8 +57,6 @@ double motor_LOutput = 0;
   // 用 PCNT 的单位（我们用 PCNT_UNIT_0 处理右轮，PCNT_UNIT_1 处理左轮）
   static int16_t lastRCount = 0;      // 上一次读取的 PCNT 原始计数（16-bit）
   static int16_t lastLCount = 0;
-  volatile int32_t Rcounter_cum = 0;  // 32-bit 累计计数（软件累积，替代 Rcounter）
-  volatile int32_t Lcounter_cum = 0;
 
   unsigned long RlastEncoderTime = 0;
 unsigned long LlastEncoderTime = 0;
@@ -100,8 +98,8 @@ motorPID pidL;
 
   float turret_saved_roll  = 0;
   float turret_saved_pitch = 0;
-  float turret_saved_yaw   = 0;
-
+  float turret_saved_yaw_cont   = 0;
+  float turret_yaw_cont_now = 0;
   // 灵敏度（倍数）
   float turret_Sensitivity = 1.0;
 
@@ -110,8 +108,14 @@ motorPID pidL;
   const float SENS_MAX = 2.0;
 
   // 最大角速度（°/s）
-  const float yawMaxVel   = 60.0;
-const float pitchMaxVel = 40.0;
+  const float yaw_Max_Vel   = 60.0;
+  const float pitch_Max_Vel = 40.0;
+
+  //连续角状态
+  float yaw_raw_last_rad = 0.0f;   // 上一次原始 yaw（rad）
+  float yaw_cont_rad     = 0.0f;   // 连续 yaw（rad）
+  bool  yaw_init_done    = false;  // 首次初始化标志
+
 
 
 //舵机
@@ -189,14 +193,17 @@ float servo_vel_int = 0;// 速度积分
     pid->lastError = pid->error;
     pid->error = ref - fdb;
     float P = pid->kp * pid->error;
-    pid->integral += pid->ki * pid->error;
+    pid->integral += pid->ki * pid->error * dt;
     // 积分限幅
     if (pid->integral > pid->maxIntegral)
         pid->integral = pid->maxIntegral;
     if (pid->integral < -pid->maxIntegral)
         pid->integral = -pid->maxIntegral;
     float I = pid->integral;
-    float D = pid->kd * (pid->error - pid->lastError)/dt;
+    float D = 0.0f;
+    if (dt > 1e-5f) {
+      D = pid->kd * (pid->error - pid->lastError) / dt;
+    }
     pid->output = P + I + D;
     // 输出限幅
     if (pid->output > pid->maxOutput)
@@ -232,13 +239,6 @@ float servo_vel_int = 0;// 速度积分
 
   // 串级 PID 实例
   CascadePID yawPID;
-
-  // 用于速度计算
-  float yaw_last_angle = 0;
-  unsigned long yaw_last_time = 0;
-
-  // 目标角度（度）
-  float yaw_target_deg = 0;
 
 
 //输出手柄输入
@@ -357,23 +357,6 @@ void pcnt_init_encoders() {
   lastLCount = cnt;
 }
 
-// ========== 读取并累积 PCNT 计数（在主循环中被调用或由速度函数调用） ==========
-static inline void update_pcns_cumulative() {
-  int16_t cntR, cntL;
-  pcnt_get_counter_value(PCNT_UNIT_0, &cntR);
-  pcnt_get_counter_value(PCNT_UNIT_1, &cntL);
-
-  // 计算差值（int16_t 差值在短时间内不会溢出）
-  int16_t deltaR = cntR - lastRCount;
-  int16_t deltaL = cntL - lastLCount;
-
-  lastRCount = cntR;
-  lastLCount = cntL;
-
-  // 累加到 32-bit 总计（软件累积，长期安全）
-  Rcounter_cum += (int32_t)deltaR;
-  Lcounter_cum += (int32_t)deltaL;
-}
 
 // ========== 替代原有 RgetSpeed() / LgetSpeed() 的实现 ==========
 float RgetSpeed() {
@@ -384,7 +367,7 @@ float RgetSpeed() {
     // 更新硬件计数并累计
     int16_t cntR;
     pcnt_get_counter_value(PCNT_UNIT_0, &cntR);
-    int16_t delta = cntR - lastRCount;
+    int32_t delta = (int32_t)cntR - (int32_t)lastRCount;
     lastRCount = cntR;
 
     // 使用 delta 作为该时间段内的脉冲数（正负）
@@ -404,10 +387,10 @@ float LgetSpeed() {
   unsigned long currentTime = millis();
   unsigned long deltaTime = currentTime - LlastEncoderTime;
   static float LRPM = 0;
-  if (deltaTime >= 50) {  // 每50ms计算一次
+  if (deltaTime >= 5) {  // 每5ms计算一次
     int16_t cntL;
     pcnt_get_counter_value(PCNT_UNIT_1, &cntL);
-    int16_t delta = cntL - lastLCount;
+    int32_t delta = (int32_t)cntL - (int32_t)lastLCount;
     lastLCount = cntL;
 
     LRPM = (delta / (float)encoderPPR / gearRatio) * (60000.0 / (float)deltaTime);
@@ -465,6 +448,7 @@ double motor_calculatePID(motorPID& pid, double targetSpeed, double actualSpeed,
       // 判断是否持续超过2秒
       if (isStopped && (currentTime - rtPressedStartTime >= rtHoldDuration)) {
         reverseMode = true; // 进入倒车模式
+        v = 0;   // 切换瞬间清零速度
       }
     }
   } else {
@@ -499,12 +483,12 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
   }
 
   // 输出调试信息
-  String output = "ReverseMode=" + String(reverseMode ? "ON" : "OFF") +
-                  ", LT=" + String(k, 3) +
-                  ", RT=" + String(brake, 3) +
-                  ", a=" + String(a, 3) +
-                  ", v=" + String(v, 3) + " m/s";
-  Serial.println(output);
+  //String output = "ReverseMode=" + String(reverseMode ? "ON" : "OFF") +
+  //                ", LT=" + String(k, 3) +
+  //                ", RT=" + String(brake, 3) +
+  //                ", a=" + String(a, 3) +
+  //                ", v=" + String(v, 3) + " m/s";
+  //Serial.println(output);
 }
 
 //加入转向和自转
@@ -612,12 +596,12 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
         if (switchState) {
             turret_saved_roll  = sensor_turretData->roll;
             turret_saved_pitch = sensor_turretData->pitch;
-            turret_saved_yaw   = sensor_turretData->yaw;
+            turret_saved_yaw_cont   = turret_yaw_cont_now;
 
             //Serial.println("=== Turret Angle Saved! ===");
             //Serial.print("Roll: ");  Serial.println(turret_saved_roll);
             //Serial.print("Pitch: "); Serial.println(turret_saved_pitch);
-            //Serial.print("Yaw: ");   Serial.println(turret_saved_yaw);
+            //Serial.print("Yaw: ");   Serial.println(turret_saved_yaw_cont);
         }
     }
 
@@ -628,8 +612,12 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     // -----------------------
     // 0. 灵敏度调节（方向键 ↑ ↓）
     // -----------------------
-    if (xboxController.xboxNotif.btnDirUp)   turret_Sensitivity += 0.1;
-    if (xboxController.xboxNotif.btnDirDown) turret_Sensitivity -= 0.1;
+    static uint32_t lastSensAdjust = 0;
+    if (millis() - lastSensAdjust > 200) {
+      if (xboxController.xboxNotif.btnDirUp)   turret_Sensitivity += 0.1;
+      if (xboxController.xboxNotif.btnDirDown) turret_Sensitivity -= 0.1;
+      lastSensAdjust = millis();
+    }
     turret_Sensitivity = constrain(turret_Sensitivity, SENS_MIN, SENS_MAX);
 
     // -----------------------
@@ -660,13 +648,13 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     // -----------------------
     // 3. 计算角速度（线性）
     // -----------------------
-    float yawVel   = yawIn   * yawMaxVel;   // °/s
-    float pitchVel = pitchIn * pitchMaxVel; // °/s
+    float yawVel   = yawIn   * yaw_Max_Vel;   // °/s
+    float pitchVel = pitchIn * pitch_Max_Vel; // °/s
 
     // -----------------------
     // 4. 积分得到姿态指令
     // -----------------------
-    turret_saved_yaw   += yawVel   * dt;
+    turret_saved_yaw_cont   += yawVel   * dt;
     turret_saved_pitch += pitchVel * dt;
 
     // 限制俯仰角
@@ -676,7 +664,7 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     // 5. 输出调试信息
     // -----------------------
     /*Serial.print("Saved Yaw=");
-    Serial.print(turret_saved_yaw, 2);
+    Serial.print(turret_saved_yaw_cont, 2);
     Serial.print(" Pitch=");
     Serial.print(turret_saved_pitch, 2);
     Serial.print(" Sens=");
@@ -696,17 +684,21 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     float pitch_turret  = sensor_turretData->pitch;
     float pitch_chassis = sensor_chassisData->pitch;
 
-    float gyro_chassis = sensor_chassisData->gx;
-    float gyro_turret  = sensor_turretData->gx;
+    float gyro_chassis = sensor_chassisData->gy;
+    float gyro_turret  = sensor_turretData->gy;
 
     // -------- 2. 位置环：角度误差 --------
     float err_pos = turret_saved_pitch - pitch_turret;
-
+      const float SERVO_I_MAX = 50.0;
     servo_pos_int += err_pos * dt;
+    servo_pos_int = constrain(servo_pos_int, -SERVO_I_MAX, SERVO_I_MAX);
+
     float d_pos = (err_pos - servo_pos_err_last) / dt;
+    static float d_pos_lpf = 0;
+    d_pos_lpf += (d_pos - d_pos_lpf) * dt / (0.02f + dt);
     servo_pos_err_last = err_pos;
 
-    float u_pos = servo_P_pos * err_pos + servo_I_pos * servo_pos_int + servo_D_pos * d_pos;
+    float u_pos = servo_P_pos * err_pos + servo_I_pos * servo_pos_int + servo_D_pos * d_pos_lpf;
 
     // -------- 3. 速度环目标 = 抵消车体角速度 + 位置环输出 --------
     float target_vel = -gyro_chassis + u_pos;
@@ -715,10 +707,17 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     float err_vel = target_vel - gyro_turret;
 
     servo_vel_int += err_vel * dt;
+
+    // 积分限幅，防止积分风暴
+    servo_vel_int = constrain(servo_vel_int, -SERVO_I_MAX, SERVO_I_MAX);
+
+
     float d_vel = (err_vel - servo_vel_err_last) / dt;
+    static float d_vel_lpf = 0;
+    d_vel_lpf += (d_vel - d_vel_lpf) * dt / (0.02f + dt);
     servo_vel_err_last = err_vel;
 
-    float u_vel = servo_P_vel * err_vel + servo_I_vel * servo_vel_int + servo_D_vel * d_vel;
+    float u_vel = servo_P_vel * err_vel + servo_I_vel * servo_vel_int + servo_D_vel * d_vel_lpf;
 
     // -------- 5. 将速度输出转换为角度输出（内部单位：度）--------
     static float controlAngle = 0.0;   // 0° = 舵机中位
@@ -742,13 +741,49 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     int pwm = map(calibratedAngle, ANGLE_MIN, ANGLE_MAX, PWM_MIN, PWM_MAX);
 
     // 如果双稳关闭，控制角度归零
-    if(!switchState) controlAngle = 0;
-
+    if(!switchState) 
+      controlAngle = 0;
+      servo_pos_int = 0;
+      servo_vel_int = 0;
+      servo_pos_err_last = 0;
+    servo_vel_err_last = 0;
 
     // 输出
     pitchServo.writeMicroseconds(pwm);
 }
 
+//yaw 角度连续化函数
+float yaw_Continuous_deg(float deg_yaw_turret_now)
+{
+    // 1. 度 → 弧度
+    float rad_yaw_turret_now = deg_yaw_turret_now * DEG_TO_RAD;
+
+    // 2. 第一次调用，直接初始化
+    if (!yaw_init_done) {
+        yaw_raw_last_rad = rad_yaw_turret_now;
+        yaw_cont_rad = rad_yaw_turret_now;
+        yaw_init_done = true;
+
+        return deg_yaw_turret_now;
+    }
+
+    // 3. 计算相邻两次的差值
+    float dyaw = rad_yaw_turret_now - yaw_raw_last_rad;
+
+    // 4. 处理跨 360° 回跳（unwrap 核心）
+    if (dyaw > M_PI) {
+        dyaw -= 2.0f * M_PI;
+    } else if (dyaw < -M_PI) {
+        dyaw += 2.0f * M_PI;
+    }
+
+    // 5. 累加得到连续角
+    yaw_cont_rad += dyaw;
+    float yaw_cont_deg = yaw_cont_rad/DEG_TO_RAD; // 转回度
+    yaw_raw_last_rad = rad_yaw_turret_now;
+
+    return yaw_cont_deg;
+}
 
 /*************************************************/
 
@@ -788,7 +823,6 @@ void setup()
   initPitchServo(15); // 舵机信号接在 GPIO15
 
   // 无刷电机控制初始化
-    Serial.begin(115200);
 
     // 1) 驱动初始化
     yaw_driver.voltage_power_supply = 12.0;
@@ -820,132 +854,117 @@ void setup()
     // 内环：速度→输出 Uq 电压 (V)
     PID_Init(&yawPID.inner, 0.1, 0.01, 0.00, 1000, 6.0);
 
-    // 初始化定时与角度
-    yaw_last_time = micros();
-    yaw_last_angle = yaw_motor.shaftAngle();
-
-
-
-
 }
 
 
 
 void loop()
 {
- //  管理手柄通信和按键数据
-  handleXboxController();
+  /************** ① 最高优先级：FOC（每次 loop 都跑） **************/
+    yaw_motor.loopFOC();   // ❗不要加 if，不要用 millis，不要 delay
+    yaw_motor.move();
 
-  
-  //计算时间
-  unsigned long now = millis();
-  static unsigned long lastLoop = 0;
-  
-    // 更新双稳 IMU 数据更新
-    imu_chassis.update();
-    imu_turret.update();
-  
-  if (now - lastLoop < 5) return;  // 每 5ms 执行一次逻辑
-  float dt = (now - lastLoop) / 1000.0;
-  lastLoop = now;
+    /************** ② 当前时间（微秒级） **************/
+    static uint32_t lastMicros = micros();
+  uint32_t nowMicros = micros();
 
 
- if (xboxController.isConnected() && !xboxController.isWaitingForFirstNotification()) {
-    //模拟油门
-    simulateThrottle(dt);
+  /************** ③ IMU 固定频率更新（500Hz） **************/
+    static uint32_t lastIMU = 0;
+    if (nowMicros - lastIMU >= 2000) {   // 2000us = 500Hz
+      lastIMU = nowMicros;
 
+      imu_chassis.update();
+      imu_turret.update();
 
-    // 更新左右轮速度目标（转向）
-    updateWheelSpeed(dt);
-
-
-    //PID 
-    motor_R_currentSpeed = RgetSpeed();
-    motor_ROutput = motor_calculatePID(pidR, Rv, motor_R_currentSpeed, dt);
-    RdriveMotor(motor_ROutput);
-
-    motor_L_currentSpeed = LgetSpeed();
-    motor_LOutput = motor_calculatePID(pidL, Lv, motor_L_currentSpeed, dt);
-    LdriveMotor(motor_LOutput);
+      // yaw 连续化建议放在 IMU 更新后
+      turret_yaw_cont_now = yaw_Continuous_deg(sensor_turretData->yaw);
   }
 
-  else {
-    // 未连接时强制停止所有电机
-    v = 0; Lv = 0; Rv = 0;
-    RdriveMotor(0);
-    LdriveMotor(0);
-    
-    // 重置PID积分项，避免积分饱和
-    pidR.integral = 0;
-    pidL.integral = 0;
-    pidR.previousError = 0;
-    pidL.previousError = 0;
+
+  /************** ④ 用户输入 / 状态机（50Hz） **************/
+    static uint32_t lastUI = 0;
+    if (nowMicros - lastUI >= 20000) {    // 20ms = 50Hz
+      float dt_ui = (nowMicros - lastUI) * 1e-6f;
+      lastUI = nowMicros;
+
+      handleXboxController();
+
+      bool A_pressed = xboxController.xboxNotif.btnA;
+      GunPosition(A_pressed, dt_ui); 
   }
 
-  // 调试信息
-    static unsigned long lastSerial = 0;
-    if (millis() - lastSerial >= 200) {
-      lastSerial = millis();
-      Serial.print("右轮转速: ");
-      Serial.print(motor_R_currentSpeed);
-      Serial.print("RPID输出: ");
-      Serial.println(motor_ROutput);
-
-      Serial.print("左轮转速: ");
-      Serial.print(motor_L_currentSpeed);
-      Serial.print("LPID输出: ");
-      Serial.println(motor_LOutput);
-    }
-
-  // 双稳控制
-    bool A_pressed = xboxController.xboxNotif.btnA;  // 获取手柄 A 按键状态
-    GunPosition(A_pressed, dt);
-
-    // 在系统里随时使用开关状态 switchState
-      if (switchState) {
-        ServoPID(dt);
-        // 模式 ON：例如 PID 保持炮塔角度
-
-        // ====== 读取 IMU 数据（你自己有这些变量） ======
-        float yaw_turret_now   = sensor_turretData->yaw;     // °
-        float yaw_turretGyro_now = sensor_turretData->gy;     // °/s
-        float turret_saved_yaw;    // °
-
-        float rad_yaw_turret_now      = yaw_turret_now * DEG_TO_RAD;      // rad
-        float rad_yaw_turretGyro_now = yaw_turretGyro_now * DEG_TO_RAD;   // rad/s
-        float rad_turret_saved_yaw   = turret_saved_yaw * DEG_TO_RAD;    // rad
-
-        // 2) FOC 电角度计算
-        yaw_motor.loopFOC();
-
-        // 5) 串级 PID 计算
-        PID_CascadeCalc(&yawPID, rad_turret_saved_yaw, rad_yaw_turret_now, rad_yaw_turretGyro_now, dt);
-
-        // 6) 内环输出即 q 轴电压，直接当作 torque 模式下的 target
-        yaw_motor.target = yawPID.output;
-
-        // 7) 更新输出
-        yaw_motor.move();
-
-        // // 8) 串口实时打印调试
-        // // 非阻塞打印逻辑
-        // static unsigned long lastPrint = 0;
-        // unsigned long now2 = millis();
-        // if (now2 - lastPrint >= 300)
-        // { // 每 300ms 打印一次
-        //     lastPrint = now2;
-        //     Serial.print("yaw_ang:");
-        //     Serial.print(yaw_ang * 180 / M_PI, 1);
-        //     Serial.print("deg yaw_vel:");
-        //     Serial.print(yaw_vel, 2);
-        //     Serial.print("uq:");
-        //     Serial.println(yawPID.output, 3);
-        // }
 
 
-      } 
+  /************** ⑤ 控制主循环（5ms = 200Hz） **************/
+    static uint32_t lastCtrl = 0;
+    if (nowMicros - lastCtrl >= 5000) {
+      float dt = (nowMicros - lastCtrl) * 1e-6f;
+      lastCtrl = nowMicros;
+
+      /***** 行走部分 *****/
+      if (xboxController.isConnected() &&!xboxController.isWaitingForFirstNotification()) {
+        simulateThrottle(dt);
+        updateWheelSpeed(dt);
+
+        motor_R_currentSpeed = RgetSpeed();
+        motor_ROutput = motor_calculatePID(pidR, Rv, motor_R_currentSpeed, dt);
+        RdriveMotor(motor_ROutput);
+
+        motor_L_currentSpeed = LgetSpeed();
+        motor_LOutput = motor_calculatePID(pidL, Lv, motor_L_currentSpeed, dt);
+        LdriveMotor(motor_LOutput);
+      }
       else {
-        // 模式 OFF：例如自由控制
+        v = 0; Lv = 0; Rv = 0;
+        RdriveMotor(0);
+        LdriveMotor(0);
+
+        pidR.integral = pidL.integral = 0;
+        pidR.previousError = pidL.previousError = 0;
       }
 
+
+      /***** 双稳控制 *****/
+      if (switchState) {
+        ServoPID(dt);
+
+        float rad_yaw_now   = turret_yaw_cont_now * DEG_TO_RAD;
+        float rad_yaw_ref   = turret_saved_yaw_cont * DEG_TO_RAD;
+        float rad_yaw_gyro  = sensor_turretData->gz * DEG_TO_RAD;
+            
+        static float rad_yaw_gyro_lpf = 0;
+        const float gyroTf = 0.01f; // 10ms
+        rad_yaw_gyro_lpf += (rad_yaw_gyro - rad_yaw_gyro_lpf) * dt / (gyroTf + dt);
+
+        PID_CascadeCalc(
+          &yawPID,
+          rad_yaw_ref,
+          rad_yaw_now,
+          rad_yaw_gyro_lpf,
+          dt
+        );
+
+        yaw_motor.target = constrain(
+          yawPID.output,
+          -yaw_motor.voltage_limit,
+          yaw_motor.voltage_limit
+        );
+
+      }
+    }
+
+
+  /************** ⑥ 调试输出（低频，不阻塞） **************/
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint >= 200) {
+      lastPrint = millis();
+
+      Serial.print("R:");
+      Serial.print(motor_R_currentSpeed);
+      Serial.print(" L:");
+      Serial.print(motor_L_currentSpeed);
+      Serial.print(" yaw:");
+      Serial.println(turret_yaw_cont_now);
+    }
 }
