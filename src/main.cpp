@@ -1,12 +1,10 @@
 #include <Arduino.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
-#include <Ticker.h>
-#include <math.h>
-#include <HardwareSerial.h>
 #define PI 3.1415926
 #include "AS201.h"
 #include <Servo.h>
 #include <SimpleFOC.h>
+#include <driver/pcnt.h>
 
 
 
@@ -20,52 +18,57 @@ xboxController("28:ea:0b:d9:0b:9f");
   float v = 0.0;
   float Lv = 0.0;
   float Rv = 0.0;
-  unsigned long prevTime = 0;
-  const float vmax = 14.5; // 主战坦克极限速度
-const float brakeCoeff = 1.5;   // 刹车强度系数（建议在 1.2 ~ 2.0）
+  const float motor_v_max = 14.5; // 主战坦克极限速度
+const float motor_brake_Coeff = 1.5;   // 刹车强度系数（建议在 1.2 ~ 2.0）
 
 
 // PID参数
-  const double Kp = 2.0;
-  const double Ki = 0.1;
-  const double Kd = 0.5;
-  double ROutput = 0;
-double LOutput = 0;
+  const double mortor_Kp = 2.0;
+  const double mortor_Ki = 0.1;
+  const double mortor_Kd = 0.5;
+  double motor_ROutput = 0;
+double motor_LOutput = 0;
 
 
 // 行走部分驱动引脚（输出）
-  #define AIN1 25
-  #define AIN2 26
-  #define PWMA 33
+  #define motor_R_IN1 25
+  #define motor_R_IN2 26
+  #define motor_R_PWM 27
 
-  #define BIN1 27
-  #define BIN2 14
-#define PWMB 32
+  #define motor_L_IN1 14
+  #define motor_L_IN2 13
+#define motor_L_PWM 23
 
 
 /***************** 编码器参数 *****************/
-  #define R1 18    // 右轮编码器引脚A
-  #define R2 19    // 右轮编码器引脚B
-  volatile long Rcounter = 0; // 右轮脉冲计数
-  float RcurrentSpeed = 0;
+  #define motor_R_sensorA 34    // 右轮编码器 A
+  #define motor_R_sensorB 35    // 右轮编码器 B
+  #define motor_L_sensorA 32    // 左轮编码器 A
+  #define motor_L_sensorB 33    // 左轮编码器 B
 
-  #define L1 21    // 左轮编码器引脚A
-  #define L2 22    // 左轮编码器引脚B
-  volatile long Lcounter = 0; // 右轮脉冲计数
-  float LcurrentSpeed = 0;
+  // 保留原先参数
+  float motor_R_currentSpeed = 0;
+  float motor_L_currentSpeed = 0;
+
+  const int encoderPPR = 7;    // 编码器每转脉冲数
+  const int gearRatio = 59;    // 减速比
+  const float wheelRPMToSpeed = 13.3 / 540.0;  // 保持你原来的换算（m/s per RPM）
+
+  // 用 PCNT 的单位（我们用 PCNT_UNIT_0 处理右轮，PCNT_UNIT_1 处理左轮）
+  static int16_t lastRCount = 0;      // 上一次读取的 PCNT 原始计数（16-bit）
+  static int16_t lastLCount = 0;
+  volatile int32_t Rcounter_cum = 0;  // 32-bit 累计计数（软件累积，替代 Rcounter）
+  volatile int32_t Lcounter_cum = 0;
 
   unsigned long RlastEncoderTime = 0;
-  unsigned long LlastEncoderTime = 0;
-  const int encoderPPR = 7;    // 编码器每转脉冲数
-  const int gearRatio = 59;   // 减速比
-const float wheelRPMToSpeed = 13.3 / 540.0;  // ≈ 0.02463 m/s per RPM
+unsigned long LlastEncoderTime = 0;
 
 
 // PWM 通道、频率、分辨率
-  #define CHANNEL_A 0  // 控制 PWMA（右轮）
-  #define CHANNEL_B 1  // 控制 PWMB（左轮）
-  #define PWM_FREQ 10000       // 10kHz，适合电机
-#define PWM_RESOLUTION 8     // 8位，0~255
+  #define motor_PWMchannel_R 0  // 控制 motor_R_PWM（右轮）
+  #define motor_PWMchannel_L 1  // 控制 motor_L_PWM（左轮）
+  #define motor_PWM_FREQ 10000       // 10kHz，适合电机
+#define motor_PWM_RESOLUTION 8     // 8位，0~255
 
 
 //加入倒车
@@ -86,10 +89,10 @@ motorPID pidL;
 
 //双稳
   AS201 imu_chassis(16, 17, Serial2);  // 车体 IMU
-  AS201 imu_turret(26, 27, Serial1);     // 炮塔 IMU
+  AS201 imu_turret(5, 2, Serial1);     // 炮塔 IMU
 
-  SensorData* chassisData;  
-  SensorData* turretData;  
+  SensorData* sensor_chassisData;  
+  SensorData* sensor_turretData;  
 
   //打开双稳获取当前姿态
   bool switchState = false;   // A键双稳开关
@@ -100,7 +103,7 @@ motorPID pidL;
   float turret_saved_yaw   = 0;
 
   // 灵敏度（倍数）
-  float turretSensitivity = 1.0;
+  float turret_Sensitivity = 1.0;
 
   // 灵敏度范围
   const float SENS_MIN = 0.3;
@@ -129,20 +132,20 @@ const float pitchMaxVel = 40.0;
 
   // ---------------- PID 参数 ----------------
   // 位置环
-  float P_pos = 2.0;
-  float I_pos = 0.0;
-  float D_pos = 0.2;
+  float servo_P_pos = 2.0;
+  float servo_I_pos = 0.0;
+  float servo_D_pos = 0.2;
 
   // 速度环
-  float P_vel = 1.2;
-  float I_vel = 0.0;
-  float D_vel = 0.05;
+  float servo_P_vel = 1.2;
+  float servo_I_vel = 0.0;
+  float servo_D_vel = 0.05;
 
   // PID 状态变量
-  float pos_err_last = 0;
-  float vel_err_last = 0;
-  float pos_int = 0;
-float vel_int = 0;
+  float servo_pos_err_last = 0;// 上次位置误差
+  float servo_vel_err_last = 0;// 上次速度误差
+  float servo_pos_int = 0;// 位置积分
+float servo_vel_int = 0;// 速度积分
 
 
 //无刷电机控制
@@ -211,24 +214,31 @@ float vel_int = 0;
   }
 
   // ======================================================
-  //               SimpleFOC + IMU 双环控制参数
+  //               SimpleFOC
   // ======================================================
 
-  // ---- 驱动管脚，根据你的情况修改 ----
-  const int pinPWM_A = 32;
-  const int pinPWM_B = 33;
-  const int pinPWM_C = 25;
-  const int pinEn    = 12;
+  // ——— SimpleFOC 对象声明 ——//
 
-  // ---- SimpleFOC 对象 ----
-  BLDCMotor motor = BLDCMotor(7); // 7 极对数
-  BLDCDriver3PWM driver = BLDCDriver3PWM(pinPWM_A, pinPWM_B, pinPWM_C, pinEn);
-  MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+  // 硬件引脚
+  const int yaw_pinPWM_A = 18;
+  const int yaw_pinPWM_B = 19;
+  const int yaw_pinPWM_C = 12;
+  const int yaw_pinEn = 4;
 
-  // ---- 串级 PID 实例 ----
+  // FOC 对象
+  BLDCMotor yaw_motor = BLDCMotor(7); // 7 极对数
+  BLDCDriver3PWM yaw_driver = BLDCDriver3PWM(yaw_pinPWM_A, yaw_pinPWM_B, yaw_pinPWM_C, yaw_pinEn);
+  MagneticSensorI2C yaw_sensor = MagneticSensorI2C(AS5600_I2C);
+
+  // 串级 PID 实例
   CascadePID yawPID;
 
+  // 用于速度计算
+  float yaw_last_angle = 0;
+  unsigned long yaw_last_time = 0;
 
+  // 目标角度（度）
+  float yaw_target_deg = 0;
 
 
 //输出手柄输入
@@ -289,29 +299,101 @@ void handleXboxController() {
   }
 }
 
-// 编码器中断服务程序
-void IRAM_ATTR RencoderISR() {
-  bool a = digitalRead(R1);
-  bool b = digitalRead(R2);
-  if (a == b) Rcounter++;
-  else Rcounter--;
+// ========== PCNT 初始化（放在 setup() 中调用） ==========
+void pcnt_init_encoders() {
+  // 配置右轮 PCNT（PCNT_UNIT_0）
+  pcnt_config_t pcnt_cfg_r;
+  pcnt_cfg_r.pulse_gpio_num = motor_R_sensorA;
+  pcnt_cfg_r.ctrl_gpio_num  = motor_R_sensorB;
+  pcnt_cfg_r.channel       = PCNT_CHANNEL_0;
+  pcnt_cfg_r.unit          = PCNT_UNIT_0;
+  // 在脉冲上升下降时都计数，但方向由 ctrl（B）决定：上升时增/减、下降时增/减
+  pcnt_cfg_r.pos_mode = PCNT_COUNT_INC;   // pulse 上升沿时计数 +1
+  pcnt_cfg_r.neg_mode = PCNT_COUNT_DEC;   // pulse 下降沿时计数 -1
+  pcnt_cfg_r.lctrl_mode = PCNT_MODE_KEEP; // ctrl=low 时保持模式
+  pcnt_cfg_r.hctrl_mode = PCNT_MODE_REVERSE; // ctrl=high 时反转极性
+  pcnt_cfg_r.counter_h_lim = 32767;
+  pcnt_cfg_r.counter_l_lim = -32768;
+  pcnt_unit_config(&pcnt_cfg_r);
+
+  // 配置左轮 PCNT（PCNT_UNIT_1）
+  pcnt_config_t pcnt_cfg_l;
+  pcnt_cfg_l.pulse_gpio_num = motor_L_sensorA;
+  pcnt_cfg_l.ctrl_gpio_num  = motor_L_sensorB;
+  pcnt_cfg_l.channel       = PCNT_CHANNEL_0;
+  pcnt_cfg_l.unit          = PCNT_UNIT_1;
+  pcnt_cfg_l.pos_mode = PCNT_COUNT_INC;
+  pcnt_cfg_l.neg_mode = PCNT_COUNT_DEC;
+  pcnt_cfg_l.lctrl_mode = PCNT_MODE_KEEP;
+  pcnt_cfg_l.hctrl_mode = PCNT_MODE_REVERSE;
+  pcnt_cfg_l.counter_h_lim = 32767;
+  pcnt_cfg_l.counter_l_lim = -32768;
+  pcnt_unit_config(&pcnt_cfg_l);
+
+  // 启动计数器
+  pcnt_counter_pause(PCNT_UNIT_0);
+  pcnt_counter_clear(PCNT_UNIT_0);
+  pcnt_counter_resume(PCNT_UNIT_0);
+
+  pcnt_counter_pause(PCNT_UNIT_1);
+  pcnt_counter_clear(PCNT_UNIT_1);
+  pcnt_counter_resume(PCNT_UNIT_1);
+
+  // 建议：把引脚设置为输入并上拉（可保留）
+  pinMode(motor_R_sensorA, INPUT_PULLUP);
+  pinMode(motor_R_sensorB, INPUT_PULLUP);
+  pinMode(motor_L_sensorA, INPUT_PULLUP);
+  pinMode(motor_L_sensorB, INPUT_PULLUP);
+
+  // 初始化时间戳
+  RlastEncoderTime = millis();
+  LlastEncoderTime = millis();
+
+  // 读取初始计数值到 lastCount，避免第一次大跳
+  int16_t cnt;
+  pcnt_get_counter_value(PCNT_UNIT_0, &cnt);
+  lastRCount = cnt;
+  pcnt_get_counter_value(PCNT_UNIT_1, &cnt);
+  lastLCount = cnt;
 }
 
-void IRAM_ATTR LencoderISR() {
-  bool a = digitalRead(L1);
-  bool b = digitalRead(L2);
-  if (a == b) Lcounter--;
-  else Lcounter++;
+// ========== 读取并累积 PCNT 计数（在主循环中被调用或由速度函数调用） ==========
+static inline void update_pcns_cumulative() {
+  int16_t cntR, cntL;
+  pcnt_get_counter_value(PCNT_UNIT_0, &cntR);
+  pcnt_get_counter_value(PCNT_UNIT_1, &cntL);
+
+  // 计算差值（int16_t 差值在短时间内不会溢出）
+  int16_t deltaR = cntR - lastRCount;
+  int16_t deltaL = cntL - lastLCount;
+
+  lastRCount = cntR;
+  lastLCount = cntL;
+
+  // 累加到 32-bit 总计（软件累积，长期安全）
+  Rcounter_cum += (int32_t)deltaR;
+  Lcounter_cum += (int32_t)deltaL;
 }
 
-// 获取真实转速(m/s)
+// ========== 替代原有 RgetSpeed() / LgetSpeed() 的实现 ==========
 float RgetSpeed() {
   unsigned long currentTime = millis();
   unsigned long deltaTime = currentTime - RlastEncoderTime;
-  static float RRPM= 0;
-  if(deltaTime >= 50) {  // 每50ms计算一次转速
-    RRPM = (Rcounter / (float)encoderPPR / gearRatio) * (60000.0 / deltaTime);
-    Rcounter = 0;
+  static float RRPM = 0;
+  if (deltaTime >= 5) {  // 每5ms计算一次
+    // 更新硬件计数并累计
+    int16_t cntR;
+    pcnt_get_counter_value(PCNT_UNIT_0, &cntR);
+    int16_t delta = cntR - lastRCount;
+    lastRCount = cntR;
+
+    // 使用 delta 作为该时间段内的脉冲数（正负）
+    // 计算 RPM（注意单位与原来保持一致）
+    RRPM = (delta / (float)encoderPPR / gearRatio) * (60000.0 / (float)deltaTime);
+
+    // 清零硬件计数（可选）：不清零也行，因为我们用差值
+    // pcnt_counter_clear(PCNT_UNIT_0);
+
     RlastEncoderTime = currentTime;
   }
   float RWheelSpeed = RRPM * wheelRPMToSpeed;
@@ -319,16 +401,23 @@ float RgetSpeed() {
 }
 
 float LgetSpeed() {
-    unsigned long currentTime = millis();
-    unsigned long deltaTime = currentTime - LlastEncoderTime;
-    static float LRPM= 0;
-    if(deltaTime >= 50) {  // 每50ms计算一次转速
-      LRPM = (Lcounter / (float)encoderPPR / gearRatio) * (60000.0 / deltaTime);
-      Lcounter = 0;
-      LlastEncoderTime = currentTime;
-    }
-    float LWhellSpeed = LRPM * wheelRPMToSpeed;
-    return LWhellSpeed;
+  unsigned long currentTime = millis();
+  unsigned long deltaTime = currentTime - LlastEncoderTime;
+  static float LRPM = 0;
+  if (deltaTime >= 50) {  // 每50ms计算一次
+    int16_t cntL;
+    pcnt_get_counter_value(PCNT_UNIT_1, &cntL);
+    int16_t delta = cntL - lastLCount;
+    lastLCount = cntL;
+
+    LRPM = (delta / (float)encoderPPR / gearRatio) * (60000.0 / (float)deltaTime);
+
+    // pcnt_counter_clear(PCNT_UNIT_1);
+
+    LlastEncoderTime = currentTime;
+  }
+  float LWheelSpeed = LRPM * wheelRPMToSpeed;
+  return LWheelSpeed;
 }
 
 //PID计算
@@ -346,7 +435,7 @@ double motor_calculatePID(motorPID& pid, double targetSpeed, double actualSpeed,
   double derivative = (currentError - pid.previousError) / dt;
   pid.previousError = currentError;
 
-  double output = Kp * currentError + Ki * pid.integral + Kd * derivative;
+  double output = mortor_Kp * currentError + mortor_Ki * pid.integral + mortor_Kd * derivative;
   output = constrain(output, -255, 255);
   
   if (abs(output) < 35 && abs(targetSpeed) > 0.1)
@@ -386,22 +475,22 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
 }  }   //再次按左扳机，退出倒车
 
   // 根据是否倒车模式计算加速度和速度
-  float k_adj = pow(k, 2.0);
+  float k_adj = k * k;
   float rollingResistance = (abs(v) < 3.0) ? 0.5 : 0.338;// 低速滚阻：速度越低，滚阻越大（模拟履带 + 慢起步）
   float a = 0.0;
 
   if (!reverseMode) {
     // 正常前进模式
-    a = 1.4 * k_adj - 0.006 * v * v - rollingResistance - brakeCoeff * brake;// 加速度公式（推力 - 阻力 - 滚阻 - 刹车）
+    a = 1.4 * k_adj - 0.006 * v * v - rollingResistance - motor_brake_Coeff * brake;// 加速度公式（推力 - 阻力 - 滚阻 - 刹车）
     if (v < 0.5) a *= 0.5;  // 起步迟钝
     v = v + a * dt;
     if (v < 0) v = 0;
-    if (v > vmax) v = vmax;
+    if (v > motor_v_max) v = motor_v_max;
   } else {
     // 倒车模式：加速度用同样公式，但油门变成倒车时的刹车，速度取负值表示倒车
     // 注意此时k（油门）不再代表推力，而是“倒车时的刹车”，即用k替代brake
     // 这里做个简单处理：用k代替刹车，推力为负方向
-    a = -1.4 * pow(brake, 2.0) + 0.006 * v * v + rollingResistance + brakeCoeff * k; 
+    a = -1.4 * brake * brake + 0.006 * v * v + rollingResistance + motor_brake_Coeff * k; 
      
     v = v + a * dt;
     if (v < -reverseVmax) v = -reverseVmax;
@@ -456,8 +545,8 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     Lv = v * (1.0 - turnFactor * turnRatio); // 左履带
     Rv = v * (1.0 + turnFactor * turnRatio); // 右履带
 
-    // 限速处理，避免某侧履带速度超过 vmax
-    float maxV = reverseMode ? reverseVmax : vmax;
+    // 限速处理，避免某侧履带速度超过 motor_v_max
+    float maxV = reverseMode ? reverseVmax : motor_v_max;
     Lv = constrain(Lv, -maxV, maxV);
     Rv = constrain(Rv, -maxV, maxV);
   }
@@ -470,19 +559,19 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
   speed = constrain(speed, -255, 255);
 
   if (speed > 0) {
-    digitalWrite(AIN1, LOW);   // 正转 AIN1=0 AIN2=1
-    digitalWrite(AIN2, HIGH);
-    ledcWrite(CHANNEL_A, speed);
+    digitalWrite(motor_R_IN1, LOW);   // 正转 motor_R_IN1=0 motor_R_IN2=1
+    digitalWrite(motor_R_IN2, HIGH);
+    ledcWrite(motor_PWMchannel_R, speed);
   } else if (speed < 0) {
-    digitalWrite(AIN1, HIGH);  // 反转 AIN1=1 AIN2=0
-    digitalWrite(AIN2, LOW);
-    ledcWrite(CHANNEL_A, -speed);
+    digitalWrite(motor_R_IN1, HIGH);  // 反转 motor_R_IN1=1 motor_R_IN2=0
+    digitalWrite(motor_R_IN2, LOW);
+    ledcWrite(motor_PWMchannel_R, -speed);
 
   } else {
     // 停止
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, LOW);
-    ledcWrite(CHANNEL_A, 0);
+    digitalWrite(motor_R_IN1, LOW);
+    digitalWrite(motor_R_IN2, LOW);
+    ledcWrite(motor_PWMchannel_R, 0);
   }
 }
 
@@ -492,18 +581,18 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
   speed = constrain(speed, -255, 255);
 
   if (speed < 0) {
-    digitalWrite(BIN1, LOW);   // 反转 BIN1=0 BIN2=1
-    digitalWrite(BIN2, HIGH);
-    ledcWrite(CHANNEL_B, -speed);
+    digitalWrite(motor_L_IN1, LOW);   // 反转 motor_L_IN1=0 motor_L_IN2=1
+    digitalWrite(motor_L_IN2, HIGH);
+    ledcWrite(motor_PWMchannel_L, -speed);
   } else if (speed > 0) {
-    digitalWrite(BIN1, HIGH);  // 轮子正转 BIN1=1 BIN2=0
-    digitalWrite(BIN2, LOW);
-    ledcWrite(CHANNEL_B, speed);
+    digitalWrite(motor_L_IN1, HIGH);  // 轮子正转 motor_L_IN1=1 motor_L_IN2=0
+    digitalWrite(motor_L_IN2, LOW);
+    ledcWrite(motor_PWMchannel_L, speed);
   } else {
     // 停止
-    digitalWrite(BIN1, LOW);
-    digitalWrite(BIN2, LOW);
-    ledcWrite(CHANNEL_B, 0);
+    digitalWrite(motor_L_IN1, LOW);
+    digitalWrite(motor_L_IN2, LOW);
+    ledcWrite(motor_PWMchannel_L, 0);
   }
 }
 
@@ -521,9 +610,9 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
 
         // 如果现在切换到 "ON"，则保存炮塔IMU角度
         if (switchState) {
-            turret_saved_roll  = turretData->roll;
-            turret_saved_pitch = turretData->pitch;
-            turret_saved_yaw   = turretData->yaw;
+            turret_saved_roll  = sensor_turretData->roll;
+            turret_saved_pitch = sensor_turretData->pitch;
+            turret_saved_yaw   = sensor_turretData->yaw;
 
             //Serial.println("=== Turret Angle Saved! ===");
             //Serial.print("Roll: ");  Serial.println(turret_saved_roll);
@@ -539,9 +628,9 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     // -----------------------
     // 0. 灵敏度调节（方向键 ↑ ↓）
     // -----------------------
-    if (xboxController.xboxNotif.btnDirUp)   turretSensitivity += 0.1;
-    if (xboxController.xboxNotif.btnDirDown) turretSensitivity -= 0.1;
-    turretSensitivity = constrain(turretSensitivity, SENS_MIN, SENS_MAX);
+    if (xboxController.xboxNotif.btnDirUp)   turret_Sensitivity += 0.1;
+    if (xboxController.xboxNotif.btnDirDown) turret_Sensitivity -= 0.1;
+    turret_Sensitivity = constrain(turret_Sensitivity, SENS_MIN, SENS_MAX);
 
     // -----------------------
     // 1. 读取右摇杆
@@ -565,8 +654,8 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     // -----------------------
     // 2. 应用灵敏度
     // -----------------------
-    yawIn   *= turretSensitivity;
-    pitchIn *= turretSensitivity;
+    yawIn   *= turret_Sensitivity;
+    pitchIn *= turret_Sensitivity;
 
     // -----------------------
     // 3. 计算角速度（线性）
@@ -591,7 +680,7 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     Serial.print(" Pitch=");
     Serial.print(turret_saved_pitch, 2);
     Serial.print(" Sens=");
-    Serial.println(turretSensitivity, 2);*/
+    Serial.println(turret_Sensitivity, 2);*/
   }
 }
 
@@ -604,20 +693,20 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
   void ServoPID(float dt)
 {
     // -------- 1. 读取 IMU pitch 和 pitch 角速度（X轴）--------
-    float pitch_turret  = turretData->pitch;
-    float pitch_chassis = chassisData->pitch;
+    float pitch_turret  = sensor_turretData->pitch;
+    float pitch_chassis = sensor_chassisData->pitch;
 
-    float gyro_chassis = chassisData->gx;
-    float gyro_turret  = turretData->gx;
+    float gyro_chassis = sensor_chassisData->gx;
+    float gyro_turret  = sensor_turretData->gx;
 
     // -------- 2. 位置环：角度误差 --------
     float err_pos = turret_saved_pitch - pitch_turret;
 
-    pos_int += err_pos * dt;
-    float d_pos = (err_pos - pos_err_last) / dt;
-    pos_err_last = err_pos;
+    servo_pos_int += err_pos * dt;
+    float d_pos = (err_pos - servo_pos_err_last) / dt;
+    servo_pos_err_last = err_pos;
 
-    float u_pos = P_pos * err_pos + I_pos * pos_int + D_pos * d_pos;
+    float u_pos = servo_P_pos * err_pos + servo_I_pos * servo_pos_int + servo_D_pos * d_pos;
 
     // -------- 3. 速度环目标 = 抵消车体角速度 + 位置环输出 --------
     float target_vel = -gyro_chassis + u_pos;
@@ -625,11 +714,11 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
     // -------- 4. 速度环：速度误差 --------
     float err_vel = target_vel - gyro_turret;
 
-    vel_int += err_vel * dt;
-    float d_vel = (err_vel - vel_err_last) / dt;
-    vel_err_last = err_vel;
+    servo_vel_int += err_vel * dt;
+    float d_vel = (err_vel - servo_vel_err_last) / dt;
+    servo_vel_err_last = err_vel;
 
-    float u_vel = P_vel * err_vel + I_vel * vel_int + D_vel * d_vel;
+    float u_vel = servo_P_vel * err_vel + servo_I_vel * servo_vel_int + servo_D_vel * d_vel;
 
     // -------- 5. 将速度输出转换为角度输出（内部单位：度）--------
     static float controlAngle = 0.0;   // 0° = 舵机中位
@@ -661,22 +750,6 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
 }
 
 
-// 无刷电机 yaw 稳定器更新函数
-  void YawStabilizer(float turretYaw, float chassisGyro, float targetYawDeg, float dt)
-{
-    // ---- 1) 角度输入处理 ----
-    float posRef = targetYawDeg * DEG_TO_RAD; // 目标角度（rad）
-    float posFdb = turretYaw;                 // 炮塔 yaw（rad）
-    float velFdb = chassisGyro;               // 车体 yaw 角速度（rad/s）
-
-    // ---- 2) 串级 PID ----
-    PID_CascadeCalc(&yawPID, posRef, posFdb, velFdb, dt);
-
-    // ---- 3) 输出给 SimpleFOC torque 模式 ----
-    motor.target = yawPID.output;  // Uq 电压
-}
-
-
 /*************************************************/
 
 
@@ -686,86 +759,70 @@ void setup()
   xboxController.begin();
 
   // 初始化编码器
-  pinMode(R1, INPUT_PULLUP);
-  pinMode(R2, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(R1), RencoderISR, RISING);
-    
-  pinMode(L1, INPUT_PULLUP);
-  pinMode(L2, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(L1), LencoderISR, RISING);
-
+  pcnt_init_encoders();
 
   // 初始化电机驱动引脚
-  pinMode(AIN1, OUTPUT);
-  pinMode(AIN2, OUTPUT);
+  pinMode(motor_R_IN1, OUTPUT);
+  pinMode(motor_R_IN2, OUTPUT);
 
-  pinMode(BIN1, OUTPUT);
-  pinMode(BIN2, OUTPUT);
+  pinMode(motor_L_IN1, OUTPUT);
+  pinMode(motor_L_IN2, OUTPUT);
 
   // PWM 初始化
-  ledcSetup(CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PWMA, CHANNEL_A);
+  ledcSetup(motor_PWMchannel_R, motor_PWM_FREQ, motor_PWM_RESOLUTION);
+  ledcAttachPin(motor_R_PWM, motor_PWMchannel_R);
 
-  ledcSetup(CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PWMB, CHANNEL_B);
+  ledcSetup(motor_PWMchannel_L, motor_PWM_FREQ, motor_PWM_RESOLUTION);
+  ledcAttachPin(motor_L_PWM, motor_PWMchannel_L);
   
   // 初始化双稳
-  Serial1.begin(115200, SERIAL_8N1, 26, 27);
+  Serial1.begin(115200, SERIAL_8N1, 5, 2);
   Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
 
   // 将全局引用指向 IMU 内部 data
-  chassisData = &imu_chassis.getData();
-  turretData  = &imu_turret.getData();
+  sensor_chassisData = &imu_chassis.getData();
+  sensor_turretData  = &imu_turret.getData();
 
   // 初始化舵机
-  initPitchServo(13); // 舵机信号接在 GPIO13
+  initPitchServo(15); // 舵机信号接在 GPIO15
 
   // 无刷电机控制初始化
-    // ========== SimpleFOC 初始化 ==========
+    Serial.begin(115200);
+
     // 1) 驱动初始化
-    driver.voltage_power_supply = 12.0;
-    driver.init();
+    yaw_driver.voltage_power_supply = 12.0;
+    yaw_driver.init();
 
     // 2) 传感器初始化
-    sensor.init();
-    motor.linkSensor(&sensor);
+    yaw_sensor.init();
+    yaw_motor.linkSensor(&yaw_sensor);
 
     // 3) 链接驱动与电机
-    motor.linkDriver(&driver);
-    motor.voltage_limit = 12.0;
+    yaw_motor.linkDriver(&yaw_driver);
+    yaw_motor.voltage_limit = 12.0;
 
     // 4) 选择 torque 模式，不使用库内置 PID
-    motor.controller = MotionControlType::torque;
+    yaw_motor.controller = MotionControlType::torque;
     // 禁掉库内速度 PI，避免与您的 inner PID 干扰
-    motor.PID_velocity.P = 0;
-    motor.PID_velocity.I = 0;
-    motor.PID_velocity.D = 0;
-    motor.LPF_velocity.Tf = 0.01; // 低通滤波时间常数
+    yaw_motor.PID_velocity.P = 0;
+    yaw_motor.PID_velocity.I = 0;
+    yaw_motor.PID_velocity.D = 0;
+    yaw_motor.LPF_velocity.Tf = 0.01; // 低通滤波时间常数
 
     // 5) FOC 初始化
-    motor.init();
-    motor.initFOC();
+    yaw_motor.init();
+    yaw_motor.initFOC();
 
+    // 6) 自己的 PID 参数，需根据电机与负载调参
+    // 外环：位置→输出速度 (rad/s)
+    PID_Init(&yawPID.outer, 1, 0.0, 1.0, 0.0, 12);
+    // 内环：速度→输出 Uq 电压 (V)
+    PID_Init(&yawPID.inner, 0.1, 0.01, 0.00, 1000, 6.0);
 
-    // ========== 串级 PID 参数 ==========
-    // 外环：位置 → 输出目标角速度(rad/s)
-    PID_Init(&yawPID.outer,
-      6.0,     // kp
-      0.0,     // ki
-      0.5,     // kd
-      0.0,     // max I
-    20.0);   // max output rad/s
-
-    // 内环：角速度 → 输出力矩电压
-    PID_Init(&yawPID.inner,
-      0.3,     // kp
-      0.01,    // ki
-      0.0,     // kd
-      3.0,     // max I
-    6.0);    // max Uq
-
-
+    // 初始化定时与角度
+    yaw_last_time = micros();
+    yaw_last_angle = yaw_motor.shaftAngle();
 
 
 
@@ -788,7 +845,7 @@ void loop()
     imu_chassis.update();
     imu_turret.update();
   
-  if (now - lastLoop < 50) return;  // 每 50ms 执行一次逻辑
+  if (now - lastLoop < 5) return;  // 每 5ms 执行一次逻辑
   float dt = (now - lastLoop) / 1000.0;
   lastLoop = now;
 
@@ -803,13 +860,13 @@ void loop()
 
 
     //PID 
-    RcurrentSpeed = RgetSpeed();
-    ROutput = motor_calculatePID(pidR, Rv, RcurrentSpeed, dt);
-    RdriveMotor(ROutput);
+    motor_R_currentSpeed = RgetSpeed();
+    motor_ROutput = motor_calculatePID(pidR, Rv, motor_R_currentSpeed, dt);
+    RdriveMotor(motor_ROutput);
 
-    LcurrentSpeed = LgetSpeed();
-    LOutput = motor_calculatePID(pidL, Lv, LcurrentSpeed, dt);
-    LdriveMotor(LOutput);
+    motor_L_currentSpeed = LgetSpeed();
+    motor_LOutput = motor_calculatePID(pidL, Lv, motor_L_currentSpeed, dt);
+    LdriveMotor(motor_LOutput);
   }
 
   else {
@@ -830,14 +887,14 @@ void loop()
     if (millis() - lastSerial >= 200) {
       lastSerial = millis();
       Serial.print("右轮转速: ");
-      Serial.print(RcurrentSpeed);
+      Serial.print(motor_R_currentSpeed);
       Serial.print("RPID输出: ");
-      Serial.println(ROutput);
+      Serial.println(motor_ROutput);
 
       Serial.print("左轮转速: ");
-      Serial.print(LcurrentSpeed);
+      Serial.print(motor_L_currentSpeed);
       Serial.print("LPID输出: ");
-      Serial.println(LOutput);
+      Serial.println(motor_LOutput);
     }
 
   // 双稳控制
@@ -848,19 +905,44 @@ void loop()
       if (switchState) {
         ServoPID(dt);
         // 模式 ON：例如 PID 保持炮塔角度
-    
-
-        // 无刷电机 yaw 稳定器
-        motor.loopFOC();  // 必须调用
 
         // ====== 读取 IMU 数据（你自己有这些变量） ======
-        float turretYaw   = turretData->yaw;     // °
-        float chassisGyro = chassisData->gy;     // °/s
-        float targetYaw   = turret_saved_yaw;    // °
+        float yaw_turret_now   = sensor_turretData->yaw;     // °
+        float yaw_turretGyro_now = sensor_turretData->gy;     // °/s
+        float turret_saved_yaw;    // °
 
-        // ====== 主控制函数 ======
-        YawStabilizer(turretYaw, chassisGyro, targetYaw, dt);
-        motor.move(motor.target);
+        float rad_yaw_turret_now      = yaw_turret_now * DEG_TO_RAD;      // rad
+        float rad_yaw_turretGyro_now = yaw_turretGyro_now * DEG_TO_RAD;   // rad/s
+        float rad_turret_saved_yaw   = turret_saved_yaw * DEG_TO_RAD;    // rad
+
+        // 2) FOC 电角度计算
+        yaw_motor.loopFOC();
+
+        // 5) 串级 PID 计算
+        PID_CascadeCalc(&yawPID, rad_turret_saved_yaw, rad_yaw_turret_now, rad_yaw_turretGyro_now, dt);
+
+        // 6) 内环输出即 q 轴电压，直接当作 torque 模式下的 target
+        yaw_motor.target = yawPID.output;
+
+        // 7) 更新输出
+        yaw_motor.move();
+
+        // // 8) 串口实时打印调试
+        // // 非阻塞打印逻辑
+        // static unsigned long lastPrint = 0;
+        // unsigned long now2 = millis();
+        // if (now2 - lastPrint >= 300)
+        // { // 每 300ms 打印一次
+        //     lastPrint = now2;
+        //     Serial.print("yaw_ang:");
+        //     Serial.print(yaw_ang * 180 / M_PI, 1);
+        //     Serial.print("deg yaw_vel:");
+        //     Serial.print(yaw_vel, 2);
+        //     Serial.print("uq:");
+        //     Serial.println(yawPID.output, 3);
+        // }
+
+
       } 
       else {
         // 模式 OFF：例如自由控制
