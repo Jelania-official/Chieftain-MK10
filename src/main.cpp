@@ -126,9 +126,9 @@ motorPID pidL;
   float servo_center_angle = 90.0; // 舵机实际中位
 
   // 对应舵机 PWM 范围（单位：微秒）
-  // 根据产品规格，通常数字舵机 PWM: 1000~2000us 对应 0~180°
-  const int PWM_MIN = 1000;  
-  const int PWM_MAX = 2000;
+  // 根据产品规格，通常数字舵机 PWM: 500~2500us 对应 0~180°
+  const int PWM_MIN = 500;  
+  const int PWM_MAX = 2500;
 
   // 如果目标角度和舵机角度存在偏差，可调整校准参数
   float angleOffset = 0.0;      // 角度偏移，用于零点校准
@@ -172,6 +172,7 @@ float servo_vel_int = 0;// 速度积分
     PID outer;    // 位置环
     PID inner;    // 速度环
     float output; // 最终 Uq 电压
+    float ff_gain;    // 前馈系数 Kff
   } CascadePID;
 
   // 初始化单级 PID
@@ -213,11 +214,12 @@ float servo_vel_int = 0;// 速度积分
   }
 
   // 串级调用
-  void PID_CascadeCalc(CascadePID *cp, float posRef, float posFdb, float velFdb,float dt)
+  void PID_CascadeCalc(CascadePID *cp, float posRef, float posFdb, float velFdb, float chassisVel, float dt)
   {
     PID_Calc(&cp->outer, posRef, posFdb, dt);
     PID_Calc(&cp->inner, cp->outer.output, velFdb, dt);
-    cp->output = cp->inner.output;
+    float ff = cp->ff_gain * chassisVel;
+    cp->output = cp->inner.output + ff;
   }
 
   // ======================================================
@@ -932,6 +934,7 @@ void loop()
         float rad_yaw_now   = turret_yaw_cont_now * DEG_TO_RAD;
         float rad_yaw_ref   = turret_saved_yaw_cont * DEG_TO_RAD;
         float rad_yaw_gyro  = sensor_turretData->gz * DEG_TO_RAD;
+        float rad_yaw_chassis_gyro = -sensor_chassisData->gz * DEG_TO_RAD;
             
         static float rad_yaw_gyro_lpf = 0;
         const float gyroTf = 0.01f; // 10ms
@@ -942,6 +945,7 @@ void loop()
           rad_yaw_ref,
           rad_yaw_now,
           rad_yaw_gyro_lpf,
+          rad_yaw_chassis_gyro,
           dt
         );
 
