@@ -32,19 +32,19 @@ double motor_LOutput = 0;
 
 // 行走部分驱动引脚（输出）
   #define motor_R_IN1 25
-  #define motor_R_IN2 26
-  #define motor_R_PWM 27
+  #define motor_R_IN2 33
+  #define motor_R_PWM 32
 
-  #define motor_L_IN1 14
-  #define motor_L_IN2 13
-#define motor_L_PWM 23
+  #define motor_L_IN1 26
+  #define motor_L_IN2 27
+#define motor_L_PWM 14
 
 
 /***************** 编码器参数 *****************/
-  #define motor_R_sensorA 34    // 右轮编码器 A
-  #define motor_R_sensorB 35    // 右轮编码器 B
-  #define motor_L_sensorA 32    // 左轮编码器 A
-  #define motor_L_sensorB 33    // 左轮编码器 B
+  #define motor_R_sensorA 23    // 右轮编码器 A
+  #define motor_R_sensorB 22    // 右轮编码器 B
+  #define motor_L_sensorA 35    // 左轮编码器 A
+  #define motor_L_sensorB 34    // 左轮编码器 B
 
   // 保留原先参数
   float motor_R_currentSpeed = 0;
@@ -87,7 +87,7 @@ motorPID pidL;
 
 //双稳
   AS201 imu_chassis(16, 17, Serial2);  // 车体 IMU
-  AS201 imu_turret(5, 2, Serial1);     // 炮塔 IMU
+  AS201 imu_turret(2, 4, Serial1);     // 炮塔 IMU
 
   SensorData* sensor_chassisData;  
   SensorData* sensor_turretData;  
@@ -229,14 +229,13 @@ float servo_vel_int = 0;// 速度积分
   // ——— SimpleFOC 对象声明 ——//
 
   // 硬件引脚
-  const int yaw_pinPWM_A = 18;
+  const int yaw_pinPWM_A = 21;
   const int yaw_pinPWM_B = 19;
-  const int yaw_pinPWM_C = 12;
-  const int yaw_pinEn = 4;
+  const int yaw_pinPWM_C = 18;
 
   // FOC 对象
   BLDCMotor yaw_motor = BLDCMotor(7); // 7 极对数
-  BLDCDriver3PWM yaw_driver = BLDCDriver3PWM(yaw_pinPWM_A, yaw_pinPWM_B, yaw_pinPWM_C, yaw_pinEn);
+  BLDCDriver3PWM yaw_driver = BLDCDriver3PWM(yaw_pinPWM_A, yaw_pinPWM_B, yaw_pinPWM_C);
   MagneticSensorI2C yaw_sensor = MagneticSensorI2C(AS5600_I2C);
 
   // 串级 PID 实例
@@ -813,7 +812,7 @@ void setup()
   ledcAttachPin(motor_L_PWM, motor_PWMchannel_L);
   
   // 初始化双稳
-  Serial1.begin(115200, SERIAL_8N1, 5, 2);
+  Serial1.begin(115200, SERIAL_8N1, 2, 4);
   Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
 
