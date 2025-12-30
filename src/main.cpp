@@ -595,8 +595,7 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
 
         // 如果现在切换到 "ON"，则保存炮塔IMU角度
         if (switchState) {
-            turret_saved_roll  = sensor_turretData->roll;
-            turret_saved_pitch = sensor_turretData->pitch;
+            turret_saved_pitch = sensor_turretData->roll;
             turret_saved_yaw_cont   = turret_yaw_cont_now;
 
             //Serial.println("=== Turret Angle Saved! ===");
@@ -681,12 +680,12 @@ if (v > -0.1 && reverseMode && k > rtThreshold) {
 //舵机控制：双环 PID 角度范围 -10°～30° 中位角度 = 0°
   void ServoPID(float dt)
 {
-    // -------- 1. 读取 IMU pitch 和 pitch 角速度（X轴）--------
-    float pitch_turret  = sensor_turretData->pitch;
-    float pitch_chassis = sensor_chassisData->pitch;
+    // -------- 1. 读取 IMU roll 和 roll 角速度（X轴）--------
+    float pitch_turret  = sensor_turretData->roll;
+    float pitch_chassis = sensor_chassisData->roll;
 
-    float gyro_chassis = sensor_chassisData->gy;
-    float gyro_turret  = sensor_turretData->gy;
+    float gyro_chassis = sensor_chassisData->gx;
+    float gyro_turret  = sensor_turretData->gx;
 
     // -------- 2. 位置环：角度误差 --------
     float err_pos = turret_saved_pitch - pitch_turret;
