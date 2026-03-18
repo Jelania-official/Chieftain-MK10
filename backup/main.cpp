@@ -790,7 +790,7 @@ float yaw_Continuous_deg(float deg_yaw_turret_now)
 
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(921600);
   xboxController.begin();
 
   // 初始化编码器
