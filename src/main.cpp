@@ -69,11 +69,14 @@ namespace Config {
     // [动力学精细调校 - 3阶导数 Jerk 限制]
     // 前进/后退推力爬升限制 (km/h/s²)
     const float LINEAR_JERK_ACCEL = 0.4f;  // 模拟 L60 引擎缓慢的扭矩堆积
-    const float LINEAR_JERK_BRAKE = 2.5f;  // 模拟液压制动系统快速建立压力
+    const float LINEAR_JERK_BRAKE = 2.5f;  // 刹车Jerk更大，保证制动响应同时防冲击
 
-    // 转向/自转动力爬升限制
-    const float YAW_JERK_ACCEL = 0.3f;     // 模拟侧向铲土阻力导致的启动迟滞
-    const float YAW_JERK_BRAKE = 1.2f;     // 转向停止时的惯性缓冲
+    // [横向动力学与随速感应 (新增)]
+    const float YAW_JERK_ACCEL = 2.0f;     // 转向液压建立速度 (比前进快)
+    const float YAW_JERK_BRAKE = 4.0f;     // 转向停止时的惯性缓冲
+    const float YAW_SENSITIVITY = 25.0f;   // 转向加速度增益 (配合阻尼决定最大转向速度)
+    const float YAW_DAMPING = 3.5f;        // 转向物理阻尼系数 (每秒衰减比例，模拟侧向摩擦)
+    const float SPEED_SENS_K = 0.08f;      // 随速衰减系数 (越高，高速时方向盘越“重”)
 
     // [炮塔与双稳]
     const uint8_t SERVO_PIN = 15;           // 俯仰舵机引脚
@@ -244,7 +247,7 @@ private:
     bool reverseMode = false;
     uint32_t rtPressedStartTime = 0;
 
-    // --- 实例化两个独立的动力限幅器 ---
+    // 实例化两个独立的动力限幅器
     AccelRateLimiter linearLimiter; 
     AccelRateLimiter yawLimiter;
 
@@ -256,7 +259,6 @@ public:
         leftTrack (DCMotor(Config::L_IN1, Config::L_IN2, Config::L_PWM, Config::PWM_CH_L, true),
                    CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1),
                    CustomPID(1.2, 0.05, 0.3, 100.0, 255.0)),
-        // 在初始化列表中注入 Config 参数
         linearLimiter(Config::LINEAR_JERK_ACCEL, Config::LINEAR_JERK_BRAKE),
         yawLimiter(Config::YAW_JERK_ACCEL, Config::YAW_JERK_BRAKE) 
     {}
@@ -267,7 +269,7 @@ public:
         uint32_t now = millis();
         bool isStopped = (abs(v_real) < 0.5f);
 
-        // 1. 倒车档位切换逻辑
+        // 1. 倒车档位切换逻辑 (保留原样)
         if (triggerR > Config::RT_THRESHOLD) {
             if (rtPressedStartTime == 0) rtPressedStartTime = now;
             else if (isStopped && (now - rtPressedStartTime >= Config::RT_HOLD_TIME)) {
@@ -282,59 +284,102 @@ public:
             }
         }
 
-        // 2. 前进/后退动力学模拟
-        float airResist = 0.001f * v_real * v_real;
-        // 速度在 0~0.5km/h 之间时，阻力从 0 线性增加到 0.6，彻底解决起步跳变
-        float rollResistFactor = constrain(abs(v_real) / 0.5f, 0.0f, 1.0f);
-        float rollResist = 0.6f * rollResistFactor;        
-        float target_a_engine = 0.0f;
-        float smooth_a_engine = 0.0f;
-        float brake_force = 0.0f;
-        float a_final = 0.0f;
-
-        if (!reverseMode) {
-            target_a_engine = Config::REAL_ACCEL * (triggerL * triggerL);
-            smooth_a_engine = linearLimiter.update(target_a_engine, dt);
-            brake_force = Config::REAL_BRAKE * (triggerR * triggerR); 
-            a_final = smooth_a_engine - airResist - rollResist - brake_force;
-            v_real = constrain(v_real + a_final * dt, 0, Config::REAL_V_MAX);
-        } else {
-            target_a_engine = -Config::REAL_ACCEL * (triggerR * triggerR);
-            smooth_a_engine = linearLimiter.update(target_a_engine, dt);
+        // ==========================================
+        // 纵向动力学 (Longitudinal Dynamics)
+        // ==========================================
+        
+        // 1. 确定推力/制动意图
+        float drive_force = 0.0f, brake_force = 0.0f, a_raw = 0.0f;
+        if (!reverseMode) { 
+            drive_force = Config::REAL_ACCEL * (triggerL * triggerL);
+            brake_force = Config::REAL_BRAKE * (triggerR * triggerR);
+            a_raw = drive_force - brake_force;
+        } else { 
+            drive_force = -Config::REAL_ACCEL * (triggerR * triggerR);
             brake_force = Config::REAL_BRAKE * (triggerL * triggerL);
-            a_final = smooth_a_engine + airResist + rollResist + brake_force;
-            v_real = constrain(v_real + a_final * dt, -Config::REAL_V_REV_MAX, 0);
+            a_raw = drive_force + brake_force;
         }
 
-        // 3. 转向逻辑 (包含转向限幅)
-        float joyX_adj = (abs(joyX) < 0.12f) ? 0 : joyX;
-        bool isSpinMode = (abs(v_real) < 1.0f && abs(joyX_adj) > 0.2f);
-        float Lv_tgt = 0, Rv_tgt = 0;
+        // 2. 环境阻力计算 (保留你的变量名，加入方向控制)
+        // 计算阻力方向：基于 v_real 状态，而非 reverseMode 意图
+        float resDir = 0;
+        if (v_real > 0.1f) resDir = 1.0f;
+        else if (v_real < -0.1f) resDir = -1.0f;
+        else resDir = v_real / 0.1f; // 线性平滑区间
 
-        if (isSpinMode) {
-            // 原地自转：将摇杆映射为目标转向加速度
-            float target_a_spin = (2.0f * abs(joyX_adj) - 0.5f) * 5.0f; 
-            float smooth_a_spin = yawLimiter.update(target_a_spin, dt);
-            
-            spinV = constrain(spinV + smooth_a_spin * dt, 0, 8.0f); 
-            Lv_tgt = -spinV * copysign(1.0f, joyX_adj); 
-            Rv_tgt =  spinV * copysign(1.0f, joyX_adj);
-            
-            linearLimiter.reset(); // 自转时重置前进限幅器，防止干扰
+        // --- 你的原始阻力公式 ---
+        float airResist = 0.001f * v_real * v_real;
+        float rollResistFactor = constrain(abs(v_real) / 0.5f, 0.0f, 1.0f);
+        float rollResist = 0.6f * rollResistFactor; 
+        // -----------------------
+
+        // 3. 施加方向：阻力总和始终与 v_real 方向相反
+        float totalResist = (airResist + rollResist) * resDir;
+        a_raw -= totalResist;
+
+        // 4. 静摩擦力锁死 (解决速度为0时加速度突变)
+        if (abs(v_real) < 0.05f) {
+            if (!reverseMode && a_raw < 0) {
+                a_raw = 0.0f; // 企图减速但车已停，静摩擦介入
+                v_real = 0.0f;
+            } else if (reverseMode && a_raw > 0) {
+                a_raw = 0.0f; 
+                v_real = 0.0f;
+            }
+        }
+
+        // 5. 经过 Jerk 限幅，计算最终纵向速度
+        float a_final = linearLimiter.update(a_raw, dt);
+        if (!reverseMode) {
+            v_real = constrain(v_real + a_final * dt, 0.0f, Config::REAL_V_MAX);
         } else {
-            spinV = (spinV - 5.0f * dt > 0.0f) ? (spinV - 5.0f * dt) : 0.0f;
-            yawLimiter.reset();    // 正常行驶模式重置转向限幅器
-            
-            // 差速模型
-            Lv_tgt = v_real * (1.0f + 0.4f * joyX_adj);
-            Rv_tgt = v_real * (1.0f - 0.4f * joyX_adj);
+            v_real = constrain(v_real + a_final * dt, -Config::REAL_V_REV_MAX, 0.0f);
+        }
+
+        // ==========================================
+        // 横向动力学 (Lateral Dynamics)
+        // ==========================================
+
+        float joyX_adj = (abs(joyX) < 0.12f) ? 0 : joyX;
+        
+        // 6. 随速感应灵敏度：速度越快，转弯越“重”
+        float dynamic_sens = Config::YAW_SENSITIVITY / (1.0f + abs(v_real) * Config::SPEED_SENS_K);
+        
+        // 指数映射 (Expo)：增加微操精度
+        float joyX_squared = copysign(joyX_adj * joyX_adj, joyX_adj); 
+        float target_a_yaw = joyX_squared * dynamic_sens;
+
+        // 横向加速度也需要 Jerk 平滑 (液压建立时间)
+        float smooth_a_yaw = yawLimiter.update(target_a_yaw, dt);
+
+        // 7. 旋转阻力衰减 (Damping)
+        spinV += smooth_a_yaw * dt;
+        spinV -= spinV * Config::YAW_DAMPING * dt; // 模拟巨大侧向摩擦
+        spinV = constrain(spinV, -8.0f, 8.0f);     // 限制物理极限自转速度
+
+        // ==========================================
+        // 双流耦合输出 (Coupled Output)
+        // ==========================================
+
+        // 8. 将线速度与自转速度无缝叠加
+        float Lv_tgt = v_real + spinV;
+        float Rv_tgt = v_real - spinV;
+
+        // 找出两轮中绝对值最大的那个
+        float max_val = max(abs(Lv_tgt), abs(Rv_tgt));
+
+        // 如果最大的那个超过了物理极限
+        if (max_val > Config::REAL_V_MAX) {
+            float ratio = Config::REAL_V_MAX / max_val;
+            Lv_tgt *= ratio; // 等比例缩小
+            Rv_tgt *= ratio;
         }
 
         leftTrack.update(Lv_tgt, dt); 
         rightTrack.update(Rv_tgt, dt);
 
-        LOG(CHASSIS_ONLY, "REAL_KMH:%.2f, L:%.2f, R:%.2f, Mode:%s\n", 
-            v_real, leftTrack.currentSpeed, rightTrack.currentSpeed, reverseMode ? "REV" : "FWD");
+        LOG(CHASSIS_ONLY, "V:%.2f, Spin:%.2f, L:%.2f, R:%.2f, a_raw:%.2f\n", 
+            v_real, spinV, leftTrack.currentSpeed, rightTrack.currentSpeed, a_raw);
     }
 
     void stop() { 
@@ -362,7 +407,6 @@ private:
     float yawContDeg = 0;
     bool yawInitDone = false, switchState = false;
     float pitchFiltered = 0, gyroZ_offset = 0, gyroX_offset = 0;
-    float pitchFiltered = 0;
     float t_gyroZ_offset = 0, t_gyroX_offset = 0; // 炮塔零偏
     float c_gyroZ_offset = 0, c_gyroX_offset = 0; // 底盘零偏
 
@@ -463,9 +507,17 @@ public:
         float c_gx_cal = gC.gyro.x - c_gyroX_offset;
         float c_gz_cal = gC.gyro.z - c_gyroZ_offset;
 
+        // 假设期望的 P 增益为 150 (每1度误差，要求 150度/秒 的回正速度)
+        // 前馈增益设为 1.0 (底盘抬起 10度/秒，舵机就低头 10度/秒 完全抵消)
+        float kP_pitch = 150.0f; 
+        float kFF_pitch = 1.0f;  
+
         float pErr = savedPitch - pitchFiltered;
-        float pComp = (pErr * 0.85f) - (c_gx_cal * RAD_TO_DEG * 0.06f);
-        currentPitchAngle = constrain(currentPitchAngle + pComp, 45.0f, 135.0f);
+        // 算出期望的补偿角速度 (deg/s)
+        float pitchRateCmd = (pErr * kP_pitch) - (c_gx_cal * RAD_TO_DEG * kFF_pitch);
+
+        // 乘以 dt，得到本帧需要改变的具体角度
+        currentPitchAngle = constrain(currentPitchAngle + (pitchRateCmd * dt), 45.0f, 135.0f);
         pitchServo.write(currentPitchAngle);
         
         float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, (gT.gyro.z - t_gyroZ_offset) * RAD_TO_DEG, -c_gz_cal * RAD_TO_DEG, dt);
@@ -495,6 +547,9 @@ public:
         chassis.init(); turret.init(); 
         delay(200); turret.calibrate(); 
         xboxController.begin(); 
+
+        uint32_t now = micros();
+        lastIMU = now; lastUI = now; lastCtrl = now;
     }
 
     void loop() {
