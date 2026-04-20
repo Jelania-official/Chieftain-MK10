@@ -7,8 +7,6 @@
 #include <SimpleFOC.h>
 #include <driver/pcnt.h>
 
-#define PI 3.1415926
-
 // ==========================================
 // 0. 调试控制中心 (Debug Control Center)
 // ==========================================
@@ -39,11 +37,11 @@ namespace Config {
     // [底盘动力引脚]
     const uint8_t R_IN1 = 25, R_IN2 = 33, R_PWM = 32; // 右侧直流驱动
     const uint8_t L_IN1 = 26, L_IN2 = 27, L_PWM = 14; // 左侧直流驱动
-    const uint8_t PWM_CH_R = 0, PWM_CH_L = 1;         // ESP32 硬件PWM通道
+    const uint8_t PWM_CH_R = 8, PWM_CH_L = 9;         // ESP32 硬件PWM通道
     const uint32_t PWM_FREQ = 10000;                  // 电机控制频率 10kHz
     const uint8_t PWM_RES = 8;                        // 8位分辨率 (0-255)
 
-    // [编码器引脚] - 34/35需外部上拉电阻
+    // [编码器引脚] - 34/35需外部上拉电阻(10K\0805)
     const uint8_t R_ENCA = 23, R_ENCB = 4;
     const uint8_t L_ENCA = 35, L_ENCB = 34; 
 
@@ -77,6 +75,17 @@ namespace Config {
     const float YAW_SENSITIVITY = 25.0f;   // 转向加速度增益 (配合阻尼决定最大转向速度)
     const float YAW_DAMPING = 3.5f;        // 转向物理阻尼系数 (每秒衰减比例，模拟侧向摩擦)
     const float SPEED_SENS_K = 0.08f;      // 随速衰减系数 (越高，高速时方向盘越“重”)
+
+    // [惯性补偿参数]
+    // 增益：决定了补偿的力度
+    const float V_INERTIA_GAIN = 0.15f; 
+    // 滤波系数：0.0 到 1.0 之间。
+    // 越小越平稳（如 0.05），越大响应越快（如 0.3）。
+    const float V_INERTIA_LPF = 0.1f;
+
+    // [环境阻力精细调校]
+    // 假设在垂直90度时，重力带来的最大加速度。数值越大，爬坡越吃力，下坡溜得越快。
+    const float SLOPE_GRAVITY_MAX = 12.0f; // 单位：km/h/s
 
     // [炮塔与双稳]
     const uint8_t SERVO_PIN = 15;           // 俯仰舵机引脚
@@ -145,8 +154,7 @@ public:
         }
         // 2. 关键优化：线性重映射 (Deadzone Compensation)
         // 把 0~255 的输入映射到 40~255 的输出
-        // 公式：实际PWM = 最小起步PWM + (输入 / 255) * (最大255 - 最小40)
-        float mappedPWM = 40.0f + (absOut / 255.0f) * (255.0f - 40.0f);
+        float mappedPWM = (absOut > 0) ? 40.0f + (absOut / 255.0f) * 215.0f : 0;
         mappedPWM = constrain(mappedPWM, 40, 255);
 
         // 3. 物理驱动方向逻辑
@@ -219,21 +227,31 @@ private:
     float jerk_accel, jerk_brake;
 
 public:
-    // 构造函数：初始化不同的 Jerk 限制
     AccelRateLimiter(float j_accel, float j_brake) 
         : jerk_accel(j_accel), jerk_brake(j_brake) {}
 
     float update(float target_a, float dt) {
         float a_error = target_a - a_actual;
+        float current_jerk_limit;
 
-        // 根据加/减速状态选择限制值
-        float current_jerk_limit = (abs(target_a) > abs(a_actual)) 
-                                   ? jerk_accel 
-                                   : jerk_brake;
+        // --- 物理逻辑优化：区分“建立动力”与“消除动力/制动” ---
+        
+        // 条件 1: (target_a * a_actual < 0) 
+        // 含义：目标力与当前力方向相反。例如正在前进(a>0)却踩下刹车(target_a<0)。这是急刹，需快！
+        
+        // 条件 2: (abs(target_a) < abs(a_actual))
+        // 含义：目标力的强度在减小。例如正在收油门滑行。这是减载，需快！
 
-        float max_delta_a = current_jerk_limit * dt;
+        if ((target_a * a_actual < 0) || (abs(target_a) < abs(a_actual))) {
+            current_jerk_limit = jerk_brake; // 使用快速响应 (2.5)
+        } else {
+            current_jerk_limit = jerk_accel; // 使用引擎迟滞 (0.4)
+        }
+
+        // 安全步进限制，防止 dt 异常导致计算爆炸
+        float max_delta_a = current_jerk_limit * min(dt, 0.05f); 
+        
         a_actual += constrain(a_error, -max_delta_a, max_delta_a);
-
         return a_actual;
     }
 
@@ -251,6 +269,10 @@ private:
     AccelRateLimiter linearLimiter; 
     AccelRateLimiter yawLimiter;
 
+    // 惯性补偿状态变量
+    float lastPitchRate = 0.0f;
+    float filteredAlpha = 0.0f;
+
 public:
     TankChassis() : 
         rightTrack(DCMotor(Config::R_IN1, Config::R_IN2, Config::R_PWM, Config::PWM_CH_R, false),
@@ -265,7 +287,7 @@ public:
 
     void init() { rightTrack.init(); leftTrack.init(); }
 
-    void processKinematics(float triggerL, float triggerR, float joyX, float dt) {
+    void processKinematics(float triggerL, float triggerR, float joyX, float dt,float currentPitchRate, float pitchAngle) {
         uint32_t now = millis();
         bool isStopped = (abs(v_real) < 0.5f);
 
@@ -299,6 +321,13 @@ public:
             brake_force = Config::REAL_BRAKE * (triggerL * triggerL);
             a_raw = drive_force + brake_force;
         }
+        // --- [新增核心逻辑：坡度重力分解] ---
+        // 假设 pitchAngle > 0 代表车头朝上（上坡）。
+        // 上坡时，重力会把你往后拉（产生负加速度）；下坡时，重力把你往前推。
+        float slope_accel = -Config::SLOPE_GRAVITY_MAX * sin(pitchAngle * DEG_TO_RAD);
+        
+        // 将重力分量直接叠加进总推力中
+        a_raw += slope_accel;
 
         // 2. 环境阻力计算 (保留你的变量名，加入方向控制)
         // 计算阻力方向：基于 v_real 状态，而非 reverseMode 意图
@@ -365,6 +394,18 @@ public:
         float Lv_tgt = v_real + spinV;
         float Rv_tgt = v_real - spinV;
 
+        // 计算角加速度并滤波
+        float rawAlpha = (currentPitchRate - lastPitchRate) / dt;
+        lastPitchRate = currentPitchRate;
+        
+        // y(n) = y(n-1) + k * (x(n) - y(n-1))
+        filteredAlpha = filteredAlpha + Config::V_INERTIA_LPF * (rawAlpha - filteredAlpha);
+        
+        // 应用补偿量
+        float v_comp = filteredAlpha * Config::V_INERTIA_GAIN;
+        Lv_tgt -= v_comp;
+        Rv_tgt -= v_comp;
+
         // 找出两轮中绝对值最大的那个
         float max_val = max(abs(Lv_tgt), abs(Rv_tgt));
 
@@ -409,6 +450,8 @@ private:
     float pitchFiltered = 0, gyroZ_offset = 0, gyroX_offset = 0;
     float t_gyroZ_offset = 0, t_gyroX_offset = 0; // 炮塔零偏
     float c_gyroZ_offset = 0, c_gyroX_offset = 0; // 底盘零偏
+    float c_gx_cal_deg = 0.0f; // 存放处理后的底盘俯仰角速度 (deg/s)
+    float chassisPitchFiltered = 0.0f; // [新增] 用于存放底盘的坡度角
 
 public:
     TankTurret(Adafruit_MPU6050& c, Adafruit_MPU6050& t) 
@@ -462,6 +505,14 @@ public:
         mpuC.getEvent(&aC, &gC, &tC); 
         mpuT.getEvent(&aT, &gT, &tT);
 
+        // 保存底盘校准后的 X 轴角速度，减去零偏并转换为度/秒
+        c_gx_cal_deg = (gC.gyro.x - c_gyroX_offset) * RAD_TO_DEG;
+
+        // 底盘俯仰角计算 (坡度)
+        float c_pitchAcc = atan2(aC.acceleration.y, aC.acceleration.z) * RAD_TO_DEG;
+        // 互补滤波计算底盘的绝对姿态
+        chassisPitchFiltered = 0.96f * (chassisPitchFiltered + c_gx_cal_deg * dt) + 0.04f * c_pitchAcc;
+
         // 1. 减去零偏，得到真实的角速度
         float gz_cal = gT.gyro.z - t_gyroZ_offset; 
         float gx_cal = gT.gyro.x - t_gyroX_offset;
@@ -473,6 +524,15 @@ public:
         // 3. 偏航角 (Yaw) 直接积分 (删除了多余的 accYaw 和 unwrapYaw)
         // yawContDeg 现在就是一个纯净的、无限连续的相对角度
         yawContDeg += gz_cal * RAD_TO_DEG * dt; 
+    }
+
+    // 获取已经算好的底盘俯仰速率
+    float getLatestChassisPitchRate() {
+        return c_gx_cal_deg;
+    }
+    // 获取当前坡度角
+    float getChassisPitchAngle() {
+        return chassisPitchFiltered;
     }
 
     void runFOC() { yawMotor.loopFOC(); if (switchState) yawMotor.move(); else yawMotor.move(0); }
@@ -504,8 +564,8 @@ public:
         if (!switchState) return;
         
         // 修正：补偿计算时，减去底盘 IMU 的零偏
-        float c_gx_cal = gC.gyro.x - c_gyroX_offset;
-        float c_gz_cal = gC.gyro.z - c_gyroZ_offset;
+        float chassisPitchRateDeg = c_gx_cal_deg;
+        float chassisYawRateDeg = (gC.gyro.z - c_gyroZ_offset) * RAD_TO_DEG;
 
         // 假设期望的 P 增益为 150 (每1度误差，要求 150度/秒 的回正速度)
         // 前馈增益设为 1.0 (底盘抬起 10度/秒，舵机就低头 10度/秒 完全抵消)
@@ -514,13 +574,13 @@ public:
 
         float pErr = savedPitch - pitchFiltered;
         // 算出期望的补偿角速度 (deg/s)
-        float pitchRateCmd = (pErr * kP_pitch) - (c_gx_cal * RAD_TO_DEG * kFF_pitch);
+        float pitchRateCmd = (pErr * kP_pitch) - (chassisPitchRateDeg * kFF_pitch);
 
         // 乘以 dt，得到本帧需要改变的具体角度
         currentPitchAngle = constrain(currentPitchAngle + (pitchRateCmd * dt), 45.0f, 135.0f);
         pitchServo.write(currentPitchAngle);
         
-        float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, (gT.gyro.z - t_gyroZ_offset) * RAD_TO_DEG, -c_gz_cal * RAD_TO_DEG, dt);
+        float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, (gT.gyro.z - t_gyroZ_offset) * RAD_TO_DEG, -chassisYawRateDeg, dt);
         yawMotor.target = yVoltage;
         
         LOG(TURRET_ONLY, "Y_Tgt:%.2f, Y_Real:%.2f\n", savedYawCont, yawContDeg);
@@ -577,7 +637,10 @@ public:
                 float tL = xboxController.xboxNotif.trigLT / 1023.0f;
                 float tR = xboxController.xboxNotif.trigRT / 1023.0f;
                 float jLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
-                chassis.processKinematics(tL, tR, jLX, dtCtrl);
+                // 从底盘 IMU 获取 pitch 速度和坡度角
+                float pRate = turret.getLatestChassisPitchRate();
+                float pAngle = turret.getChassisPitchAngle();
+                chassis.processKinematics(tL, tR, jLX, dtCtrl, pRate, pAngle);
                 turret.updateStabilization(dtCtrl);
             } else { chassis.stop(); }
         }
