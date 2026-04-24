@@ -462,7 +462,7 @@ public:
 
     void init() {
         ESP32PWM::allocateTimer(2);
-        pitchServo.setPeriodHertz(50);
+        pitchServo.setPeriodHertz(333);
         pitchServo.attach(Config::SERVO_PIN, 500, 2500);
         pitchServo.write(90);
 
@@ -514,7 +514,8 @@ public:
         chassisPitchFiltered = 0.96f * (chassisPitchFiltered + c_gx_cal_deg * dt) + 0.04f * c_pitchAcc;
 
         // 1. 减去零偏，得到真实的角速度
-        float gz_cal = gT.gyro.z - t_gyroZ_offset; 
+        float gz_cal = gT.gyro.z - t_gyroZ_offset;
+        if (abs(gz_cal) < 0.005f) gz_cal = 0.0f; // 消除静止底噪带来的缓慢漂移
         float gx_cal = gT.gyro.x - t_gyroX_offset;
 
         // 2. 俯仰角 (Pitch) 互补滤波
@@ -569,7 +570,7 @@ public:
 
         // 假设期望的 P 增益为 150 (每1度误差，要求 150度/秒 的回正速度)
         // 前馈增益设为 1.0 (底盘抬起 10度/秒，舵机就低头 10度/秒 完全抵消)
-        float kP_pitch = 150.0f; 
+        float kP_pitch = 100.0f; 
         float kFF_pitch = 1.0f;  
 
         float pErr = savedPitch - pitchFiltered;
@@ -590,6 +591,31 @@ public:
 // ==========================================
 // 6. 顶层统筹与任务调度
 // ==========================================
+// 在全局定义任务句柄
+TaskHandle_t FOC_TaskHandle;
+
+void FocTask(void *pvParameters) {
+    for (;;) {
+        // 核心0：死循环执行无刷 FOC，尽最大可能跑出最高频率
+        robot.runFOC_Only(); 
+        // 稍微延时让出一点点CPU防止看门狗复位，1微秒即可，或 yield()
+        vTaskDelay(0); 
+    }
+}
+
+void setup() { 
+    robot.setup(); 
+    
+    // 将 FOC 任务绑定到 Core 0
+    // 参数：任务函数, 任务名称, 栈大小, 参数, 优先级(设高一点), 句柄, 核心编号(0)
+    xTaskCreatePinnedToCore(FocTask, "FOC_Task", 4096, NULL, 5, &FOC_TaskHandle, 0);
+}
+
+void loop() { 
+    // Core 1：处理底盘、IMU、PID、Xbox蓝牙和舵机
+    robot.loop_without_FOC(); 
+}
+
 class TankRobot {
 private:
     XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
@@ -599,6 +625,7 @@ private:
 
 public:
     TankRobot() : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
+
 
     void setup() {
         Serial.begin(921600);
@@ -612,9 +639,14 @@ public:
         lastIMU = now; lastUI = now; lastCtrl = now;
     }
 
-    void loop() {
+    
+    void runFOC_Only() {
+        turret.runFOC(); // 内部调用 yawMotor.loopFOC() 和 move()
+    }
+
+    void loop_without_FOC() {
+        // 蓝牙、IMU、底盘动力学都在 Core 1 执行
         uint32_t nowMicros = micros();
-        turret.runFOC(); 
 
         if (nowMicros - lastIMU >= 2000) { // 500Hz IMU
             float dtIMU = (nowMicros - lastIMU) * 1e-6f; 
@@ -648,5 +680,33 @@ public:
 };
 
 TankRobot robot;
-void setup() { robot.setup(); }
-void loop() { robot.loop(); }
+TaskHandle_t FOC_TaskHandle;
+// Core 0 的任务函数：只负责无刷电机的 FOC 算法
+void FocTask(void *pvParameters) {
+    for (;;) {
+        robot.runFOC_Only(); 
+        vTaskDelay(0); // 必须保留，让出微秒级CPU时间给系统底层（如看门狗），防止崩溃
+    }
+}
+
+// 默认在 Core 1 上运行的 setup
+void setup() { 
+    robot.setup(); 
+    
+    // 将 FOC 任务绑定到 Core 0
+    xTaskCreatePinnedToCore(
+        FocTask,       // 任务函数
+        "FOC_Task",    // 任务名称
+        8192,          // 堆栈大小 (分配8K给FOC防溢出)
+        NULL,          // 任务参数
+        5,             // 优先级 (数字越大优先级越高，设为5确保FOC优先执行)
+        &FOC_TaskHandle, // 任务句柄
+        0              // 核心编号：Core 0
+    );
+}
+
+// 默认在 Core 1 上运行的 loop
+void loop() { 
+    // 处理底盘、IMU、蓝牙、PID和舵机
+    robot.loop_without_FOC(); 
+}
