@@ -68,6 +68,11 @@ namespace Config {
     // 前进/后退推力爬升限制 (km/h/s²)
     const float LINEAR_JERK_ACCEL = 0.4f;  // 模拟 L60 引擎缓慢的扭矩堆积
     const float LINEAR_JERK_BRAKE = 2.5f;  // 刹车Jerk更大，保证制动响应同时防冲击
+    const float SHIFT_12_REAL_KMH = 15.0f; // TN12 1->2 挡模拟速度点
+    const float SHIFT_23_REAL_KMH = 30.0f; // TN12 2->3 挡模拟速度点
+    const float SHIFT_CUT_FACTOR = 0.15f;  // 换挡时剩余动力比例
+    const float SHIFT_MIN_THROTTLE = 0.2f; // 进入换挡模拟的最小油门
+    const uint32_t SHIFT_CUT_TIME_MS = 100; // 换挡动力中断时间
 
     // [横向动力学与随速感应 (新增)]
     const float YAW_JERK_ACCEL = 2.0f;     // 转向液压建立速度 (比前进快)
@@ -172,7 +177,7 @@ public:
 
 class CustomEncoder {
 private:
-    pcnt_unit_t unit; int16_t lastCount = 0; uint32_t lastTime = 0;
+    pcnt_unit_t unit; int16_t lastCount = 0; uint32_t lastTime = 0; float lastSpeed = 0.0f;
 public:
     CustomEncoder(uint8_t pinA, uint8_t pinB, pcnt_unit_t p_unit) : unit(p_unit) {
         pcnt_config_t cfg;
@@ -190,7 +195,6 @@ public:
     }
     float getRealSpeedKMH() {
         uint32_t now = millis(); uint32_t dt = now - lastTime;
-        static float lastSpeed = 0;
         if (dt >= 10) { // 10ms 测速周期
             int16_t currentCount; pcnt_get_counter_value(unit, &currentCount);
             int32_t delta = (int32_t)currentCount - (int32_t)lastCount;
@@ -400,6 +404,8 @@ public:
 
     void stop() { 
         v_real = 0; spinV = 0; 
+        reverseMode = false; rtPressedStartTime = 0;
+        lastPitchRate = 0.0f; filteredAlpha = 0.0f;
         engineSmoother.reset(); brakeSmoother.reset();
         leftTrack.stop(); rightTrack.stop(); 
     }
@@ -427,6 +433,7 @@ private:
     float c_gyroZ_offset = 0, c_gyroX_offset = 0; // 底盘零偏
     float c_gx_cal_deg = 0.0f; // 存放处理后的底盘俯仰角速度 (deg/s)
     float chassisPitchFiltered = 0.0f; // [新增] 用于存放底盘的坡度角
+    bool ready = false;
 
 public:
     TankTurret(Adafruit_MPU6050& c, Adafruit_MPU6050& t) 
@@ -435,23 +442,35 @@ public:
           yawSensor(AS5600_I2C),
           yawPID(CustomPID(2.2, 0.0, 0.5, 0.0, 15.0), CustomPID(0.18, 0.01, 0.002, 5.0, 8.0), 0.6f) {}
 
-    void init() {
+    bool init() {
         ESP32PWM::allocateTimer(2);
         pitchServo.setPeriodHertz(333);
         pitchServo.attach(Config::SERVO_PIN, 500, 2500);
         pitchServo.write(90);
 
-        mpuC.begin(0x68, &Wire1); mpuT.begin(0x69, &Wire1);
+        bool chassisOk = mpuC.begin(0x68, &Wire1);
+        bool turretOk = mpuT.begin(0x69, &Wire1);
+        if (!chassisOk || !turretOk) {
+            LOG_ALWAYS("!!! MPU6050 init failed: chassis=%d turret=%d\n", chassisOk, turretOk);
+            ready = false;
+            return false;
+        }
         mpuC.setGyroRange(MPU6050_RANGE_500_DEG); mpuT.setGyroRange(MPU6050_RANGE_500_DEG);
 
         yawSensor.init();
         yawDriver.voltage_power_supply = 12.0; yawDriver.init();
         yawMotor.linkSensor(&yawSensor); yawMotor.linkDriver(&yawDriver);
         yawMotor.controller = MotionControlType::torque;
-        yawMotor.init(); yawMotor.initFOC();
+        yawMotor.init();
+        ready = (yawMotor.initFOC() == 1);
+        if (!ready) {
+            LOG_ALWAYS("!!! Yaw motor FOC init failed.\n");
+        }
+        return ready;
     }
 
     void calibrate() {
+        if (!ready) return;
         LOG_ALWAYS(">>> Calibrating IMUs (%d samples), Keep Static...\n", Config::IMU_CALIB_SAMPLES);
         float sumT_Z = 0, sumT_X = 0, sumC_Z = 0, sumC_X = 0;
         
@@ -477,6 +496,7 @@ public:
     }
 
     void updateIMU(float dt) {
+        if (!ready) return;
         mpuC.getEvent(&aC, &gC, &tC); 
         mpuT.getEvent(&aT, &gT, &tT);
 
@@ -511,9 +531,10 @@ public:
         return chassisPitchFiltered;
     }
 
-    void runFOC() { yawMotor.loopFOC(); if (switchState) yawMotor.move(); else yawMotor.move(0); }
+    void runFOC() { if (!ready) return; yawMotor.loopFOC(); if (switchState) yawMotor.move(); else yawMotor.move(0); }
 
     void handleUI(bool aPressed, float joyX, float joyY, float dt) {
+        if (!ready) return;
         static bool lastA = false;
         if (aPressed && !lastA) {
             switchState = !switchState;
@@ -537,7 +558,7 @@ public:
     }
 
     void updateStabilization(float dt) {
-        if (!switchState) return;
+        if (!ready || !switchState) return;
         
         // 修正：补偿计算时，减去底盘 IMU 的零偏
         float chassisPitchRateDeg = c_gx_cal_deg;
@@ -561,6 +582,8 @@ public:
         
         LOG(TURRET_ONLY, "Y_Tgt:%.2f, Y_Real:%.2f\n", savedYawCont, yawContDeg);
     }
+
+    bool isReady() const { return ready; }
 };
 
 // ==========================================
@@ -572,6 +595,7 @@ private:
     Adafruit_MPU6050 mpuChassis, mpuTurret;
     TankChassis chassis; TankTurret turret;
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
+    bool systemReady = false;
 
 public:
     TankRobot() : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
@@ -581,8 +605,14 @@ public:
         Serial.begin(921600);
         Wire.begin(Config::I2C_FOC_SDA, Config::I2C_FOC_SCL); Wire.setClock(400000); 
         Wire1.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL); Wire1.setClock(400000); 
-        chassis.init(); turret.init(); 
-        delay(200); turret.calibrate(); 
+        chassis.init();
+        systemReady = turret.init();
+        if (systemReady) {
+            delay(200);
+            turret.calibrate();
+        } else {
+            LOG_ALWAYS("!!! System entered safe mode because turret init failed.\n");
+        }
         xboxController.begin(); 
 
         uint32_t now = micros();
@@ -591,6 +621,7 @@ public:
 
     
     void runFOC_Only() {
+        if (!systemReady) return;
         turret.runFOC(); // 内部调用 yawMotor.loopFOC() 和 move()
     }
 
@@ -598,7 +629,7 @@ public:
         // 蓝牙、IMU、底盘动力学都在 Core 1 执行
         uint32_t nowMicros = micros();
 
-        if (nowMicros - lastIMU >= 2000) { // 500Hz IMU
+        if (systemReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
             float dtIMU = (nowMicros - lastIMU) * 1e-6f; 
             lastIMU = nowMicros;
             turret.updateIMU(dtIMU);
@@ -606,7 +637,7 @@ public:
         if (nowMicros - lastUI >= 20000) { // 50Hz UI
             float dtUI = (nowMicros - lastUI) * 1e-6f;
             lastUI = nowMicros; xboxController.onLoop();
-            if (xboxController.isConnected()) {
+            if (systemReady && xboxController.isConnected()) {
                 float jX = (xboxController.xboxNotif.joyRHori - 32767.5f) / 32767.5f;
                 float jY = (xboxController.xboxNotif.joyRVert - 32767.5f) / 32767.5f;
                 turret.handleUI(xboxController.xboxNotif.btnA, jX, jY, dtUI);
@@ -615,7 +646,7 @@ public:
         if (nowMicros - lastCtrl >= 5000) { // 200Hz 控制
             float dtCtrl = (nowMicros - lastCtrl) * 1e-6f;
             lastCtrl = nowMicros;
-            if (xboxController.isConnected()) {
+            if (systemReady && xboxController.isConnected()) {
                 float tL = xboxController.xboxNotif.trigLT / 1023.0f;
                 float tR = xboxController.xboxNotif.trigRT / 1023.0f;
                 float jLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
