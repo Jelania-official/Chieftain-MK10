@@ -221,41 +221,27 @@ public:
     void stop() { targetSpeed = 0; pid.reset(); motor.drive(0); }
 };
 
-class AccelRateLimiter {
+// 专为重型内燃机设计的油门平滑器：踩油门迟滞(模拟涡轮/转速爬升)，松油门瞬间切断
+class ThrottleSmoother {
 private:
-    float a_actual = 0.0f;
-    float jerk_accel, jerk_brake;
+    float current_val = 0.0f;
+    float rise_rate; // 踩下时的爬升速度 (对应引擎迟滞)
+    float fall_rate; // 松开时的下降速度 (几乎瞬间)
 
 public:
-    AccelRateLimiter(float j_accel, float j_brake) 
-        : jerk_accel(j_accel), jerk_brake(j_brake) {}
+    ThrottleSmoother(float rise, float fall) : rise_rate(rise), fall_rate(fall) {}
 
-    float update(float target_a, float dt) {
-        float a_error = target_a - a_actual;
-        float current_jerk_limit;
-
-        // --- 物理逻辑优化：区分“建立动力”与“消除动力/制动” ---
-        
-        // 条件 1: (target_a * a_actual < 0) 
-        // 含义：目标力与当前力方向相反。例如正在前进(a>0)却踩下刹车(target_a<0)。这是急刹，需快！
-        
-        // 条件 2: (abs(target_a) < abs(a_actual))
-        // 含义：目标力的强度在减小。例如正在收油门滑行。这是减载，需快！
-
-        if ((target_a * a_actual < 0) || (abs(target_a) < abs(a_actual))) {
-            current_jerk_limit = jerk_brake; // 使用快速响应 (2.5)
+    float update(float target, float dt) {
+        if (target > current_val) {
+            // 踩油门：缓慢建立扭矩
+            current_val = min(current_val + rise_rate * dt, target);
         } else {
-            current_jerk_limit = jerk_accel; // 使用引擎迟滞 (0.4)
+            // 松油门/刹车：极其迅速地卸载扭矩
+            current_val = max(current_val - fall_rate * dt, target);
         }
-
-        // 安全步进限制，防止 dt 异常导致计算爆炸
-        float max_delta_a = current_jerk_limit * min(dt, 0.05f); 
-        
-        a_actual += constrain(a_error, -max_delta_a, max_delta_a);
-        return a_actual;
+        return current_val;
     }
-
-    void reset() { a_actual = 0.0f; }
+    void reset() { current_val = 0.0f; }
 };
 
 class TankChassis {
@@ -265,11 +251,12 @@ private:
     bool reverseMode = false;
     uint32_t rtPressedStartTime = 0;
 
-    // 实例化两个独立的动力限幅器
-    AccelRateLimiter linearLimiter; 
-    AccelRateLimiter yawLimiter;
+    // 引擎油门建立缓慢 (0.8)，但松油门切断极快 (10.0)
+    ThrottleSmoother engineSmoother; 
+    
+    // 刹车液压建立较快 (3.0)，松开也快 (10.0)
+    ThrottleSmoother brakeSmoother;  
 
-    // 惯性补偿状态变量
     float lastPitchRate = 0.0f;
     float filteredAlpha = 0.0f;
 
@@ -281,151 +268,139 @@ public:
         leftTrack (DCMotor(Config::L_IN1, Config::L_IN2, Config::L_PWM, Config::PWM_CH_L, true),
                    CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1),
                    CustomPID(1.2, 0.05, 0.3, 100.0, 255.0)),
-        linearLimiter(Config::LINEAR_JERK_ACCEL, Config::LINEAR_JERK_BRAKE),
-        yawLimiter(Config::YAW_JERK_ACCEL, Config::YAW_JERK_BRAKE) 
+        engineSmoother(0.8f, 10.0f),  // 参数可调：0.8表示油门踩到底需1秒多建立全扭矩
+        brakeSmoother(4.0f, 10.0f)    // 参数可调：刹车建立很快
     {}
 
     void init() { rightTrack.init(); leftTrack.init(); }
 
-    void processKinematics(float triggerL, float triggerR, float joyX, float dt,float currentPitchRate, float pitchAngle) {
+    void processKinematics(float triggerL, float triggerR, float joyX, float dt, float currentPitchRate, float pitchAngle) {
         uint32_t now = millis();
         bool isStopped = (abs(v_real) < 0.5f);
 
-        // 1. 倒车档位切换逻辑 (保留原样)
+        // 1. 倒车档位切换逻辑 
         if (triggerR > Config::RT_THRESHOLD) {
             if (rtPressedStartTime == 0) rtPressedStartTime = now;
             else if (isStopped && (now - rtPressedStartTime >= Config::RT_HOLD_TIME)) {
-                if (!reverseMode) { reverseMode = true; linearLimiter.reset(); }
+                if (!reverseMode) { reverseMode = true; engineSmoother.reset(); }
             }
-        }
-        else {
+        } else {
             rtPressedStartTime = 0;
             if (isStopped && reverseMode && triggerL > Config::RT_THRESHOLD) {
-                reverseMode = false;
-                linearLimiter.reset();
+                reverseMode = false; engineSmoother.reset();
             }
         }
 
         // ==========================================
-        // 纵向动力学 (Longitudinal Dynamics)
+        // 纵向动力学 (完全重构物理受力分析)
         // ==========================================
         
-        // 1. 确定推力/制动意图
-        float drive_force = 0.0f, brake_force = 0.0f, a_raw = 0.0f;
-        if (!reverseMode) { 
-            drive_force = Config::REAL_ACCEL * (triggerL * triggerL);
-            brake_force = Config::REAL_BRAKE * (triggerR * triggerR);
-            a_raw = drive_force - brake_force;
-        } else { 
-            drive_force = -Config::REAL_ACCEL * (triggerR * triggerR);
-            brake_force = Config::REAL_BRAKE * (triggerL * triggerL);
-            a_raw = drive_force + brake_force;
-        }
-        // --- [新增核心逻辑：坡度重力分解] ---
-        // 假设 pitchAngle > 0 代表车头朝上（上坡）。
-        // 上坡时，重力会把你往后拉（产生负加速度）；下坡时，重力把你往前推。
-        float slope_accel = -Config::SLOPE_GRAVITY_MAX * sin(pitchAngle * DEG_TO_RAD);
-        
-        // 将重力分量直接叠加进总推力中
-        a_raw += slope_accel;
+        // 1. 获取平滑后的油门与刹车输入 (0.0 ~ 1.0)
+        // trigger 做了平方处理，模拟摇杆的指数曲线，增加微操手感
+        float raw_throttle = reverseMode ? (triggerR * triggerR) : (triggerL * triggerL);
+        float raw_brake    = reverseMode ? (triggerL * triggerL) : (triggerR * triggerR);
 
-        // 2. 环境阻力计算 (保留你的变量名，加入方向控制)
-        // 计算阻力方向：基于 v_real 状态，而非 reverseMode 意图
-        float resDir = 0;
-        if (v_real > 0.1f) resDir = 1.0f;
-        else if (v_real < -0.1f) resDir = -1.0f;
-        else resDir = v_real / 0.1f; // 线性平滑区间
+        float eff_throttle = engineSmoother.update(raw_throttle, dt);
+        float eff_brake    = brakeSmoother.update(raw_brake, dt);
 
-        // --- 你的原始阻力公式 ---
+        // 2. 计算各独立作用力（换算为加速度，单位 km/h/s）
+        float force_engine = eff_throttle * Config::REAL_ACCEL; 
+        if (reverseMode) force_engine = -force_engine; // 倒车时引擎力向后
+
+        float force_brake = eff_brake * Config::REAL_BRAKE;
+
+        // 阻力：始终与当前运动方向相反
+        float resDir = (v_real > 0.1f) ? 1.0f : ((v_real < -0.1f) ? -1.0f : (v_real / 0.1f));
         float airResist = 0.001f * v_real * v_real;
-        float rollResistFactor = constrain(abs(v_real) / 0.5f, 0.0f, 1.0f);
-        float rollResist = 0.6f * rollResistFactor; 
-        // -----------------------
+        float rollResist = 0.8f * constrain(abs(v_real)/1.0f, 0.0f, 1.0f); // 滚动阻力
+        float force_resist = -(airResist + rollResist) * resDir;
 
-        // 3. 施加方向：阻力总和始终与 v_real 方向相反
-        float totalResist = (airResist + rollResist) * resDir;
-        a_raw -= totalResist;
+        // 坡度重力分量
+        float force_slope = -Config::SLOPE_GRAVITY_MAX * sin(pitchAngle * DEG_TO_RAD);
 
-        // 4. 静摩擦力锁死 (解决速度为0时加速度突变)
-        if (abs(v_real) < 0.05f) {
-            if (!reverseMode && a_raw < 0) {
-                a_raw = 0.0f; // 企图减速但车已停，静摩擦介入
-                v_real = 0.0f;
-            } else if (reverseMode && a_raw > 0) {
-                a_raw = 0.0f; 
-                v_real = 0.0f;
+        // 3. 施加刹车力的方向判定
+        // 刹车力是没有主动方向的，它只能去“抵消”当前的速度。
+        if (v_real > 0.1f) {
+            force_brake = -force_brake; // 车往前走，刹车向后拉
+        } else if (v_real < -0.1f) {
+            force_brake = force_brake;  // 车往后走，刹车向前拉
+        } else {
+            // 速度极小时，重力可能导致溜车。如果刹车踩得够死，静摩擦力接管，抵消所有外力。
+            if (eff_brake > 0.1f && abs(force_engine + force_slope) < (force_brake)) {
+                force_engine = 0; force_slope = 0; force_resist = 0; force_brake = 0; 
+                v_real = 0; // 死死刹停
+            } else {
+                force_brake = 0;
             }
         }
 
-        // 5. 经过 Jerk 限幅，计算最终纵向速度
-        float a_final = linearLimiter.update(a_raw, dt);
-        if (!reverseMode) {
-            v_real = constrain(v_real + a_final * dt, 0.0f, Config::REAL_V_MAX);
-        } else {
-            v_real = constrain(v_real + a_final * dt, -Config::REAL_V_REV_MAX, 0.0f);
-        }
+        // 4. 净力求和
+        float a_net = force_engine + force_brake + force_resist + force_slope;
+
+        // 5. 积分计算最终纵向速度
+        v_real += a_net * dt;
+
+        // 极限速度钳制
+        if (!reverseMode) v_real = constrain(v_real, 0.0f, Config::REAL_V_MAX);
+        else v_real = constrain(v_real, -Config::REAL_V_REV_MAX, 0.0f);
+
 
         // ==========================================
-        // 横向动力学 (Lateral Dynamics)
+        // 横向动力学 (重构为：目标速度追踪 + 强阻尼停转)
         // ==========================================
-
-        float joyX_adj = (abs(joyX) < 0.12f) ? 0 : joyX;
         
-        // 6. 随速感应灵敏度：速度越快，转弯越“重”
+        float joyX_adj = (abs(joyX) < 0.12f) ? 0 : joyX; // 死区
+        float joyX_squared = copysign(joyX_adj * joyX_adj, joyX_adj); 
+        
+        // 随速感应灵敏度
         float dynamic_sens = Config::YAW_SENSITIVITY / (1.0f + abs(v_real) * Config::SPEED_SENS_K);
         
-        // 指数映射 (Expo)：增加微操精度
-        float joyX_squared = copysign(joyX_adj * joyX_adj, joyX_adj); 
-        float target_a_yaw = joyX_squared * dynamic_sens;
+        // 目标自转速度 (不再是目标加速度！)
+        float target_spin_v = joyX_squared * dynamic_sens;
 
-        // 横向加速度也需要 Jerk 平滑 (液压建立时间)
-        float smooth_a_yaw = yawLimiter.update(target_a_yaw, dt);
+        // 履带转向的物理限制：加速建立有一个限度，但减速极快（因为没有滑行）
+        float max_yaw_accel = Config::YAW_JERK_ACCEL; 
+        
+        // 以限制好的加速度，向目标速度逼近
+        if (spinV < target_spin_v) {
+            spinV = min(spinV + max_yaw_accel * dt, target_spin_v);
+        } else if (spinV > target_spin_v) {
+            spinV = max(spinV - max_yaw_accel * dt, target_spin_v);
+        }
 
-        // 7. 旋转阻力衰减 (Damping)
-        spinV += smooth_a_yaw * dt;
-        spinV -= spinV * Config::YAW_DAMPING * dt; // 模拟巨大侧向摩擦
-        spinV = constrain(spinV, -8.0f, 8.0f);     // 限制物理极限自转速度
+        // 当松开摇杆时，施加极强的地面摩擦力瞬间刹停
+        if (joyX_adj == 0) {
+            if (spinV > 0) spinV = max(spinV - Config::YAW_JERK_BRAKE * dt, 0.0f);
+            else spinV = min(spinV + Config::YAW_JERK_BRAKE * dt, 0.0f);
+        }
 
         // ==========================================
-        // 双流耦合输出 (Coupled Output)
+        // 双流耦合输出 (保持不变)
         // ==========================================
-
-        // 8. 将线速度与自转速度无缝叠加
         float Lv_tgt = v_real + spinV;
         float Rv_tgt = v_real - spinV;
 
-        // 计算角加速度并滤波
         float rawAlpha = (currentPitchRate - lastPitchRate) / dt;
         lastPitchRate = currentPitchRate;
-        
-        // y(n) = y(n-1) + k * (x(n) - y(n-1))
         filteredAlpha = filteredAlpha + Config::V_INERTIA_LPF * (rawAlpha - filteredAlpha);
         
-        // 应用补偿量
         float v_comp = filteredAlpha * Config::V_INERTIA_GAIN;
         Lv_tgt -= v_comp;
         Rv_tgt -= v_comp;
 
-        // 找出两轮中绝对值最大的那个
         float max_val = max(abs(Lv_tgt), abs(Rv_tgt));
-
-        // 如果最大的那个超过了物理极限
         if (max_val > Config::REAL_V_MAX) {
             float ratio = Config::REAL_V_MAX / max_val;
-            Lv_tgt *= ratio; // 等比例缩小
-            Rv_tgt *= ratio;
+            Lv_tgt *= ratio; Rv_tgt *= ratio;
         }
 
         leftTrack.update(Lv_tgt, dt); 
         rightTrack.update(Rv_tgt, dt);
-
-        LOG(CHASSIS_ONLY, "V:%.2f, Spin:%.2f, L:%.2f, R:%.2f, a_raw:%.2f\n", 
-            v_real, spinV, leftTrack.currentSpeed, rightTrack.currentSpeed, a_raw);
     }
 
     void stop() { 
         v_real = 0; spinV = 0; 
-        linearLimiter.reset(); yawLimiter.reset();
+        engineSmoother.reset(); brakeSmoother.reset();
         leftTrack.stop(); rightTrack.stop(); 
     }
 };
@@ -591,31 +566,6 @@ public:
 // ==========================================
 // 6. 顶层统筹与任务调度
 // ==========================================
-// 在全局定义任务句柄
-TaskHandle_t FOC_TaskHandle;
-
-void FocTask(void *pvParameters) {
-    for (;;) {
-        // 核心0：死循环执行无刷 FOC，尽最大可能跑出最高频率
-        robot.runFOC_Only(); 
-        // 稍微延时让出一点点CPU防止看门狗复位，1微秒即可，或 yield()
-        vTaskDelay(0); 
-    }
-}
-
-void setup() { 
-    robot.setup(); 
-    
-    // 将 FOC 任务绑定到 Core 0
-    // 参数：任务函数, 任务名称, 栈大小, 参数, 优先级(设高一点), 句柄, 核心编号(0)
-    xTaskCreatePinnedToCore(FocTask, "FOC_Task", 4096, NULL, 5, &FOC_TaskHandle, 0);
-}
-
-void loop() { 
-    // Core 1：处理底盘、IMU、PID、Xbox蓝牙和舵机
-    robot.loop_without_FOC(); 
-}
-
 class TankRobot {
 private:
     XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
@@ -679,6 +629,9 @@ public:
     }
 };
 
+// ==========================================
+// 全局实例与 FreeRTOS 双核入口
+// ==========================================
 TankRobot robot;
 TaskHandle_t FOC_TaskHandle;
 // Core 0 的任务函数：只负责无刷电机的 FOC 算法
