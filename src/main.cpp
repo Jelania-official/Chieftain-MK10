@@ -62,8 +62,7 @@ namespace Config {
     // 现实中酋长MK10加速较慢，设定加速度约为 2.5 km/h每秒
     const float REAL_ACCEL = 2.5f;          
     const float REAL_BRAKE = 8.0f;          // 刹车减速度 (km/h/s)
-    const float RT_THRESHOLD = 0.2;         // 扳机触发阈值
-    const uint32_t RT_HOLD_TIME = 2000;     // 挂档长按时间(ms)
+    const float TRIGGER_DEADZONE = 0.2f;    // 扳机触发阈值
     // [动力学精细调校 - 3阶导数 Jerk 限制]
     // 前进/后退推力爬升限制 (km/h/s²)
     const float LINEAR_JERK_ACCEL = 0.4f;  // 模拟 L60 引擎缓慢的扭矩堆积
@@ -252,8 +251,6 @@ class TankChassis {
 private:
     TankTrack rightTrack, leftTrack;
     float v_real = 0, spinV = 0; 
-    bool reverseMode = false;
-    uint32_t rtPressedStartTime = 0;
 
     // 引擎油门建立缓慢 (0.8)，但松油门切断极快 (10.0)
     ThrottleSmoother engineSmoother; 
@@ -279,37 +276,33 @@ public:
     void init() { rightTrack.init(); leftTrack.init(); }
 
     void processKinematics(float triggerL, float triggerR, float joyX, float dt, float currentPitchRate, float pitchAngle) {
-        uint32_t now = millis();
-        bool isStopped = (abs(v_real) < 0.5f);
-
-        // 1. 倒车档位切换逻辑 
-        if (triggerR > Config::RT_THRESHOLD) {
-            if (rtPressedStartTime == 0) rtPressedStartTime = now;
-            else if (isStopped && (now - rtPressedStartTime >= Config::RT_HOLD_TIME)) {
-                if (!reverseMode) { reverseMode = true; engineSmoother.reset(); }
-            }
-        } else {
-            rtPressedStartTime = 0;
-            if (isStopped && reverseMode && triggerL > Config::RT_THRESHOLD) {
-                reverseMode = false; engineSmoother.reset();
-            }
-        }
-
         // ==========================================
-        // 纵向动力学 (完全重构物理受力分析)
+        // 纵向动力学 (游戏式 RT 前进 / LT 倒车)
         // ==========================================
         
         // 1. 获取平滑后的油门与刹车输入 (0.0 ~ 1.0)
         // trigger 做了平方处理，模拟摇杆的指数曲线，增加微操手感
-        float raw_throttle = reverseMode ? (triggerR * triggerR) : (triggerL * triggerL);
-        float raw_brake    = reverseMode ? (triggerL * triggerL) : (triggerR * triggerR);
+        float forwardInput = (triggerR > Config::TRIGGER_DEADZONE) ? (triggerR * triggerR) : 0.0f;
+        float reverseInput = (triggerL > Config::TRIGGER_DEADZONE) ? (triggerL * triggerL) : 0.0f;
+        float driveInput = forwardInput - reverseInput;
+        float desiredDir = (driveInput > 0.001f) ? 1.0f : ((driveInput < -0.001f) ? -1.0f : 0.0f);
+
+        float raw_throttle = abs(driveInput);
+        float raw_brake = 0.0f;
+
+        // 当请求方向与当前运动方向相反时，先把该输入当成刹车；接近停稳后再自动换向。
+        bool brakingToReverse = (v_real > 0.3f && desiredDir < 0.0f) || (v_real < -0.3f && desiredDir > 0.0f);
+        if (brakingToReverse) {
+            raw_brake = raw_throttle;
+            raw_throttle = 0.0f;
+            engineSmoother.reset();
+        }
 
         float eff_throttle = engineSmoother.update(raw_throttle, dt);
         float eff_brake    = brakeSmoother.update(raw_brake, dt);
 
         // 2. 计算各独立作用力（换算为加速度，单位 km/h/s）
-        float force_engine = eff_throttle * Config::REAL_ACCEL; 
-        if (reverseMode) force_engine = -force_engine; // 倒车时引擎力向后
+        float force_engine = eff_throttle * Config::REAL_ACCEL * desiredDir;
 
         float force_brake = eff_brake * Config::REAL_BRAKE;
 
@@ -345,8 +338,7 @@ public:
         v_real += a_net * dt;
 
         // 极限速度钳制
-        if (!reverseMode) v_real = constrain(v_real, 0.0f, Config::REAL_V_MAX);
-        else v_real = constrain(v_real, -Config::REAL_V_REV_MAX, 0.0f);
+        v_real = constrain(v_real, -Config::REAL_V_REV_MAX, Config::REAL_V_MAX);
 
 
         // ==========================================
@@ -404,7 +396,6 @@ public:
 
     void stop() { 
         v_real = 0; spinV = 0; 
-        reverseMode = false; rtPressedStartTime = 0;
         lastPitchRate = 0.0f; filteredAlpha = 0.0f;
         engineSmoother.reset(); brakeSmoother.reset();
         leftTrack.stop(); rightTrack.stop(); 
