@@ -96,6 +96,13 @@ namespace Config {
     const uint8_t FOC_PWM_A = 5, FOC_PWM_B = 19, FOC_PWM_C = 18; // 无刷驱动引脚
     const float REAL_TURRET_VEL = 22.5f;    // 真车转塔速度 (deg/s)
     const int IMU_CALIB_SAMPLES = 2000;     // IMU 启动校准采样次数 (2000次约4秒)
+    const float GUN_PITCH_MIN = -10.0f;     // 正常最低俯角 (deg)
+    const float GUN_PITCH_MAX = 20.0f;      // 最高仰角 (deg)
+    const float REAR_DECK_CENTER_YAW = 180.0f; // 炮塔正后方相对角 (deg)
+    const float REAR_DECK_AVOID_START = 15.0f; // 距正后方左右15度开始抬炮
+    const float REAR_DECK_AVOID_FULL = 10.0f;  // 距正后方左右10度内完全抬到安全俯角
+    const float REAR_DECK_SAFE_PITCH = 0.0f;   // 发动机舱上方允许的最低俯角 (deg)
+    const float REAR_DECK_BLEND_EXP = 1.0f;    // 1.0为线性，>1更晚抬，<1更早抬
 }
 
 // ==========================================
@@ -426,6 +433,30 @@ private:
     float chassisPitchFiltered = 0.0f; // [新增] 用于存放底盘的坡度角
     bool ready = false;
 
+    float wrapAngle180(float angleDeg) {
+        angleDeg = fmod(angleDeg, 360.0f);
+        if (angleDeg > 180.0f) angleDeg -= 360.0f;
+        if (angleDeg < -180.0f) angleDeg += 360.0f;
+        return angleDeg;
+    }
+
+    float getRearDeckMinPitch(float yawDeg) {
+        float yawWrapped = wrapAngle180(yawDeg);
+        float rearOffset = abs(abs(yawWrapped) - Config::REAR_DECK_CENTER_YAW);
+
+        if (rearOffset >= Config::REAR_DECK_AVOID_START) return Config::GUN_PITCH_MIN;
+        if (rearOffset <= Config::REAR_DECK_AVOID_FULL) return Config::REAR_DECK_SAFE_PITCH;
+
+        float span = Config::REAR_DECK_AVOID_START - Config::REAR_DECK_AVOID_FULL;
+        float blend = (Config::REAR_DECK_AVOID_START - rearOffset) / span;
+        blend = pow(constrain(blend, 0.0f, 1.0f), Config::REAR_DECK_BLEND_EXP);
+        return Config::GUN_PITCH_MIN + (Config::REAR_DECK_SAFE_PITCH - Config::GUN_PITCH_MIN) * blend;
+    }
+
+    float protectPitchForRearDeck(float pitchDeg, float yawDeg) {
+        return constrain(pitchDeg, getRearDeckMinPitch(yawDeg), Config::GUN_PITCH_MAX);
+    }
+
 public:
     TankTurret(Adafruit_MPU6050& c, Adafruit_MPU6050& t) 
         : mpuC(c), mpuT(t), yawMotor(7), 
@@ -543,7 +574,7 @@ public:
                 // 使用同样的线性映射：消除 0.15 处的突变跳变
                 float effectiveY = copysign((abs(joyY) - 0.15f) / 0.85f, joyY);
                 // 注意：joyY 通常向上推是负值，向下推是正值，请根据你的操作习惯确认符号
-                savedPitch = constrain(savedPitch - effectiveY * Config::REAL_TURRET_VEL * dt, -15.0f, 30.0f);
+                savedPitch = constrain(savedPitch - effectiveY * Config::REAL_TURRET_VEL * dt, Config::GUN_PITCH_MIN, Config::GUN_PITCH_MAX);
             }
         }
     }
@@ -560,7 +591,8 @@ public:
         float kP_pitch = 100.0f; 
         float kFF_pitch = 1.0f;  
 
-        float pErr = savedPitch - pitchFiltered;
+        float protectedPitch = protectPitchForRearDeck(savedPitch, savedYawCont);
+        float pErr = protectedPitch - pitchFiltered;
         // 算出期望的补偿角速度 (deg/s)
         float pitchRateCmd = (pErr * kP_pitch) - (chassisPitchRateDeg * kFF_pitch);
 
