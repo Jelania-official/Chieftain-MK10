@@ -98,16 +98,26 @@ namespace Config {
     const int IMU_CALIB_SAMPLES = 2000;     // IMU 启动校准采样次数 (2000次约4秒)
     const float GUN_PITCH_MIN = -10.0f;     // 正常最低俯角 (deg)
     const float GUN_PITCH_MAX = 20.0f;      // 最高仰角 (deg)
+    const float SERVO_CMD_MIN = 45.0f;      // 舵机安全命令下限
+    const float SERVO_CMD_MAX = 135.0f;     // 舵机安全命令上限
     const float REAR_DECK_CENTER_YAW = 180.0f; // 炮塔正后方相对角 (deg)
     const float REAR_DECK_AVOID_START = 15.0f; // 距正后方左右15度开始抬炮
     const float REAR_DECK_AVOID_FULL = 10.0f;  // 距正后方左右10度内完全抬到安全俯角
     const float REAR_DECK_SAFE_PITCH = 0.0f;   // 发动机舱上方允许的最低俯角 (deg)
     const float REAR_DECK_BLEND_EXP = 1.0f;    // 1.0为线性，>1更晚抬，<1更早抬
+    const float TURRET_FRONT_SENSOR_OFFSET = 0.0f; // AS5600 读数对应车体正前的机械角 (deg)
+    const float TURRET_SENSOR_SIGN = 1.0f;         // 方向修正: 1.0正常, -1.0反向
+    const float IMU_MAX_DT = 0.05f;               // IMU 单次采样最大有效周期 (s)
+    const float IMU_GYRO_SANITY_DPS = 550.0f;     // IMU 角速度合理上限 (deg/s)
+    const float PITCH_RATE_CMD_MAX = 180.0f;      // 俯仰稳定最大指令角速度 (deg/s)
+    const uint32_t CONTROLLER_TIMEOUT_MS = 300;   // 手柄失联超时
+    const uint32_t YAW_SENSOR_STALE_US = 50000;   // AS5600 缓存有效期
 }
 
 // ==========================================
 // 2. 基础控制算法 (PID)
 // ==========================================
+// 最底层的通用 PID，给履带速度环和炮塔级联控制共用。
 class CustomPID {
 public:
     float kp, ki, kd, maxOut, maxI;
@@ -127,6 +137,7 @@ public:
     void reset() { integral = 0; prevError = 0; }
 };
 
+// 炮塔 yaw 用的是位置环套速度环的级联结构，外环给目标角速度，内环出最终驱动量。
 class CascadePID {
 public:
     CustomPID outer; CustomPID inner; float ff_gain;
@@ -142,6 +153,7 @@ public:
 // ==========================================
 // 3. 硬件抽象 (电机与编码器)
 // ==========================================
+// TB6612 有刷电机抽象：输入范围约定为 -255~255，符号代表方向。
 class DCMotor {
 private:
     uint8_t in1, in2, pwmPin, pwmCh; bool isLeft;
@@ -181,6 +193,7 @@ public:
     }
 };
 
+// N20 编码器抽象：用 ESP32 的 PCNT 外设做 AB 相计数，再换算成真车等效速度。
 class CustomEncoder {
 private:
     pcnt_unit_t unit; int16_t lastCount = 0; uint32_t lastTime = 0; float lastSpeed = 0.0f;
@@ -216,6 +229,7 @@ public:
 // ==========================================
 // 4. 底盘系统 (真车物理模拟)
 // ==========================================
+// 单侧履带 = 电机 + 编码器 + 速度 PID。
 class TankTrack {
 public:
     DCMotor motor; CustomEncoder encoder; CustomPID pid;
@@ -254,6 +268,7 @@ public:
     void reset() { current_val = 0.0f; }
 };
 
+// 底盘总控：把手柄输入解释成“发动机推力/刹车/阻力/坡度”的合力，再映射到双履带。
 class TankChassis {
 private:
     TankTrack rightTrack, leftTrack;
@@ -282,6 +297,7 @@ public:
 
     void init() { rightTrack.init(); leftTrack.init(); }
 
+    // 这里的速度单位统一用“真车等效 km/h”，这样比例映射和参数调校更直观。
     void processKinematics(float triggerL, float triggerR, float joyX, float dt, float currentPitchRate, float pitchAngle) {
         // ==========================================
         // 纵向动力学 (游戏式 RT 前进 / LT 倒车)
@@ -412,6 +428,10 @@ public:
 // ==========================================
 // 5. 炮塔双稳系统 (22.5°/s 现实限速)
 // ==========================================
+// 炮塔部分分成三层：
+// 1. 读取 IMU/编码器，得到底盘姿态、炮管姿态和炮塔方位；
+// 2. 处理玩家输入，维护“世界系目标朝向”和“炮管目标俯仰”；
+// 3. 在稳定器开启时输出舵机俯仰指令和 yaw FOC 目标电压。
 class TankTurret {
 private:
     Adafruit_MPU6050 &mpuC, &mpuT; 
@@ -425,14 +445,19 @@ private:
     float currentPitchAngle = 90.0f;
     float savedPitch = 0, savedYawCont = 0;
     float yawContDeg = 0;
-    bool yawInitDone = false, switchState = false;
-    float pitchFiltered = 0, gyroZ_offset = 0, gyroX_offset = 0;
+    volatile bool switchState = false;
+    float pitchFiltered = 0;
     float t_gyroZ_offset = 0, t_gyroX_offset = 0; // 炮塔零偏
     float c_gyroZ_offset = 0, c_gyroX_offset = 0; // 底盘零偏
     float c_gx_cal_deg = 0.0f; // 存放处理后的底盘俯仰角速度 (deg/s)
     float chassisPitchFiltered = 0.0f; // [新增] 用于存放底盘的坡度角
     bool ready = false;
+    volatile bool imuHealthy = false;
+    volatile bool yawSensorHealthy = false;
+    volatile float cachedTurretMechYawDeg = 0.0f;
+    volatile uint32_t lastYawSensorUpdateUs = 0;
 
+    // 角度统一折算到 [-180, 180]，方便做“是不是在车体后方”的几何判断。
     float wrapAngle180(float angleDeg) {
         angleDeg = fmod(angleDeg, 360.0f);
         if (angleDeg > 180.0f) angleDeg -= 360.0f;
@@ -440,6 +465,8 @@ private:
         return angleDeg;
     }
 
+    // 根据“相对车体后方”的夹角，计算当前允许的最低俯角。
+    // 正常时允许到 GUN_PITCH_MIN，接近发动机舱时逐渐抬到 REAR_DECK_SAFE_PITCH。
     float getRearDeckMinPitch(float yawDeg) {
         float yawWrapped = wrapAngle180(yawDeg);
         float rearOffset = abs(abs(yawWrapped) - Config::REAR_DECK_CENTER_YAW);
@@ -455,6 +482,21 @@ private:
 
     float protectPitchForRearDeck(float pitchDeg, float yawDeg) {
         return constrain(pitchDeg, getRearDeckMinPitch(yawDeg), Config::GUN_PITCH_MAX);
+    }
+
+    // FOC 核心持续刷新 AS5600 机械角缓存，控制核心只读缓存，避免跨核争用 I2C。
+    bool isYawSensorFresh() const {
+        return yawSensorHealthy && ((uint32_t)(micros() - lastYawSensorUpdateUs) <= Config::YAW_SENSOR_STALE_US);
+    }
+
+    float getTurretRelativeYawDegFromSensor() {
+        if (!isYawSensorFresh()) return Config::REAR_DECK_CENTER_YAW;
+        float sensorDeg = cachedTurretMechYawDeg;
+        return wrapAngle180((sensorDeg - Config::TURRET_FRONT_SENSOR_OFFSET) * Config::TURRET_SENSOR_SIGN);
+    }
+
+    bool validateImuEvent(float valueDegPerSec) {
+        return isfinite(valueDegPerSec) && abs(valueDegPerSec) <= Config::IMU_GYRO_SANITY_DPS;
     }
 
 public:
@@ -480,6 +522,12 @@ public:
         mpuC.setGyroRange(MPU6050_RANGE_500_DEG); mpuT.setGyroRange(MPU6050_RANGE_500_DEG);
 
         yawSensor.init();
+        float initialSensorDeg = yawSensor.getMechanicalAngle() * RAD_TO_DEG;
+        if (isfinite(initialSensorDeg)) {
+            cachedTurretMechYawDeg = initialSensorDeg;
+            yawSensorHealthy = true;
+            lastYawSensorUpdateUs = micros();
+        }
         yawDriver.voltage_power_supply = 12.0; yawDriver.init();
         yawMotor.linkSensor(&yawSensor); yawMotor.linkDriver(&yawDriver);
         yawMotor.controller = MotionControlType::torque;
@@ -491,6 +539,7 @@ public:
         return ready;
     }
 
+    // 上电静态标定：仅估零偏，不假设炮塔当前必须朝向正前。
     void calibrate() {
         if (!ready) return;
         LOG_ALWAYS(">>> Calibrating IMUs (%d samples), Keep Static...\n", Config::IMU_CALIB_SAMPLES);
@@ -509,7 +558,12 @@ public:
         t_gyroX_offset = sumT_X / (float)Config::IMU_CALIB_SAMPLES;
         c_gyroZ_offset = sumC_Z / (float)Config::IMU_CALIB_SAMPLES; 
         c_gyroX_offset = sumC_X / (float)Config::IMU_CALIB_SAMPLES;
-        
+        imuHealthy = true;
+        yawPID.reset();
+        switchState = false;
+        savedPitch = pitchFiltered;
+        savedYawCont = yawContDeg;
+
         // 校准完成后，炮管上下“点头”一下
         pitchServo.write(105);
         delay(200);
@@ -519,6 +573,11 @@ public:
 
     void updateIMU(float dt) {
         if (!ready) return;
+        if (dt <= 0.0f || dt > Config::IMU_MAX_DT) {
+            imuHealthy = false;
+            switchState = false;
+            return;
+        }
         mpuC.getEvent(&aC, &gC, &tC); 
         mpuT.getEvent(&aT, &gT, &tT);
 
@@ -530,17 +589,29 @@ public:
         // 互补滤波计算底盘的绝对姿态
         chassisPitchFiltered = 0.96f * (chassisPitchFiltered + c_gx_cal_deg * dt) + 0.04f * c_pitchAcc;
 
-        // 1. 减去零偏，得到真实的角速度
+        // 1. 减去零偏，得到真实角速度。这里先做原始值健壮性检查，异常就直接退出稳定。
         float gz_cal = gT.gyro.z - t_gyroZ_offset;
         if (abs(gz_cal) < 0.005f) gz_cal = 0.0f; // 消除静止底噪带来的缓慢漂移
         float gx_cal = gT.gyro.x - t_gyroX_offset;
-
-        // 2. 俯仰角 (Pitch) 互补滤波
+        float chassisYawRateDeg = (gC.gyro.z - c_gyroZ_offset) * RAD_TO_DEG;
         float pitchAcc = atan2(aT.acceleration.y, aT.acceleration.z) * RAD_TO_DEG;
+
+        if (!isfinite(c_pitchAcc) || !isfinite(pitchAcc) ||
+            !validateImuEvent(c_gx_cal_deg) ||
+            !validateImuEvent(gx_cal * RAD_TO_DEG) ||
+            !validateImuEvent(gz_cal * RAD_TO_DEG) ||
+            !validateImuEvent(chassisYawRateDeg)) {
+            imuHealthy = false;
+            switchState = false;
+            return;
+        }
+        imuHealthy = true;
+
+        // 2. 俯仰角 (Pitch) 互补滤波：加速度计给低频重力方向，陀螺仪给高速响应。
         pitchFiltered = 0.96f * (pitchFiltered + gx_cal * RAD_TO_DEG * dt) + 0.04f * pitchAcc;
 
-        // 3. 偏航角 (Yaw) 直接积分 (删除了多余的 accYaw 和 unwrapYaw)
-        // yawContDeg 现在就是一个纯净的、无限连续的相对角度
+        // 3. yaw 继续用积分维持“世界系目标”，而不是相对车体角；
+        // 相对车体几何关系已经由 AS5600 单独负责。
         yawContDeg += gz_cal * RAD_TO_DEG * dt; 
     }
 
@@ -553,14 +624,53 @@ public:
         return chassisPitchFiltered;
     }
 
-    void runFOC() { if (!ready) return; yawMotor.loopFOC(); if (switchState) yawMotor.move(); else yawMotor.move(0); }
+    void runFOC() {
+        if (!ready) return;
+        yawMotor.loopFOC();
 
+        // FOC 所在核心顺手刷新一次 AS5600 机械角缓存，供控制核心做后向防干涉判断。
+        float sensorDeg = yawSensor.getMechanicalAngle() * RAD_TO_DEG;
+        if (isfinite(sensorDeg)) {
+            cachedTurretMechYawDeg = sensorDeg;
+            yawSensorHealthy = true;
+            lastYawSensorUpdateUs = micros();
+        } else {
+            yawSensorHealthy = false;
+        }
+
+        if (switchState && imuHealthy && isYawSensorFresh()) yawMotor.move();
+        else yawMotor.move(0);
+    }
+
+    void enterSafeState() {
+        switchState = false;
+        imuHealthy = false;
+        yawPID.reset();
+        yawMotor.target = 0.0f;
+    }
+
+    // 断连和故障分开处理：断连不等于传感器坏了，只是立即停止执行目标。
+    void enterDisconnectedState() {
+        switchState = false;
+        yawPID.reset();
+        yawMotor.target = 0.0f;
+    }
+
+    // A 键作为稳定器总开关；只有 IMU 和 AS5600 都健康时才允许进入稳定模式。
     void handleUI(bool aPressed, float joyX, float joyY, float dt) {
         if (!ready) return;
         static bool lastA = false;
         if (aPressed && !lastA) {
-            switchState = !switchState;
-            if (switchState) { savedPitch = pitchFiltered; savedYawCont = yawContDeg; yawPID.reset(); }
+            if (switchState) {
+                switchState = false;
+                yawPID.reset();
+                yawMotor.target = 0.0f;
+            } else if (imuHealthy && isYawSensorFresh()) {
+                switchState = true;
+                savedPitch = pitchFiltered;
+                savedYawCont = yawContDeg;
+                yawPID.reset();
+            }
         }
         lastA = aPressed;
         if (switchState) {
@@ -581,8 +691,12 @@ public:
 
     void updateStabilization(float dt) {
         if (!ready || !switchState) return;
+        if (!imuHealthy || !isYawSensorFresh()) {
+            enterSafeState();
+            return;
+        }
         
-        // 修正：补偿计算时，减去底盘 IMU 的零偏
+        // 俯仰双稳：底盘抬头会立刻通过前馈向下补，位置误差再由 P 环慢慢拉回。
         float chassisPitchRateDeg = c_gx_cal_deg;
         float chassisYawRateDeg = (gC.gyro.z - c_gyroZ_offset) * RAD_TO_DEG;
 
@@ -591,22 +705,25 @@ public:
         float kP_pitch = 100.0f; 
         float kFF_pitch = 1.0f;  
 
-        float protectedPitch = protectPitchForRearDeck(savedPitch, savedYawCont);
+        float protectedPitch = protectPitchForRearDeck(savedPitch, getTurretRelativeYawDegFromSensor());
         float pErr = protectedPitch - pitchFiltered;
         // 算出期望的补偿角速度 (deg/s)
         float pitchRateCmd = (pErr * kP_pitch) - (chassisPitchRateDeg * kFF_pitch);
+        pitchRateCmd = constrain(pitchRateCmd, -Config::PITCH_RATE_CMD_MAX, Config::PITCH_RATE_CMD_MAX);
 
-        // 乘以 dt，得到本帧需要改变的具体角度
-        currentPitchAngle = constrain(currentPitchAngle + (pitchRateCmd * dt), 45.0f, 135.0f);
+        // 舵机命令限位用机构角，不直接等于物理俯仰角。
+        currentPitchAngle = constrain(currentPitchAngle + (pitchRateCmd * dt), Config::SERVO_CMD_MIN, Config::SERVO_CMD_MAX);
         pitchServo.write(currentPitchAngle);
         
+        // yaw 双稳继续工作在“世界系目标”上，底盘转动时通过底盘 yaw 角速度前馈抵消。
         float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, (gT.gyro.z - t_gyroZ_offset) * RAD_TO_DEG, -chassisYawRateDeg, dt);
         yawMotor.target = yVoltage;
         
-        LOG(TURRET_ONLY, "Y_Tgt:%.2f, Y_Real:%.2f\n", savedYawCont, yawContDeg);
+        LOG(TURRET_ONLY, "Y_Tgt:%.2f, Y_Real:%.2f, Y_RelSens:%.2f\n", savedYawCont, yawContDeg, getTurretRelativeYawDegFromSensor());
     }
 
     bool isReady() const { return ready; }
+    bool isHealthy() const { return ready && imuHealthy && isYawSensorFresh(); }
 };
 
 // ==========================================
@@ -618,7 +735,14 @@ private:
     Adafruit_MPU6050 mpuChassis, mpuTurret;
     TankChassis chassis; TankTurret turret;
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
+    uint32_t lastControllerPacketMs = 0;
     bool systemReady = false;
+
+    // 手柄库的 isConnected() 不是 const 成员，所以这里不能把方法声明成 const。
+    bool controllerHealthy() {
+        return xboxController.isConnected() &&
+               ((uint32_t)(millis() - lastControllerPacketMs) <= Config::CONTROLLER_TIMEOUT_MS);
+    }
 
 public:
     TankRobot() : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
@@ -637,6 +761,7 @@ public:
             LOG_ALWAYS("!!! System entered safe mode because turret init failed.\n");
         }
         xboxController.begin(); 
+        lastControllerPacketMs = millis();
 
         uint32_t now = micros();
         lastIMU = now; lastUI = now; lastCtrl = now;
@@ -648,6 +773,7 @@ public:
         turret.runFOC(); // 内部调用 yawMotor.loopFOC() 和 move()
     }
 
+    // Core 1 主循环：低频 UI、中频控制、高频 IMU，和 Core 0 的 FOC 任务解耦。
     void loop_without_FOC() {
         // 蓝牙、IMU、底盘动力学都在 Core 1 执行
         uint32_t nowMicros = micros();
@@ -660,7 +786,10 @@ public:
         if (nowMicros - lastUI >= 20000) { // 50Hz UI
             float dtUI = (nowMicros - lastUI) * 1e-6f;
             lastUI = nowMicros; xboxController.onLoop();
-            if (systemReady && xboxController.isConnected()) {
+            if (xboxController.isConnected()) {
+                lastControllerPacketMs = millis();
+            }
+            if (systemReady && controllerHealthy()) {
                 float jX = (xboxController.xboxNotif.joyRHori - 32767.5f) / 32767.5f;
                 float jY = (xboxController.xboxNotif.joyRVert - 32767.5f) / 32767.5f;
                 turret.handleUI(xboxController.xboxNotif.btnA, jX, jY, dtUI);
@@ -669,7 +798,7 @@ public:
         if (nowMicros - lastCtrl >= 5000) { // 200Hz 控制
             float dtCtrl = (nowMicros - lastCtrl) * 1e-6f;
             lastCtrl = nowMicros;
-            if (systemReady && xboxController.isConnected()) {
+            if (systemReady && controllerHealthy()) {
                 float tL = xboxController.xboxNotif.trigLT / 1023.0f;
                 float tR = xboxController.xboxNotif.trigRT / 1023.0f;
                 float jLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
@@ -678,7 +807,10 @@ public:
                 float pAngle = turret.getChassisPitchAngle();
                 chassis.processKinematics(tL, tR, jLX, dtCtrl, pRate, pAngle);
                 turret.updateStabilization(dtCtrl);
-            } else { chassis.stop(); }
+            } else {
+                chassis.stop();
+                turret.enterDisconnectedState();
+            }
         }
     }
 };
