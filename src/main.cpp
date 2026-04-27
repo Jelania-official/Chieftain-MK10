@@ -34,6 +34,14 @@ namespace Config {
     const uint8_t I2C_FOC_SDA = 16, I2C_FOC_SCL = 17; // 磁编码器(AS5600)总线
     const uint8_t I2C_IMU_SDA = 21, I2C_IMU_SCL = 22; // 陀螺仪(MPU6050)总线
 
+    // [电池电压检测] 使用 ADC1，避免和蓝牙/Wi-Fi 占用的 ADC2 冲突
+    const uint8_t VBAT_ADC_PIN = 39;                // 仅输入，适合做电压采样
+    const float VBAT_DIVIDER_R1 = 100000.0f;        // 上拉分压电阻，默认 100k
+    const float VBAT_DIVIDER_R2 = 33000.0f;         // 下拉分压电阻，默认 33k
+    const float VBAT_LPF = 0.1f;                    // 电压低通滤波系数
+    const float VBAT_WARN = 10.8f;                  // 3S 低压预警阈值
+    const float VBAT_CUTOFF = 10.2f;                // 3S 低压切断阈值
+
     // [底盘动力引脚]
     const uint8_t R_IN1 = 25, R_IN2 = 33, R_PWM = 32; // 右侧直流驱动
     const uint8_t L_IN1 = 26, L_IN2 = 27, L_PWM = 14; // 左侧直流驱动
@@ -112,6 +120,7 @@ namespace Config {
     const float PITCH_RATE_CMD_MAX = 180.0f;      // 俯仰稳定最大指令角速度 (deg/s)
     const uint32_t CONTROLLER_TIMEOUT_MS = 300;   // 手柄失联超时
     const uint32_t YAW_SENSOR_STALE_US = 50000;   // AS5600 缓存有效期
+    const uint32_t VBAT_SAMPLE_MS = 100;          // 电池电压采样周期
 }
 
 // ==========================================
@@ -736,7 +745,43 @@ private:
     TankChassis chassis; TankTurret turret;
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
     uint32_t lastControllerPacketMs = 0;
+    uint32_t lastBatterySampleMs = 0;
     bool systemReady = false;
+    float batteryVoltage = 0.0f;
+    bool batteryValid = false;
+
+    float readBatteryVoltage() {
+        uint32_t adcMilliVolts = analogReadMilliVolts(Config::VBAT_ADC_PIN);
+        float adcVolts = adcMilliVolts * 0.001f;
+        return adcVolts * ((Config::VBAT_DIVIDER_R1 + Config::VBAT_DIVIDER_R2) / Config::VBAT_DIVIDER_R2);
+    }
+
+    void updateBatteryMonitor() {
+        uint32_t nowMs = millis();
+        if ((uint32_t)(nowMs - lastBatterySampleMs) < Config::VBAT_SAMPLE_MS) return;
+        lastBatterySampleMs = nowMs;
+
+        float sample = readBatteryVoltage();
+        if (!isfinite(sample) || sample <= 0.0f) {
+            batteryValid = false;
+            return;
+        }
+
+        if (!batteryValid) {
+            batteryVoltage = sample;
+            batteryValid = true;
+        } else {
+            batteryVoltage += Config::VBAT_LPF * (sample - batteryVoltage);
+        }
+    }
+
+    bool batteryCritical() const {
+        return batteryValid && batteryVoltage <= Config::VBAT_CUTOFF;
+    }
+
+    bool batteryWarning() const {
+        return batteryValid && batteryVoltage <= Config::VBAT_WARN;
+    }
 
     // 手柄库的 isConnected() 不是 const 成员，所以这里不能把方法声明成 const。
     bool controllerHealthy() {
@@ -752,6 +797,10 @@ public:
         Serial.begin(921600);
         Wire.begin(Config::I2C_FOC_SDA, Config::I2C_FOC_SCL); Wire.setClock(400000); 
         Wire1.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL); Wire1.setClock(400000); 
+        analogReadResolution(12);
+        analogSetPinAttenuation(Config::VBAT_ADC_PIN, ADC_11db);
+        pinMode(Config::VBAT_ADC_PIN, INPUT);
+        updateBatteryMonitor();
         chassis.init();
         systemReady = turret.init();
         if (systemReady) {
@@ -777,6 +826,7 @@ public:
     void loop_without_FOC() {
         // 蓝牙、IMU、底盘动力学都在 Core 1 执行
         uint32_t nowMicros = micros();
+        updateBatteryMonitor();
 
         if (systemReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
             float dtIMU = (nowMicros - lastIMU) * 1e-6f; 
@@ -798,7 +848,11 @@ public:
         if (nowMicros - lastCtrl >= 5000) { // 200Hz 控制
             float dtCtrl = (nowMicros - lastCtrl) * 1e-6f;
             lastCtrl = nowMicros;
-            if (systemReady && controllerHealthy()) {
+            if (batteryCritical()) {
+                chassis.stop();
+                turret.enterSafeState();
+                LOG_ALWAYS("!!! Battery cutoff active: %.2fV\n", batteryVoltage);
+            } else if (systemReady && controllerHealthy()) {
                 float tL = xboxController.xboxNotif.trigLT / 1023.0f;
                 float tR = xboxController.xboxNotif.trigRT / 1023.0f;
                 float jLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
@@ -807,6 +861,12 @@ public:
                 float pAngle = turret.getChassisPitchAngle();
                 chassis.processKinematics(tL, tR, jLX, dtCtrl, pRate, pAngle);
                 turret.updateStabilization(dtCtrl);
+
+                static uint32_t lastBatteryWarnLogMs = 0;
+                if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
+                    lastBatteryWarnLogMs = millis();
+                    LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
+                }
             } else {
                 chassis.stop();
                 turret.enterDisconnectedState();
