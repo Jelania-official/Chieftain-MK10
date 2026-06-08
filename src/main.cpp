@@ -124,11 +124,19 @@ namespace Config {
     const uint8_t SERVO_PIN = 15;           // 俯仰舵机引脚
     const uint8_t FOC_PWM_A = 5, FOC_PWM_B = 19, FOC_PWM_C = 18; // 无刷驱动引脚
     const float REAL_TURRET_VEL = 22.5f;    // 真车转塔速度 (deg/s)
+    const float YAW_OUTER_RATE_MAX = 25.0f; // yaw 外环最大目标角速度，略高于真车满速避免追不上手柄目标
+    const float YAW_VOLTAGE_MAX = 6.0f;     // 给 SimpleFOC torque/voltage 目标的总限幅
+    const float YAW_CHASSIS_FF_GAIN = 0.6f; // 底盘 yaw 角速度前馈增益
     const int IMU_CALIB_SAMPLES = 2000;     // IMU 启动校准采样次数 (2000次约4秒)
     const float GUN_PITCH_MIN = -10.0f;     // 正常最低俯角 (deg)
     const float GUN_PITCH_MAX = 20.0f;      // 最高仰角 (deg)
     const float SERVO_CMD_MIN = 45.0f;      // 舵机安全命令下限
     const float SERVO_CMD_MAX = 135.0f;     // 舵机安全命令上限
+    const float PITCH_ACC_TAU = 0.6f;       // 炮管 pitch 互补滤波中加速度计纠漂时间常数
+    const float PITCH_STAB_KP = 70.0f;      // pitch 角度误差到目标角速度的比例增益
+    const float PITCH_STAB_KD = 0.35f;      // 炮管自身 pitch 角速度阻尼
+    const float PITCH_CHASSIS_FF = 1.0f;    // 底盘 pitch 角速度前馈补偿
+    const float PITCH_SERVO_RATE_DEADZONE_DPS = 1.5f; // 小于该角速度命令时不刷新舵机，降低嗡嗡抖动
     const float REAR_DECK_CENTER_YAW = 180.0f; // 炮塔正后方相对角 (deg)
     const float REAR_DECK_AVOID_START = 15.0f; // 距正后方左右15度开始抬炮
     const float REAR_DECK_AVOID_FULL = 10.0f;  // 距正后方左右10度内完全抬到安全俯角
@@ -180,7 +188,9 @@ public:
     float calculate(float posRef, float posFdb, float velFdb, float chassisVel, float dt) {
         float targetVel = outer.calculate(posRef, posFdb, dt);
         float innerOut = inner.calculate(targetVel, velFdb, dt);
-        return innerOut + (ff_gain * chassisVel);
+        return constrain(innerOut + (ff_gain * chassisVel),
+                         -Config::YAW_VOLTAGE_MAX,
+                         Config::YAW_VOLTAGE_MAX);
     }
     void reset() { outer.reset(); inner.reset(); }
 };
@@ -643,6 +653,8 @@ private:
     float pitchFiltered = 0;
     float t_gyroZ_offset = 0, t_gyroX_offset = 0; // 炮塔零偏
     float c_gyroZ_offset = 0, c_gyroX_offset = 0; // 底盘零偏
+    float t_gx_cal_deg = 0.0f; // 存放处理后的炮管 pitch 角速度 (deg/s)
+    float t_gz_cal_deg = 0.0f; // 存放处理后的炮塔 yaw 角速度 (deg/s)
     float c_gx_cal_deg = 0.0f; // 存放处理后的底盘俯仰角速度 (deg/s)
     float c_gz_cal_deg = 0.0f; // 存放处理后的底盘 yaw 角速度 (deg/s)
     float chassisPitchFiltered = 0.0f; // [新增] 用于存放底盘的坡度角
@@ -811,7 +823,9 @@ public:
         : mpuC(c), mpuT(t), yawMotor(7), 
           yawDriver(Config::FOC_PWM_A, Config::FOC_PWM_B, Config::FOC_PWM_C),
           yawSensor(AS5600_I2C),
-          yawPID(CustomPID(2.2, 0.0, 0.5, 0.0, 15.0), CustomPID(0.18, 0.01, 0.002, 5.0, 8.0), 0.6f) {}
+          yawPID(CustomPID(2.2, 0.0, 0.5, 0.0, Config::YAW_OUTER_RATE_MAX),
+                 CustomPID(0.18, 0.01, 0.002, 5.0, Config::YAW_VOLTAGE_MAX),
+                 Config::YAW_CHASSIS_FF_GAIN) {}
 
     bool init() {
         ESP32PWM::allocateTimer(2);
@@ -902,25 +916,28 @@ public:
         // 1. 减去零偏，得到真实角速度。这里先做原始值健壮性检查，异常就直接退出稳定。
         float gz_cal = gT.gyro.z - t_gyroZ_offset;
         if (abs(gz_cal) < 0.005f) gz_cal = 0.0f; // 消除静止底噪带来的缓慢漂移
-        float gx_cal = gT.gyro.x - t_gyroX_offset;
+        t_gx_cal_deg = (gT.gyro.x - t_gyroX_offset) * RAD_TO_DEG;
+        t_gz_cal_deg = gz_cal * RAD_TO_DEG;
         float pitchAcc = atan2(aT.acceleration.y, aT.acceleration.z) * RAD_TO_DEG;
 
         if (!isfinite(c_pitchAcc) || !isfinite(pitchAcc) ||
             !validateImuEvent(c_gx_cal_deg) ||
-            !validateImuEvent(gx_cal * RAD_TO_DEG) ||
-            !validateImuEvent(gz_cal * RAD_TO_DEG) ||
+            !validateImuEvent(t_gx_cal_deg) ||
+            !validateImuEvent(t_gz_cal_deg) ||
             !validateImuEvent(c_gz_cal_deg)) {
             setImuHealthy(false);
             return;
         }
         setImuHealthy(true);
 
-        // 2. 俯仰角 (Pitch) 互补滤波：加速度计给低频重力方向，陀螺仪给高速响应。
-        pitchFiltered = 0.96f * (pitchFiltered + gx_cal * RAD_TO_DEG * dt) + 0.04f * pitchAcc;
+        // 2. 俯仰角 (Pitch) 互补滤波：陀螺仪管快速稳定，加速度计只慢速纠漂。
+        float pitchAccelBlend = dt / (Config::PITCH_ACC_TAU + dt);
+        float pitchGyroPrediction = pitchFiltered + t_gx_cal_deg * dt;
+        pitchFiltered = (1.0f - pitchAccelBlend) * pitchGyroPrediction + pitchAccelBlend * pitchAcc;
 
         // 3. yaw 继续用积分维持“世界系目标”，而不是相对车体角；
         // 相对车体几何关系已经由 AS5600 单独负责。
-        yawContDeg += gz_cal * RAD_TO_DEG * dt; 
+        yawContDeg += t_gz_cal_deg * dt;
     }
 
     // 获取已经算好的底盘俯仰速率
@@ -1013,23 +1030,25 @@ public:
         float chassisPitchRateDeg = c_gx_cal_deg;
         float chassisYawRateDeg = c_gz_cal_deg;
 
-        // 假设期望的 P 增益为 150 (每1度误差，要求 150度/秒 的回正速度)
-        // 前馈增益设为 1.0 (底盘抬起 10度/秒，舵机就低头 10度/秒 完全抵消)
-        float kP_pitch = 100.0f; 
-        float kFF_pitch = 1.0f;  
-
         float protectedPitch = protectPitchForRearDeck(savedPitch, getTurretRelativeYawDegFromSensor());
         float pErr = protectedPitch - pitchFiltered;
-        // 算出期望的补偿角速度 (deg/s)
-        float pitchRateCmd = (pErr * kP_pitch) - (chassisPitchRateDeg * kFF_pitch);
+        // P 负责回到目标，底盘前馈负责抵消车体点头，炮管自身角速度阻尼负责压过冲和抖动。
+        float pitchRateCmd = (pErr * Config::PITCH_STAB_KP) -
+                             (chassisPitchRateDeg * Config::PITCH_CHASSIS_FF) -
+                             (t_gx_cal_deg * Config::PITCH_STAB_KD);
         pitchRateCmd = constrain(pitchRateCmd, -Config::PITCH_RATE_CMD_MAX, Config::PITCH_RATE_CMD_MAX);
+        if (abs(pitchRateCmd) < Config::PITCH_SERVO_RATE_DEADZONE_DPS) {
+            pitchRateCmd = 0.0f;
+        }
 
         // 舵机命令限位用机构角，不直接等于物理俯仰角。
-        currentPitchAngle = constrain(currentPitchAngle + (pitchRateCmd * dt), Config::SERVO_CMD_MIN, Config::SERVO_CMD_MAX);
-        pitchServo.write(currentPitchAngle);
+        if (pitchRateCmd != 0.0f) {
+            currentPitchAngle = constrain(currentPitchAngle + (pitchRateCmd * dt), Config::SERVO_CMD_MIN, Config::SERVO_CMD_MAX);
+            pitchServo.write(currentPitchAngle);
+        }
         
         // yaw 双稳继续工作在“世界系目标”上，底盘转动时通过底盘 yaw 角速度前馈抵消。
-        float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, (gT.gyro.z - t_gyroZ_offset) * RAD_TO_DEG, -chassisYawRateDeg, dt);
+        float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, t_gz_cal_deg, -chassisYawRateDeg, dt);
         publishYawTarget(yVoltage);
         
         LOG(TURRET_ONLY, "Y_Tgt:%.2f, Y_Real:%.2f, Y_RelSens:%.2f\n", savedYawCont, yawContDeg, getTurretRelativeYawDegFromSensor());
