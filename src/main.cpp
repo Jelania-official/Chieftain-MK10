@@ -48,6 +48,21 @@ namespace Config {
     const uint8_t PWM_CH_R = 8, PWM_CH_L = 9;         // ESP32 硬件PWM通道
     const uint32_t PWM_FREQ = 10000;                  // 电机控制频率 10kHz
     const uint8_t PWM_RES = 8;                        // 8位分辨率 (0-255)
+    const float MOTOR_PWM_DEADZONE = 1.0f;            // 输出小于该值时完全断开电机
+    const float TRACK_STOP_DEADZONE_KMH = 0.5f;       // 履带速度死区
+    const float TRACK_FF_KS = 32.0f;                  // 静摩擦前馈 PWM
+    const float TRACK_FF_KV = 4.4f;                   // 速度前馈 PWM/(km/h)
+    const float TRACK_FF_KA = 2.2f;                   // 加速度前馈 PWM/(km/h/s)
+    const float TRACK_FF_KSLOPE = 18.0f;              // 坡度保持前馈 PWM
+    const float TRACK_FF_MAX_ACCEL = 80.0f;           // 前馈使用的目标加速度限幅
+    const float TRACK_FF_ACCEL_LPF = 0.25f;           // 目标加速度前馈低通，抑制死区边缘脉冲
+    const float TRACK_PI_KP = 2.0f;                   // 履带速度 PI 比例项
+    const float TRACK_PI_KI = 0.25f;                  // 履带速度 PI 积分项
+    const float TRACK_PI_MAX_I = 80.0f;               // 履带速度 PI 积分限幅
+    const float TRACK_PI_MAX_CORRECTION = 90.0f;      // PI 只做误差修正，主输出交给前馈
+    const float TRACK_EXTERNAL_PWM_MAX = 70.0f;        // 外部惯量 PWM 总修正限幅
+    const uint32_t ENCODER_SAMPLE_US = 5000;          // 编码器测速周期，对齐 200Hz 控制环
+    const float ENCODER_SPEED_LPF = 0.35f;            // 编码器速度低通，降低低速量化抖动
 
     // [编码器引脚] - 34/35需外部上拉电阻(10K\0805)
     const uint8_t R_ENCA = 23, R_ENCB = 4;
@@ -81,23 +96,29 @@ namespace Config {
     const float SHIFT_MIN_THROTTLE = 0.2f; // 进入换挡模拟的最小油门
     const uint32_t SHIFT_CUT_TIME_MS = 100; // 换挡动力中断时间
 
-    // [横向动力学与随速感应 (新增)]
-    const float YAW_JERK_ACCEL = 2.0f;     // 转向液压建立速度 (比前进快)
-    const float YAW_JERK_BRAKE = 4.0f;     // 转向停止时的惯性缓冲
-    const float YAW_SENSITIVITY = 25.0f;   // 转向加速度增益 (配合阻尼决定最大转向速度)
-    const float YAW_DAMPING = 3.5f;        // 转向物理阻尼系数 (每秒衰减比例，模拟侧向摩擦)
+    // [横向动力学与随速感应]
+    const float YAW_SENSITIVITY = 25.0f;   // 最大差速分量
     const float SPEED_SENS_K = 0.08f;      // 随速衰减系数 (越高，高速时方向盘越“重”)
+    const float YAW_INERTIA_ALPHA_TAU = 0.04f;          // yaw 角加速度低通时间常数
+    const float YAW_INERTIA_ALPHA_DEADZONE_DPS2 = 25.0f;// yaw 角加速度死区
+    const float YAW_INERTIA_ALPHA_MAX_DPS2 = 500.0f;    // yaw 角加速度限幅
+    const float YAW_INERTIA_PWM_GAIN = 0.05f;           // yaw 虚拟惯量增益：PWM/(deg/s^2)
+    const float YAW_INERTIA_PWM_MAX = 28.0f;            // yaw 虚拟惯量最大差速 PWM
+    const float YAW_INERTIA_PWM_SIGN = 1.0f;            // 实测方向反了就改成 -1.0f
 
-    // [惯性补偿参数]
-    // 增益：决定了补偿的力度
-    const float V_INERTIA_GAIN = 0.15f; 
-    // 滤波系数：0.0 到 1.0 之间。
-    // 越小越平稳（如 0.05），越大响应越快（如 0.3）。
-    const float V_INERTIA_LPF = 0.1f;
+    // [虚拟旋转惯量]
+    // 用底盘俯仰角加速度生成反向电机力矩：T_virtual = -I_virtual * alpha。
+    const float V_INERTIA_ALPHA_TAU = 0.035f;         // 角加速度低通时间常数，单位 s
+    const float V_INERTIA_ALPHA_DEADZONE_DPS2 = 18.0f;// 角加速度死区，抑制 IMU 微分底噪
+    const float V_INERTIA_ALPHA_MAX_DPS2 = 450.0f;    // 角加速度限幅
+    const float V_INERTIA_PWM_GAIN = 0.08f;           // 虚拟惯量增益：PWM/(deg/s^2)
+    const float V_INERTIA_PWM_MAX = 45.0f;            // 虚拟惯量最大 PWM 修正
+    const float V_INERTIA_PWM_SIGN = 1.0f;            // 实测方向反了就改成 -1.0f
 
     // [环境阻力精细调校]
     // 假设在垂直90度时，重力带来的最大加速度。数值越大，爬坡越吃力，下坡溜得越快。
     const float SLOPE_GRAVITY_MAX = 12.0f; // 单位：km/h/s
+    const float GRADE_PITCH_TAU = 0.35f;   // 坡度角低通时间常数，滤掉起步点头/颠簸高频
 
     // [炮塔与双稳]
     const uint8_t SERVO_PIN = 15;           // 俯仰舵机引脚
@@ -131,7 +152,7 @@ portMUX_TYPE turretStateMux = portMUX_INITIALIZER_UNLOCKED;
 // ==========================================
 // 2. 基础控制算法 (PID)
 // ==========================================
-// 最底层的通用 PID，给履带速度环和炮塔级联控制共用。
+// 最底层的通用 PID，给炮塔级联控制使用。
 class CustomPID {
 public:
     float kp, ki, kd, maxOut, maxI;
@@ -164,6 +185,72 @@ public:
     void reset() { outer.reset(); inner.reset(); }
 };
 
+// 履带速度控制：前馈承担主要 PWM，PI 只修正编码器反馈误差。
+class TrackVelocityController {
+private:
+    float integral = 0.0f;
+    float lastTarget = 0.0f;
+    float filteredTargetAccel = 0.0f;
+    bool wasTargetActive = false;
+
+public:
+    float calculate(float target, float actual, float dt, float pitchAngleDeg, float externalPwm) {
+        if (dt <= 0.0f) dt = 0.001f;
+        if (dt > 0.05f) dt = 0.05f;
+        externalPwm = constrain(externalPwm,
+                                -Config::TRACK_EXTERNAL_PWM_MAX,
+                                Config::TRACK_EXTERNAL_PWM_MAX);
+
+        if (abs(target) < Config::TRACK_STOP_DEADZONE_KMH &&
+            abs(actual) < Config::TRACK_STOP_DEADZONE_KMH) {
+            reset();
+            return externalPwm;
+        }
+
+        bool targetActive = abs(target) >= Config::TRACK_STOP_DEADZONE_KMH;
+        float targetAccel = 0.0f;
+        if (targetActive && wasTargetActive) {
+            targetAccel = constrain((target - lastTarget) / dt,
+                                    -Config::TRACK_FF_MAX_ACCEL,
+                                    Config::TRACK_FF_MAX_ACCEL);
+        }
+        filteredTargetAccel += Config::TRACK_FF_ACCEL_LPF * (targetAccel - filteredTargetAccel);
+        lastTarget = target;
+        wasTargetActive = targetActive;
+
+        float ff = 0.0f;
+        if (targetActive) {
+            float dir = (target > 0.0f) ? 1.0f : -1.0f;
+            ff = (Config::TRACK_FF_KS * dir) +
+                 (Config::TRACK_FF_KV * target) +
+                 (Config::TRACK_FF_KA * filteredTargetAccel) +
+                 (Config::TRACK_FF_KSLOPE * sin(pitchAngleDeg * DEG_TO_RAD));
+        }
+
+        float error = target - actual;
+        if (abs(target) < Config::TRACK_STOP_DEADZONE_KMH) {
+            integral *= 0.9f;
+        } else {
+            integral += error * dt;
+        }
+        integral = constrain(integral, -Config::TRACK_PI_MAX_I, Config::TRACK_PI_MAX_I);
+
+        float correction = constrain((Config::TRACK_PI_KP * error) +
+                                     (Config::TRACK_PI_KI * integral),
+                                     -Config::TRACK_PI_MAX_CORRECTION,
+                                     Config::TRACK_PI_MAX_CORRECTION);
+
+        return constrain(ff + correction + externalPwm, -255.0f, 255.0f);
+    }
+
+    void reset() {
+        integral = 0.0f;
+        lastTarget = 0.0f;
+        filteredTargetAccel = 0.0f;
+        wasTargetActive = false;
+    }
+};
+
 // ==========================================
 // 3. 硬件抽象 (电机与编码器)
 // ==========================================
@@ -181,28 +268,24 @@ public:
     }
     void drive(float output) {
         // 1. 限制范围并处理死区
-        float absOut = abs(output);
-        if (absOut < 0.1f) { 
+        float absOut = constrain(abs(output), 0.0f, 255.0f);
+        if (absOut < Config::MOTOR_PWM_DEADZONE) {
             // 完全停止：不仅 PWM 给 0，电机引脚也要拉低，防止发热
             digitalWrite(in1, LOW); 
             digitalWrite(in2, LOW); 
             ledcWrite(pwmCh, 0);
             return;
         }
-        // 2. 关键优化：线性重映射 (Deadzone Compensation)
-        // 把 0~255 的输入映射到 40~255 的输出
-        float mappedPWM = (absOut > 0) ? 40.0f + (absOut / 255.0f) * 215.0f : 0;
-        mappedPWM = constrain(mappedPWM, 40, 255);
 
-        // 3. 物理驱动方向逻辑
+        // 2. 物理驱动方向逻辑；静摩擦补偿由履带前馈控制器负责。
         if (output > 0) {
             digitalWrite(in1, isLeft ? HIGH : LOW); 
             digitalWrite(in2, isLeft ? LOW : HIGH);
-            ledcWrite(pwmCh, (uint32_t)mappedPWM);
+            ledcWrite(pwmCh, (uint32_t)absOut);
         } else {
             digitalWrite(in1, isLeft ? LOW : HIGH); 
             digitalWrite(in2, isLeft ? HIGH : LOW);
-            ledcWrite(pwmCh, (uint32_t)mappedPWM);
+            ledcWrite(pwmCh, (uint32_t)absOut);
         }
     }
 };
@@ -210,10 +293,12 @@ public:
 // N20 编码器抽象：用 ESP32 的 PCNT 外设做 AB 相计数，再换算成真车等效速度。
 class CustomEncoder {
 private:
-    uint8_t pinA, pinB; pcnt_unit_t unit; int16_t lastCount = 0; uint32_t lastTime = 0; float lastSpeed = 0.0f;
+    uint8_t pinA, pinB; pcnt_unit_t unit; uint32_t lastSampleUs = 0; float lastSpeed = 0.0f;
 public:
     CustomEncoder(uint8_t pinA, uint8_t pinB, pcnt_unit_t p_unit) : pinA(pinA), pinB(pinB), unit(p_unit) {}
     void init() {
+        pinMode(pinA, INPUT);
+        pinMode(pinB, INPUT);
         pcnt_config_t cfg = {};
         cfg.pulse_gpio_num = pinA; cfg.ctrl_gpio_num = pinB;
         cfg.channel = PCNT_CHANNEL_0; cfg.unit = unit;
@@ -224,19 +309,26 @@ public:
         if (err != ESP_OK) {
             LOG_ALWAYS("!!! PCNT config failed: unit=%d err=%d\n", (int)unit, (int)err);
         }
+        pcnt_set_filter_value(unit, 1000);
+        pcnt_filter_enable(unit);
         pcnt_counter_pause(unit); pcnt_counter_clear(unit); pcnt_counter_resume(unit);
-        pcnt_get_counter_value(unit, &lastCount);
-        lastTime = millis();
+        lastSampleUs = micros();
     }
     float getRealSpeedKMH() {
-        uint32_t now = millis(); uint32_t dt = now - lastTime;
-        if (dt >= 10) { // 10ms 测速周期
-            int16_t currentCount; pcnt_get_counter_value(unit, &currentCount);
-            int32_t delta = (int32_t)currentCount - (int32_t)lastCount;
-            lastCount = currentCount;
-            float rpm = (delta / (float)Config::ENCODER_PPR / Config::GEAR_RATIO) * (60000.0f / dt);
-            lastSpeed = rpm * Config::RPM_TO_REAL_KMH; // 输出真车等效速度
-            lastTime = now;
+        uint32_t now = micros();
+        uint32_t dtUs = now - lastSampleUs;
+        if (dtUs >= Config::ENCODER_SAMPLE_US) {
+            int16_t count = 0;
+            pcnt_counter_pause(unit);
+            pcnt_get_counter_value(unit, &count);
+            pcnt_counter_clear(unit);
+            pcnt_counter_resume(unit);
+
+            float rpm = (count / (float)Config::ENCODER_PPR / Config::GEAR_RATIO) * (60000000.0f / dtUs);
+            float measuredSpeed = rpm * Config::RPM_TO_REAL_KMH; // 输出真车等效速度
+            lastSpeed += Config::ENCODER_SPEED_LPF * (measuredSpeed - lastSpeed);
+            if (count == 0 && abs(lastSpeed) < Config::TRACK_STOP_DEADZONE_KMH) lastSpeed = 0.0f;
+            lastSampleUs = now;
         }
         return lastSpeed;
     }
@@ -245,20 +337,20 @@ public:
 // ==========================================
 // 4. 底盘系统 (真车物理模拟)
 // ==========================================
-// 单侧履带 = 电机 + 编码器 + 速度 PID。
+// 单侧履带 = 电机 + 编码器 + 前馈/PI 速度控制器。
 class TankTrack {
 public:
-    DCMotor motor; CustomEncoder encoder; CustomPID pid;
+    DCMotor motor; CustomEncoder encoder; TrackVelocityController controller;
     float currentSpeed = 0, targetSpeed = 0;
-    TankTrack(DCMotor m, CustomEncoder e, CustomPID p) : motor(m), encoder(e), pid(p) {}
+    TankTrack(DCMotor m, CustomEncoder e) : motor(m), encoder(e) {}
     void init() { motor.init(); encoder.init(); }
-    void update(float target, float dt) {
+    void update(float target, float dt, float pitchAngleDeg, float externalPwm) {
         targetSpeed = target;
         currentSpeed = encoder.getRealSpeedKMH();
-        if (abs(targetSpeed) < 0.5f) targetSpeed = 0; // 0.5km/h 死区
-        motor.drive(pid.calculate(targetSpeed, currentSpeed, dt));
+        if (abs(targetSpeed) < Config::TRACK_STOP_DEADZONE_KMH) targetSpeed = 0;
+        motor.drive(controller.calculate(targetSpeed, currentSpeed, dt, pitchAngleDeg, externalPwm));
     }
-    void stop() { targetSpeed = 0; pid.reset(); motor.drive(0); }
+    void stop() { targetSpeed = 0; controller.reset(); motor.drive(0); }
 };
 
 // 专为重型内燃机设计的油门平滑器：踩油门迟滞(模拟涡轮/转速爬升)，松油门瞬间切断
@@ -296,17 +388,105 @@ private:
     // 刹车液压建立较快 (3.0)，松开也快 (10.0)
     ThrottleSmoother brakeSmoother;  
 
-    float lastPitchRate = 0.0f;
-    float filteredAlpha = 0.0f;
+    float longitudinalAccel = 0.0f;
+    float gradePitchDeg = 0.0f;
+    bool gradePitchReady = false;
+    float lastPitchRateDeg = 0.0f;
+    float filteredPitchAlpha = 0.0f;
+    bool pitchRateReady = false;
+    float lastYawRateDeg = 0.0f;
+    float filteredYawAlpha = 0.0f;
+    bool yawRateReady = false;
+
+    float moveToward(float current, float target, float maxDelta) {
+        float delta = target - current;
+        if (delta > maxDelta) return current + maxDelta;
+        if (delta < -maxDelta) return current - maxDelta;
+        return target;
+    }
+
+    float calculateVirtualInertiaPwm(float pitchRateDeg, float dt) {
+        if (dt <= 0.0f) return 0.0f;
+        if (!pitchRateReady) {
+            lastPitchRateDeg = pitchRateDeg;
+            pitchRateReady = true;
+            return 0.0f;
+        }
+
+        float rawAlpha = (pitchRateDeg - lastPitchRateDeg) / dt;
+        lastPitchRateDeg = pitchRateDeg;
+        rawAlpha = constrain(rawAlpha,
+                             -Config::V_INERTIA_ALPHA_MAX_DPS2,
+                             Config::V_INERTIA_ALPHA_MAX_DPS2);
+
+        float alphaBlend = dt / (Config::V_INERTIA_ALPHA_TAU + dt);
+        filteredPitchAlpha += alphaBlend * (rawAlpha - filteredPitchAlpha);
+
+        float effectiveAlpha = filteredPitchAlpha;
+        if (abs(effectiveAlpha) < Config::V_INERTIA_ALPHA_DEADZONE_DPS2) {
+            effectiveAlpha = 0.0f;
+        } else {
+            effectiveAlpha = copysign(abs(effectiveAlpha) - Config::V_INERTIA_ALPHA_DEADZONE_DPS2,
+                                      effectiveAlpha);
+        }
+
+        return constrain(-Config::V_INERTIA_PWM_SIGN *
+                         Config::V_INERTIA_PWM_GAIN *
+                         effectiveAlpha,
+                         -Config::V_INERTIA_PWM_MAX,
+                         Config::V_INERTIA_PWM_MAX);
+    }
+
+    float calculateYawInertiaPwm(float yawRateDeg, float dt) {
+        if (dt <= 0.0f) return 0.0f;
+        if (!yawRateReady) {
+            lastYawRateDeg = yawRateDeg;
+            yawRateReady = true;
+            return 0.0f;
+        }
+
+        float rawAlpha = (yawRateDeg - lastYawRateDeg) / dt;
+        lastYawRateDeg = yawRateDeg;
+        rawAlpha = constrain(rawAlpha,
+                             -Config::YAW_INERTIA_ALPHA_MAX_DPS2,
+                             Config::YAW_INERTIA_ALPHA_MAX_DPS2);
+
+        float alphaBlend = dt / (Config::YAW_INERTIA_ALPHA_TAU + dt);
+        filteredYawAlpha += alphaBlend * (rawAlpha - filteredYawAlpha);
+
+        float effectiveAlpha = filteredYawAlpha;
+        if (abs(effectiveAlpha) < Config::YAW_INERTIA_ALPHA_DEADZONE_DPS2) {
+            effectiveAlpha = 0.0f;
+        } else {
+            effectiveAlpha = copysign(abs(effectiveAlpha) - Config::YAW_INERTIA_ALPHA_DEADZONE_DPS2,
+                                      effectiveAlpha);
+        }
+
+        return constrain(-Config::YAW_INERTIA_PWM_SIGN *
+                         Config::YAW_INERTIA_PWM_GAIN *
+                         effectiveAlpha,
+                         -Config::YAW_INERTIA_PWM_MAX,
+                         Config::YAW_INERTIA_PWM_MAX);
+    }
+
+    float updateGradePitch(float pitchAngleDeg, float dt) {
+        if (!gradePitchReady) {
+            gradePitchDeg = pitchAngleDeg;
+            gradePitchReady = true;
+            return gradePitchDeg;
+        }
+
+        float gradeBlend = dt / (Config::GRADE_PITCH_TAU + dt);
+        gradePitchDeg += gradeBlend * (pitchAngleDeg - gradePitchDeg);
+        return gradePitchDeg;
+    }
 
 public:
     TankChassis() : 
         rightTrack(DCMotor(Config::R_IN1, Config::R_IN2, Config::R_PWM, Config::PWM_CH_R, false),
-                   CustomEncoder(Config::R_ENCA, Config::R_ENCB, PCNT_UNIT_0),
-                   CustomPID(1.2, 0.05, 0.3, 100.0, 255.0)),
+                   CustomEncoder(Config::R_ENCA, Config::R_ENCB, PCNT_UNIT_0)),
         leftTrack (DCMotor(Config::L_IN1, Config::L_IN2, Config::L_PWM, Config::PWM_CH_L, true),
-                   CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1),
-                   CustomPID(1.2, 0.05, 0.3, 100.0, 255.0)),
+                   CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1)),
         engineSmoother(0.8f, 10.0f),  // 参数可调：0.8表示油门踩到底需1秒多建立全扭矩
         brakeSmoother(4.0f, 10.0f)    // 参数可调：刹车建立很快
     {}
@@ -314,7 +494,9 @@ public:
     void init() { rightTrack.init(); leftTrack.init(); }
 
     // 这里的速度单位统一用“真车等效 km/h”，这样比例映射和参数调校更直观。
-    void processKinematics(float triggerL, float triggerR, float joyX, float dt, float currentPitchRate, float pitchAngle) {
+    void processKinematics(float triggerL, float triggerR, float joyX, float dt, float currentPitchRate, float currentYawRate, float pitchAngle) {
+        float gradePitch = updateGradePitch(pitchAngle, dt);
+
         // ==========================================
         // 纵向动力学 (游戏式 RT 前进 / LT 倒车)
         // ==========================================
@@ -352,7 +534,7 @@ public:
         float force_resist = -(airResist + rollResist) * resDir;
 
         // 坡度重力分量
-        float force_slope = -Config::SLOPE_GRAVITY_MAX * sin(pitchAngle * DEG_TO_RAD);
+        float force_slope = -Config::SLOPE_GRAVITY_MAX * sin(gradePitch * DEG_TO_RAD);
 
         // 3. 施加刹车力的方向判定
         // 刹车力是没有主动方向的，它只能去“抵消”当前的速度。
@@ -373,15 +555,24 @@ public:
         // 4. 净力求和
         float a_net = force_engine + force_brake + force_resist + force_slope;
 
-        // 5. 积分计算最终纵向速度
-        v_real += a_net * dt;
+        // 5. jerk 限制后的实际纵向加速度。持续加速时车身持续抬头/低头，而不是只在起步瞬间响应。
+        bool accelerationBuilds = (a_net * longitudinalAccel >= 0.0f) && (abs(a_net) > abs(longitudinalAccel));
+        float jerkLimit = accelerationBuilds ? Config::LINEAR_JERK_ACCEL : Config::LINEAR_JERK_BRAKE;
+        longitudinalAccel = moveToward(longitudinalAccel, a_net, jerkLimit * dt);
+        if (abs(a_net) < 0.02f && abs(longitudinalAccel) < 0.02f) longitudinalAccel = 0.0f;
+
+        // 6. 积分计算最终纵向速度
+        v_real += longitudinalAccel * dt;
 
         // 极限速度钳制
         v_real = constrain(v_real, -Config::REAL_V_REV_MAX, Config::REAL_V_MAX);
-
+        if ((v_real >= Config::REAL_V_MAX && longitudinalAccel > 0.0f) ||
+            (v_real <= -Config::REAL_V_REV_MAX && longitudinalAccel < 0.0f)) {
+            longitudinalAccel = 0.0f;
+        }
 
         // ==========================================
-        // 横向动力学 (重构为：目标速度追踪 + 强阻尼停转)
+        // 横向动力学：摇杆直接给目标差速，真实车体的转动惯量由 yaw IMU 反馈补偿。
         // ==========================================
         
         float joyX_adj = (abs(joyX) < 0.12f) ? 0 : joyX; // 死区
@@ -390,38 +581,17 @@ public:
         // 随速感应灵敏度
         float dynamic_sens = Config::YAW_SENSITIVITY / (1.0f + abs(v_real) * Config::SPEED_SENS_K);
         
-        // 目标自转速度 (不再是目标加速度！)
+        // 目标自转速度
         float target_spin_v = joyX_squared * dynamic_sens;
-
-        // 履带转向的物理限制：加速建立有一个限度，但减速极快（因为没有滑行）
-        float max_yaw_accel = Config::YAW_JERK_ACCEL; 
-        
-        // 以限制好的加速度，向目标速度逼近
-        if (spinV < target_spin_v) {
-            spinV = min(spinV + max_yaw_accel * dt, target_spin_v);
-        } else if (spinV > target_spin_v) {
-            spinV = max(spinV - max_yaw_accel * dt, target_spin_v);
-        }
-
-        // 当松开摇杆时，施加极强的地面摩擦力瞬间刹停
-        if (joyX_adj == 0) {
-            if (spinV > 0) spinV = max(spinV - Config::YAW_JERK_BRAKE * dt, 0.0f);
-            else spinV = min(spinV + Config::YAW_JERK_BRAKE * dt, 0.0f);
-        }
+        spinV = target_spin_v;
 
         // ==========================================
         // 双流耦合输出 (保持不变)
         // ==========================================
         float Lv_tgt = v_real + spinV;
         float Rv_tgt = v_real - spinV;
-
-        float rawAlpha = (currentPitchRate - lastPitchRate) / dt;
-        lastPitchRate = currentPitchRate;
-        filteredAlpha = filteredAlpha + Config::V_INERTIA_LPF * (rawAlpha - filteredAlpha);
-        
-        float v_comp = filteredAlpha * Config::V_INERTIA_GAIN;
-        Lv_tgt -= v_comp;
-        Rv_tgt -= v_comp;
+        float pitchInertiaPwm = calculateVirtualInertiaPwm(currentPitchRate, dt);
+        float yawInertiaPwm = calculateYawInertiaPwm(currentYawRate, dt);
 
         float max_val = max(abs(Lv_tgt), abs(Rv_tgt));
         if (max_val > Config::REAL_V_MAX) {
@@ -429,13 +599,21 @@ public:
             Lv_tgt *= ratio; Rv_tgt *= ratio;
         }
 
-        leftTrack.update(Lv_tgt, dt); 
-        rightTrack.update(Rv_tgt, dt);
+        leftTrack.update(Lv_tgt, dt, gradePitch, pitchInertiaPwm + yawInertiaPwm);
+        rightTrack.update(Rv_tgt, dt, gradePitch, pitchInertiaPwm - yawInertiaPwm);
     }
 
     void stop() { 
         v_real = 0; spinV = 0; 
-        lastPitchRate = 0.0f; filteredAlpha = 0.0f;
+        longitudinalAccel = 0.0f;
+        gradePitchDeg = 0.0f;
+        gradePitchReady = false;
+        lastPitchRateDeg = 0.0f;
+        filteredPitchAlpha = 0.0f;
+        pitchRateReady = false;
+        lastYawRateDeg = 0.0f;
+        filteredYawAlpha = 0.0f;
+        yawRateReady = false;
         engineSmoother.reset(); brakeSmoother.reset();
         leftTrack.stop(); rightTrack.stop(); 
     }
@@ -466,6 +644,7 @@ private:
     float t_gyroZ_offset = 0, t_gyroX_offset = 0; // 炮塔零偏
     float c_gyroZ_offset = 0, c_gyroX_offset = 0; // 底盘零偏
     float c_gx_cal_deg = 0.0f; // 存放处理后的底盘俯仰角速度 (deg/s)
+    float c_gz_cal_deg = 0.0f; // 存放处理后的底盘 yaw 角速度 (deg/s)
     float chassisPitchFiltered = 0.0f; // [新增] 用于存放底盘的坡度角
     bool ready = false;
     volatile bool imuHealthy = false;
@@ -711,8 +890,9 @@ public:
         mpuC.getEvent(&aC, &gC, &tC); 
         mpuT.getEvent(&aT, &gT, &tT);
 
-        // 保存底盘校准后的 X 轴角速度，减去零偏并转换为度/秒
+        // 保存底盘校准后的角速度，减去零偏并转换为度/秒
         c_gx_cal_deg = (gC.gyro.x - c_gyroX_offset) * RAD_TO_DEG;
+        c_gz_cal_deg = (gC.gyro.z - c_gyroZ_offset) * RAD_TO_DEG;
 
         // 底盘俯仰角计算 (坡度)
         float c_pitchAcc = atan2(aC.acceleration.y, aC.acceleration.z) * RAD_TO_DEG;
@@ -723,14 +903,13 @@ public:
         float gz_cal = gT.gyro.z - t_gyroZ_offset;
         if (abs(gz_cal) < 0.005f) gz_cal = 0.0f; // 消除静止底噪带来的缓慢漂移
         float gx_cal = gT.gyro.x - t_gyroX_offset;
-        float chassisYawRateDeg = (gC.gyro.z - c_gyroZ_offset) * RAD_TO_DEG;
         float pitchAcc = atan2(aT.acceleration.y, aT.acceleration.z) * RAD_TO_DEG;
 
         if (!isfinite(c_pitchAcc) || !isfinite(pitchAcc) ||
             !validateImuEvent(c_gx_cal_deg) ||
             !validateImuEvent(gx_cal * RAD_TO_DEG) ||
             !validateImuEvent(gz_cal * RAD_TO_DEG) ||
-            !validateImuEvent(chassisYawRateDeg)) {
+            !validateImuEvent(c_gz_cal_deg)) {
             setImuHealthy(false);
             return;
         }
@@ -747,6 +926,9 @@ public:
     // 获取已经算好的底盘俯仰速率
     float getLatestChassisPitchRate() {
         return c_gx_cal_deg;
+    }
+    float getLatestChassisYawRate() {
+        return c_gz_cal_deg;
     }
     // 获取当前坡度角
     float getChassisPitchAngle() {
@@ -829,7 +1011,7 @@ public:
         
         // 俯仰双稳：底盘抬头会立刻通过前馈向下补，位置误差再由 P 环慢慢拉回。
         float chassisPitchRateDeg = c_gx_cal_deg;
-        float chassisYawRateDeg = (gC.gyro.z - c_gyroZ_offset) * RAD_TO_DEG;
+        float chassisYawRateDeg = c_gz_cal_deg;
 
         // 假设期望的 P 增益为 150 (每1度误差，要求 150度/秒 的回正速度)
         // 前馈增益设为 1.0 (底盘抬起 10度/秒，舵机就低头 10度/秒 完全抵消)
@@ -990,10 +1172,11 @@ public:
                 float tL = xboxController.xboxNotif.trigLT / 1023.0f;
                 float tR = xboxController.xboxNotif.trigRT / 1023.0f;
                 float jLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
-                // 从底盘 IMU 获取 pitch 速度和坡度角
+                // 坡度角用于坡度前馈，pitch/yaw rate 用于生成虚拟旋转惯量。
                 float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
+                float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
                 float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
-                chassis.processKinematics(tL, tR, jLX, dtCtrl, pRate, pAngle);
+                chassis.processKinematics(tL, tR, jLX, dtCtrl, pRate, yRate, pAngle);
                 if (turretReady) turret.updateStabilization(dtCtrl);
 
                 static uint32_t lastBatteryWarnLogMs = 0;
