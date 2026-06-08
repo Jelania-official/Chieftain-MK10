@@ -120,8 +120,13 @@ namespace Config {
     const float PITCH_RATE_CMD_MAX = 180.0f;      // 俯仰稳定最大指令角速度 (deg/s)
     const uint32_t CONTROLLER_TIMEOUT_MS = 300;   // 手柄失联超时
     const uint32_t YAW_SENSOR_STALE_US = 50000;   // AS5600 缓存有效期
+    const uint32_t YAW_SENSOR_CHECK_US = 10000;   // AS5600 主动健康探测周期
+    const uint8_t AS5600_ADDR = 0x36;
+    const uint8_t AS5600_ANGLE_REG = 0x0C;
     const uint32_t VBAT_SAMPLE_MS = 100;          // 电池电压采样周期
 }
+
+portMUX_TYPE turretStateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ==========================================
 // 2. 基础控制算法 (PID)
@@ -205,18 +210,20 @@ public:
 // N20 编码器抽象：用 ESP32 的 PCNT 外设做 AB 相计数，再换算成真车等效速度。
 class CustomEncoder {
 private:
-    pcnt_unit_t unit; int16_t lastCount = 0; uint32_t lastTime = 0; float lastSpeed = 0.0f;
+    uint8_t pinA, pinB; pcnt_unit_t unit; int16_t lastCount = 0; uint32_t lastTime = 0; float lastSpeed = 0.0f;
 public:
-    CustomEncoder(uint8_t pinA, uint8_t pinB, pcnt_unit_t p_unit) : unit(p_unit) {
-        pcnt_config_t cfg;
+    CustomEncoder(uint8_t pinA, uint8_t pinB, pcnt_unit_t p_unit) : pinA(pinA), pinB(pinB), unit(p_unit) {}
+    void init() {
+        pcnt_config_t cfg = {};
         cfg.pulse_gpio_num = pinA; cfg.ctrl_gpio_num = pinB;
         cfg.channel = PCNT_CHANNEL_0; cfg.unit = unit;
         cfg.pos_mode = PCNT_COUNT_INC; cfg.neg_mode = PCNT_COUNT_DEC;
         cfg.lctrl_mode = PCNT_MODE_KEEP; cfg.hctrl_mode = PCNT_MODE_REVERSE;
         cfg.counter_h_lim = 32767; cfg.counter_l_lim = -32768;
-        pcnt_unit_config(&cfg);
-    }
-    void init() {
+        esp_err_t err = pcnt_unit_config(&cfg);
+        if (err != ESP_OK) {
+            LOG_ALWAYS("!!! PCNT config failed: unit=%d err=%d\n", (int)unit, (int)err);
+        }
         pcnt_counter_pause(unit); pcnt_counter_clear(unit); pcnt_counter_resume(unit);
         pcnt_get_counter_value(unit, &lastCount);
         lastTime = millis();
@@ -465,6 +472,8 @@ private:
     volatile bool yawSensorHealthy = false;
     volatile float cachedTurretMechYawDeg = 0.0f;
     volatile uint32_t lastYawSensorUpdateUs = 0;
+    volatile float pendingYawTarget = 0.0f;
+    uint32_t lastYawSensorCheckUs = 0;
 
     // 角度统一折算到 [-180, 180]，方便做“是不是在车体后方”的几何判断。
     float wrapAngle180(float angleDeg) {
@@ -493,14 +502,124 @@ private:
         return constrain(pitchDeg, getRearDeckMinPitch(yawDeg), Config::GUN_PITCH_MAX);
     }
 
+    bool readAS5600MechanicalDeg(float& angleDeg) {
+        Wire.beginTransmission(Config::AS5600_ADDR);
+        Wire.write(Config::AS5600_ANGLE_REG);
+        if (Wire.endTransmission(false) != 0) return false;
+
+        uint8_t received = Wire.requestFrom(Config::AS5600_ADDR, (uint8_t)2);
+        if (received != 2 || Wire.available() < 2) return false;
+
+        uint8_t msb = Wire.read();
+        uint8_t lsb = Wire.read();
+        uint16_t raw = ((uint16_t)(msb & 0x0F) << 8) | lsb;
+        angleDeg = (raw * 360.0f) / 4096.0f;
+        return isfinite(angleDeg);
+    }
+
+    void setImuHealthy(bool healthy) {
+        portENTER_CRITICAL(&turretStateMux);
+        imuHealthy = healthy;
+        if (!healthy) {
+            switchState = false;
+            pendingYawTarget = 0.0f;
+        }
+        portEXIT_CRITICAL(&turretStateMux);
+    }
+
+    void setStabilizationEnabled(bool enabled) {
+        portENTER_CRITICAL(&turretStateMux);
+        switchState = enabled;
+        if (!enabled) pendingYawTarget = 0.0f;
+        portEXIT_CRITICAL(&turretStateMux);
+    }
+
+    bool isStabilizationEnabled() const {
+        bool enabled;
+        portENTER_CRITICAL(&turretStateMux);
+        enabled = switchState;
+        portEXIT_CRITICAL(&turretStateMux);
+        return enabled;
+    }
+
+    void updateYawSensorCache(bool healthy, float sensorDeg = 0.0f) {
+        portENTER_CRITICAL(&turretStateMux);
+        yawSensorHealthy = healthy;
+        if (healthy) {
+            cachedTurretMechYawDeg = sensorDeg;
+            lastYawSensorUpdateUs = micros();
+        } else {
+            switchState = false;
+            pendingYawTarget = 0.0f;
+        }
+        portEXIT_CRITICAL(&turretStateMux);
+    }
+
+    bool readFreshYawSensorDeg(float& sensorDeg) const {
+        bool healthy;
+        uint32_t updatedUs;
+        float cachedDeg;
+
+        portENTER_CRITICAL(&turretStateMux);
+        healthy = yawSensorHealthy;
+        updatedUs = lastYawSensorUpdateUs;
+        cachedDeg = cachedTurretMechYawDeg;
+        portEXIT_CRITICAL(&turretStateMux);
+
+        if (!healthy || ((uint32_t)(micros() - updatedUs) > Config::YAW_SENSOR_STALE_US)) return false;
+        sensorDeg = cachedDeg;
+        return true;
+    }
+
+    bool controlSensorsHealthy() const {
+        bool imuOk, yawOk;
+        uint32_t updatedUs;
+
+        portENTER_CRITICAL(&turretStateMux);
+        imuOk = imuHealthy;
+        yawOk = yawSensorHealthy;
+        updatedUs = lastYawSensorUpdateUs;
+        portEXIT_CRITICAL(&turretStateMux);
+
+        return imuOk && yawOk &&
+               ((uint32_t)(micros() - updatedUs) <= Config::YAW_SENSOR_STALE_US);
+    }
+
+    void publishYawTarget(float targetVoltage) {
+        portENTER_CRITICAL(&turretStateMux);
+        pendingYawTarget = targetVoltage;
+        portEXIT_CRITICAL(&turretStateMux);
+    }
+
+    bool readFocCommand(float& targetVoltage) const {
+        bool enabled, imuOk, yawOk;
+        uint32_t updatedUs;
+
+        portENTER_CRITICAL(&turretStateMux);
+        enabled = switchState;
+        imuOk = imuHealthy;
+        yawOk = yawSensorHealthy;
+        updatedUs = lastYawSensorUpdateUs;
+        targetVoltage = pendingYawTarget;
+        portEXIT_CRITICAL(&turretStateMux);
+
+        if (!enabled || !imuOk || !yawOk ||
+            ((uint32_t)(micros() - updatedUs) > Config::YAW_SENSOR_STALE_US)) {
+            targetVoltage = 0.0f;
+            return false;
+        }
+        return true;
+    }
+
     // FOC 核心持续刷新 AS5600 机械角缓存，控制核心只读缓存，避免跨核争用 I2C。
     bool isYawSensorFresh() const {
-        return yawSensorHealthy && ((uint32_t)(micros() - lastYawSensorUpdateUs) <= Config::YAW_SENSOR_STALE_US);
+        float unused;
+        return readFreshYawSensorDeg(unused);
     }
 
     float getTurretRelativeYawDegFromSensor() {
-        if (!isYawSensorFresh()) return Config::REAR_DECK_CENTER_YAW;
-        float sensorDeg = cachedTurretMechYawDeg;
+        float sensorDeg;
+        if (!readFreshYawSensorDeg(sensorDeg)) return Config::REAR_DECK_CENTER_YAW;
         return wrapAngle180((sensorDeg - Config::TURRET_FRONT_SENSOR_OFFSET) * Config::TURRET_SENSOR_SIGN);
     }
 
@@ -531,11 +650,14 @@ public:
         mpuC.setGyroRange(MPU6050_RANGE_500_DEG); mpuT.setGyroRange(MPU6050_RANGE_500_DEG);
 
         yawSensor.init();
-        float initialSensorDeg = yawSensor.getMechanicalAngle() * RAD_TO_DEG;
-        if (isfinite(initialSensorDeg)) {
-            cachedTurretMechYawDeg = initialSensorDeg;
-            yawSensorHealthy = true;
-            lastYawSensorUpdateUs = micros();
+        float initialSensorDeg = 0.0f;
+        if (readAS5600MechanicalDeg(initialSensorDeg)) {
+            updateYawSensorCache(true, initialSensorDeg);
+        } else {
+            updateYawSensorCache(false);
+            ready = false;
+            LOG_ALWAYS("!!! AS5600 init check failed.\n");
+            return false;
         }
         yawDriver.voltage_power_supply = 12.0; yawDriver.init();
         yawMotor.linkSensor(&yawSensor); yawMotor.linkDriver(&yawDriver);
@@ -567,9 +689,9 @@ public:
         t_gyroX_offset = sumT_X / (float)Config::IMU_CALIB_SAMPLES;
         c_gyroZ_offset = sumC_Z / (float)Config::IMU_CALIB_SAMPLES; 
         c_gyroX_offset = sumC_X / (float)Config::IMU_CALIB_SAMPLES;
-        imuHealthy = true;
+        setImuHealthy(true);
         yawPID.reset();
-        switchState = false;
+        setStabilizationEnabled(false);
         savedPitch = pitchFiltered;
         savedYawCont = yawContDeg;
 
@@ -583,8 +705,7 @@ public:
     void updateIMU(float dt) {
         if (!ready) return;
         if (dt <= 0.0f || dt > Config::IMU_MAX_DT) {
-            imuHealthy = false;
-            switchState = false;
+            setImuHealthy(false);
             return;
         }
         mpuC.getEvent(&aC, &gC, &tC); 
@@ -610,11 +731,10 @@ public:
             !validateImuEvent(gx_cal * RAD_TO_DEG) ||
             !validateImuEvent(gz_cal * RAD_TO_DEG) ||
             !validateImuEvent(chassisYawRateDeg)) {
-            imuHealthy = false;
-            switchState = false;
+            setImuHealthy(false);
             return;
         }
-        imuHealthy = true;
+        setImuHealthy(true);
 
         // 2. 俯仰角 (Pitch) 互补滤波：加速度计给低频重力方向，陀螺仪给高速响应。
         pitchFiltered = 0.96f * (pitchFiltered + gx_cal * RAD_TO_DEG * dt) + 0.04f * pitchAcc;
@@ -637,32 +757,34 @@ public:
         if (!ready) return;
         yawMotor.loopFOC();
 
-        // FOC 所在核心顺手刷新一次 AS5600 机械角缓存，供控制核心做后向防干涉判断。
-        float sensorDeg = yawSensor.getMechanicalAngle() * RAD_TO_DEG;
-        if (isfinite(sensorDeg)) {
-            cachedTurretMechYawDeg = sensorDeg;
-            yawSensorHealthy = true;
-            lastYawSensorUpdateUs = micros();
-        } else {
-            yawSensorHealthy = false;
+        uint32_t nowUs = micros();
+        if ((uint32_t)(nowUs - lastYawSensorCheckUs) >= Config::YAW_SENSOR_CHECK_US) {
+            lastYawSensorCheckUs = nowUs;
+            float sensorDeg = 0.0f;
+            updateYawSensorCache(readAS5600MechanicalDeg(sensorDeg), sensorDeg);
         }
 
-        if (switchState && imuHealthy && isYawSensorFresh()) yawMotor.move();
-        else yawMotor.move(0);
+        float targetVoltage = 0.0f;
+        if (readFocCommand(targetVoltage)) {
+            yawMotor.target = targetVoltage;
+            yawMotor.move();
+        } else {
+            yawMotor.target = 0.0f;
+            yawMotor.move(0);
+        }
     }
 
     void enterSafeState() {
-        switchState = false;
-        imuHealthy = false;
+        setImuHealthy(false);
         yawPID.reset();
-        yawMotor.target = 0.0f;
+        publishYawTarget(0.0f);
     }
 
     // 断连和故障分开处理：断连不等于传感器坏了，只是立即停止执行目标。
     void enterDisconnectedState() {
-        switchState = false;
+        setStabilizationEnabled(false);
         yawPID.reset();
-        yawMotor.target = 0.0f;
+        publishYawTarget(0.0f);
     }
 
     // A 键作为稳定器总开关；只有 IMU 和 AS5600 都健康时才允许进入稳定模式。
@@ -670,19 +792,19 @@ public:
         if (!ready) return;
         static bool lastA = false;
         if (aPressed && !lastA) {
-            if (switchState) {
-                switchState = false;
+            if (isStabilizationEnabled()) {
+                setStabilizationEnabled(false);
                 yawPID.reset();
-                yawMotor.target = 0.0f;
-            } else if (imuHealthy && isYawSensorFresh()) {
-                switchState = true;
+                publishYawTarget(0.0f);
+            } else if (controlSensorsHealthy()) {
+                setStabilizationEnabled(true);
                 savedPitch = pitchFiltered;
                 savedYawCont = yawContDeg;
                 yawPID.reset();
             }
         }
         lastA = aPressed;
-        if (switchState) {
+        if (isStabilizationEnabled()) {
             // 真车 22.5 deg/s 映射
             if (abs(joyX) > 0.15f) {
                 // 计算有效推力比例：0.15时为0，1.0时为1.0
@@ -699,8 +821,8 @@ public:
     }
 
     void updateStabilization(float dt) {
-        if (!ready || !switchState) return;
-        if (!imuHealthy || !isYawSensorFresh()) {
+        if (!ready || !isStabilizationEnabled()) return;
+        if (!controlSensorsHealthy()) {
             enterSafeState();
             return;
         }
@@ -726,13 +848,13 @@ public:
         
         // yaw 双稳继续工作在“世界系目标”上，底盘转动时通过底盘 yaw 角速度前馈抵消。
         float yVoltage = yawPID.calculate(savedYawCont, yawContDeg, (gT.gyro.z - t_gyroZ_offset) * RAD_TO_DEG, -chassisYawRateDeg, dt);
-        yawMotor.target = yVoltage;
+        publishYawTarget(yVoltage);
         
         LOG(TURRET_ONLY, "Y_Tgt:%.2f, Y_Real:%.2f, Y_RelSens:%.2f\n", savedYawCont, yawContDeg, getTurretRelativeYawDegFromSensor());
     }
 
     bool isReady() const { return ready; }
-    bool isHealthy() const { return ready && imuHealthy && isYawSensorFresh(); }
+    bool isHealthy() const { return ready && controlSensorsHealthy(); }
 };
 
 // ==========================================
@@ -746,7 +868,9 @@ private:
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
     uint32_t lastControllerPacketMs = 0;
     uint32_t lastBatterySampleMs = 0;
-    bool systemReady = false;
+    uint32_t lastBatteryCutoffLogMs = 0;
+    bool chassisReady = false;
+    bool turretReady = false;
     float batteryVoltage = 0.0f;
     bool batteryValid = false;
 
@@ -783,9 +907,17 @@ private:
         return batteryValid && batteryVoltage <= Config::VBAT_WARN;
     }
 
+    void updateControllerPacketClock() {
+        unsigned long receivedAt = xboxController.getReceiveNotificationAt();
+        if (receivedAt != 0) {
+            lastControllerPacketMs = receivedAt;
+        }
+    }
+
     // 手柄库的 isConnected() 不是 const 成员，所以这里不能把方法声明成 const。
     bool controllerHealthy() {
         return xboxController.isConnected() &&
+               lastControllerPacketMs != 0 &&
                ((uint32_t)(millis() - lastControllerPacketMs) <= Config::CONTROLLER_TIMEOUT_MS);
     }
 
@@ -802,15 +934,16 @@ public:
         pinMode(Config::VBAT_ADC_PIN, INPUT);
         updateBatteryMonitor();
         chassis.init();
-        systemReady = turret.init();
-        if (systemReady) {
+        chassisReady = true;
+        turretReady = turret.init();
+        if (turretReady) {
             delay(200);
             turret.calibrate();
         } else {
-            LOG_ALWAYS("!!! System entered safe mode because turret init failed.\n");
+            LOG_ALWAYS("!!! Turret unavailable; chassis control remains enabled.\n");
         }
         xboxController.begin(); 
-        lastControllerPacketMs = millis();
+        lastControllerPacketMs = 0;
 
         uint32_t now = micros();
         lastIMU = now; lastUI = now; lastCtrl = now;
@@ -818,7 +951,7 @@ public:
 
     
     void runFOC_Only() {
-        if (!systemReady) return;
+        if (!turretReady) return;
         turret.runFOC(); // 内部调用 yawMotor.loopFOC() 和 move()
     }
 
@@ -828,7 +961,7 @@ public:
         uint32_t nowMicros = micros();
         updateBatteryMonitor();
 
-        if (systemReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
+        if (turretReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
             float dtIMU = (nowMicros - lastIMU) * 1e-6f; 
             lastIMU = nowMicros;
             turret.updateIMU(dtIMU);
@@ -836,10 +969,8 @@ public:
         if (nowMicros - lastUI >= 20000) { // 50Hz UI
             float dtUI = (nowMicros - lastUI) * 1e-6f;
             lastUI = nowMicros; xboxController.onLoop();
-            if (xboxController.isConnected()) {
-                lastControllerPacketMs = millis();
-            }
-            if (systemReady && controllerHealthy()) {
+            updateControllerPacketClock();
+            if (turretReady && controllerHealthy()) {
                 float jX = (xboxController.xboxNotif.joyRHori - 32767.5f) / 32767.5f;
                 float jY = (xboxController.xboxNotif.joyRVert - 32767.5f) / 32767.5f;
                 turret.handleUI(xboxController.xboxNotif.btnA, jX, jY, dtUI);
@@ -849,18 +980,21 @@ public:
             float dtCtrl = (nowMicros - lastCtrl) * 1e-6f;
             lastCtrl = nowMicros;
             if (batteryCritical()) {
-                chassis.stop();
-                turret.enterSafeState();
-                LOG_ALWAYS("!!! Battery cutoff active: %.2fV\n", batteryVoltage);
-            } else if (systemReady && controllerHealthy()) {
+                if (chassisReady) chassis.stop();
+                if (turretReady) turret.enterSafeState();
+                if (millis() - lastBatteryCutoffLogMs >= 1000) {
+                    lastBatteryCutoffLogMs = millis();
+                    LOG_ALWAYS("!!! Battery cutoff active: %.2fV\n", batteryVoltage);
+                }
+            } else if (chassisReady && controllerHealthy()) {
                 float tL = xboxController.xboxNotif.trigLT / 1023.0f;
                 float tR = xboxController.xboxNotif.trigRT / 1023.0f;
                 float jLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
                 // 从底盘 IMU 获取 pitch 速度和坡度角
-                float pRate = turret.getLatestChassisPitchRate();
-                float pAngle = turret.getChassisPitchAngle();
+                float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
+                float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
                 chassis.processKinematics(tL, tR, jLX, dtCtrl, pRate, pAngle);
-                turret.updateStabilization(dtCtrl);
+                if (turretReady) turret.updateStabilization(dtCtrl);
 
                 static uint32_t lastBatteryWarnLogMs = 0;
                 if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
@@ -868,8 +1002,8 @@ public:
                     LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
                 }
             } else {
-                chassis.stop();
-                turret.enterDisconnectedState();
+                if (chassisReady) chassis.stop();
+                if (turretReady) turret.enterDisconnectedState();
             }
         }
     }
