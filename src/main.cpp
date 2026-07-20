@@ -41,8 +41,8 @@ namespace Config {
     const uint32_t DEBUG_TELEMETRY_INTERVAL_MS = 100; // 10Hz，避免遥测通知阻塞控制循环
 
     // [I2C 端口分配]
-    const uint8_t I2C_FOC_SDA = 16, I2C_FOC_SCL = 17; // 磁编码器(AS5600)总线
-    const uint8_t I2C_IMU_SDA = 21, I2C_IMU_SCL = 22; // 陀螺仪(MPU6050)总线
+    const uint8_t I2C_FOC_SDA = 17, I2C_FOC_SCL = 16; // 磁编码器(AS5600)总线
+    const uint8_t I2C_IMU_SDA = 22, I2C_IMU_SCL = 21; // 陀螺仪(MPU6050)总线
 
     // [电池电压检测] 使用 ADC1，避免和蓝牙/Wi-Fi 占用的 ADC2 冲突
     const uint8_t VBAT_ADC_PIN = 39;                // 仅输入，适合做电压采样
@@ -54,7 +54,7 @@ namespace Config {
 
     // [底盘动力引脚]
     const uint8_t R_IN1 = 25, R_IN2 = 33, R_PWM = 32; // 右侧直流驱动
-    const uint8_t L_IN1 = 26, L_IN2 = 27, L_PWM = 14; // 左侧直流驱动
+    const uint8_t L_IN1 = 14, L_IN2 = 27, L_PWM = 26; // 左侧直流驱动
     const uint8_t PWM_CH_R = 8, PWM_CH_L = 9;         // ESP32 硬件PWM通道
     const uint32_t PWM_FREQ = 10000;                  // 电机控制频率 10kHz
     const uint8_t PWM_RES = 8;                        // 8位分辨率 (0-255)
@@ -75,8 +75,8 @@ namespace Config {
     const float ENCODER_SPEED_LPF = 0.35f;            // 编码器速度低通，降低低速量化抖动
 
     // [编码器引脚] - 34/35需外部上拉电阻(10K\0805)
-    const uint8_t R_ENCA = 23, R_ENCB = 4;
-    const uint8_t L_ENCA = 35, L_ENCB = 34; 
+    const uint8_t R_ENCA = 35, R_ENCB = 34;
+    const uint8_t L_ENCA = 23, L_ENCB = 4; 
 
     // --- 酋长 MK10 物理数据映射 (1:32) ---
     const int SCALE = 32;                   // 比例尺
@@ -132,7 +132,7 @@ namespace Config {
 
     // [炮塔与双稳]
     const uint8_t SERVO_PIN = 15;           // 俯仰舵机引脚
-    const uint8_t FOC_PWM_A = 5, FOC_PWM_B = 19, FOC_PWM_C = 18; // 无刷驱动引脚
+    const uint8_t FOC_PWM_A = 19, FOC_PWM_B = 18, FOC_PWM_C = 5; // 无刷驱动引脚
     const float REAL_TURRET_VEL = 22.5f;    // 真车转塔速度 (deg/s)
     const float YAW_OUTER_RATE_MAX = 25.0f; // yaw 外环最大目标角速度，略高于真车满速避免追不上手柄目标
     const float YAW_VOLTAGE_MAX = 6.0f;     // 给 SimpleFOC torque/voltage 目标的总限幅

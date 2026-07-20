@@ -1,17 +1,28 @@
 import argparse
 import asyncio
+import html
 import json
 import math
 import queue
 import re
+import sys
 import threading
 import time
-import tkinter as tk
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import ttk
 
+from PySide6.QtCore import Qt, QEvent, QTimer, QPoint, QPointF, QRectF, Signal
+from PySide6.QtGui import (
+    QPainter, QColor, QPen, QBrush, QPolygonF, QFont, QCursor,
+    QDoubleValidator, QTextCursor
+)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QPushButton, QSlider, QLineEdit, QTextEdit,
+    QScrollArea, QTabWidget, QFrame, QSplitter
+)
 from bleak import BleakClient, BleakScanner
 
 
@@ -19,16 +30,296 @@ SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-BG = "#0b1017"
-PANEL = "#131b25"
-PANEL_ALT = "#192432"
-TEXT = "#e8eef7"
-MUTED = "#8fa3b8"
-ACCENT = "#42a5f5"
-GREEN = "#39d98a"
-YELLOW = "#f6c85f"
-RED = "#ff5d6c"
-GRID = "#314154"
+# Bright industrial palette inspired by modern device-management utilities.
+BG = "#EAF0F5"
+SURFACE = "#FFFFFF"
+CARD = "#FFFFFF"
+ELEVATED = "#EEF3F7"
+BORDER = "#CBD7E1"
+TEXT = "#17212B"
+MUTED = "#687687"
+ACCENT = "#1677FF"
+ACCENT_HOVER = "#4096FF"
+CYAN = "#00A6C7"
+GREEN = "#159B62"
+YELLOW = "#D98400"
+RED = "#D9363E"
+GRID = "#E7EDF3"
+
+QSS_THEME = f"""
+QWidget {{
+    color: {TEXT};
+    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-size: 13px;
+}}
+QWidget#AppRoot {{
+    background-color: {BG};
+}}
+QFrame#TopBar, QFrame#Panel {{
+    background-color: {CARD};
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+}}
+QFrame#TopBar {{
+    border: 1px solid #C4D3E1;
+    border-bottom: 3px solid {ACCENT};
+}}
+QFrame#TelemetryPanel, QFrame#ParameterPanel {{
+    background-color: #FFFFFF;
+    border: 1px solid #B8CEE5;
+    border-top: 3px solid {ACCENT};
+    border-radius: 12px;
+}}
+QFrame#SafetyPanel {{
+    background-color: #FFFCF5;
+    border: 1px solid #E8C98E;
+    border-top: 3px solid {YELLOW};
+    border-radius: 12px;
+}}
+QFrame#ControlPanel {{
+    background-color: #FBFCFE;
+    border: 1px solid #C8D5E1;
+    border-radius: 12px;
+}}
+QFrame#ConsolePanel {{
+    background-color: #F8FBFF;
+    border: 1px solid #B9CADD;
+    border-top: 3px solid #7D96B2;
+    border-radius: 12px;
+}}
+QFrame#ConsoleAccent {{
+    background-color: {ACCENT};
+    border: none;
+    border-radius: 2px;
+}}
+QFrame#Inset {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 9px;
+}}
+QFrame#TelemetryTile {{
+    background-color: #F8FBFF;
+    border: 1px solid #C4D7EB;
+    border-radius: 8px;
+}}
+QFrame#ParameterRow {{
+    background: transparent;
+    border-bottom: 1px solid {BORDER};
+}}
+QFrame#ParameterRow[dirty="true"] {{
+    background-color: #FFF9E8;
+    border-left: 3px solid {YELLOW};
+}}
+QFrame#ParameterRow[dirty="true"] QLabel#ParameterTitle {{
+    color: {YELLOW};
+}}
+QLabel#Title {{
+    font-weight: 700;
+    color: {TEXT};
+    font-size: 15px;
+}}
+QLabel#HeroTitle {{
+    font-weight: 800;
+    color: #101C28;
+    font-size: 18px;
+}}
+QLabel#SectionTitle {{
+    font-weight: 750;
+    color: #142230;
+    font-size: 16px;
+}}
+QLabel#SectionHint {{
+    color: {MUTED};
+    font-size: 10px;
+}}
+QLabel#StatusStrong {{
+    font-weight: 750;
+    font-size: 13px;
+}}
+QLabel#SubTitle {{
+    font-weight: 600;
+    color: {MUTED};
+    font-size: 11px;
+}}
+QLabel#LargeValue {{
+    font-family: "Segoe UI Variable Display", "Segoe UI";
+    font-weight: 700;
+    font-size: 18px;
+    color: {TEXT};
+}}
+QLabel#Mono {{
+    font-family: "Cascadia Mono", "Consolas";
+}}
+QLabel#ParameterTitle {{
+    font-weight: 600;
+    color: {TEXT};
+    font-size: 13px;
+}}
+QPushButton {{
+    background-color: {ELEVATED};
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+    padding: 7px 12px;
+    color: {TEXT};
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background-color: #E2EBF4;
+    border-color: #B8C7D5;
+}}
+QPushButton:pressed {{
+    background-color: #D7E3EE;
+}}
+QPushButton#Primary {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+    color: #FFFFFF;
+}}
+QPushButton#Primary:hover {{
+    background-color: {ACCENT_HOVER};
+    border-color: {ACCENT_HOVER};
+}}
+QPushButton#Danger {{
+    background-color: #FFF1F0;
+    border-color: #FFCCC7;
+    color: {RED};
+}}
+QPushButton#Danger:hover {{
+    background-color: {RED};
+    border-color: {RED};
+    color: #FFFFFF;
+}}
+QPushButton#Quiet {{
+    background-color: #FFFFFF;
+    border-color: #CBD7E2;
+    color: {MUTED};
+}}
+QPushButton#Secondary {{
+    background-color: #EDF4FB;
+    border-color: #C5D7E8;
+    color: #27445F;
+}}
+QPushButton#Secondary:hover {{
+    background-color: #DFECF8;
+    border-color: #AFC7DC;
+}}
+QPushButton:disabled {{
+    background-color: #F3F5F7;
+    border-color: #E4E9EE;
+    color: #A4AFBA;
+}}
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: #DCE5ED;
+    border-radius: 2px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {ACCENT};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {TEXT};
+    border: 2px solid {ACCENT};
+    width: 14px;
+    height: 14px;
+    margin: -6px 0;
+    border-radius: 8px;
+}}
+QSlider::handle:horizontal:hover {{
+    background: #FFFFFF;
+}}
+QTabWidget::pane {{
+    border: 1px solid {BORDER};
+    border-radius: 9px;
+    background: {SURFACE};
+    top: -1px;
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {MUTED};
+    padding: 9px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    border-bottom: 2px solid transparent;
+}}
+QTabBar::tab:selected {{
+    color: {TEXT};
+    border-bottom: 2px solid {ACCENT};
+}}
+QTabBar::tab:hover {{
+    color: {TEXT};
+}}
+QLineEdit, QTextEdit {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+    padding: 7px 9px;
+    font-family: "Cascadia Mono", "Consolas";
+    color: {TEXT};
+    selection-background-color: {ACCENT};
+}}
+QLineEdit:focus, QTextEdit:focus {{
+    border-color: {ACCENT};
+}}
+QTextEdit {{
+    font-size: 11px;
+    color: #435162;
+}}
+QTextEdit#ConsoleLog {{
+    background-color: #FFFFFF;
+    border: 2px solid #C5D4E3;
+    border-radius: 8px;
+    padding: 9px 11px;
+}}
+QTextEdit#ConsoleLog:focus {{
+    border-color: {ACCENT};
+}}
+QLineEdit#ConsoleCommand {{
+    background-color: #FFFFFF;
+    border: 2px solid #C5D4E3;
+    border-radius: 8px;
+    padding: 7px 10px;
+}}
+QLineEdit#ConsoleCommand:focus {{
+    border-color: {ACCENT};
+}}
+QScrollArea {{
+    border: none;
+    background: transparent;
+}}
+QScrollArea > QWidget > QWidget {{
+    background: {SURFACE};
+}}
+QScrollBar:vertical {{
+    border: none;
+    background: {SURFACE};
+    width: 9px;
+    margin: 3px;
+}}
+QScrollBar::handle:vertical {{
+    background: #B8C5D1;
+    border-radius: 4px;
+    min-height: 24px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+}}
+QSplitter::handle {{
+    background: transparent;
+}}
+QSplitter::handle:vertical {{
+    height: 8px;
+}}
+QSplitter::handle:horizontal {{
+    width: 8px;
+}}
+QToolTip {{
+    color: {TEXT};
+    background-color: {ELEVATED};
+    border: 1px solid {BORDER};
+    padding: 5px;
+}}
+"""
 
 GROUP_ORDER = ["炮塔 Yaw", "炮管 Pitch", "虚拟惯量", "底盘动力学", "履带速度环", "其他"]
 
@@ -71,18 +362,11 @@ PARAM_META = {
     "TRACK_PI_KI": ("履带速度环", "速度环 Ki", "编码器速度误差的积分修正"),
 }
 
-PARAM_PATTERN = re.compile(
-    r"^([A-Z0-9_]+)=([-+0-9.eE]+)\s+\[([-+0-9.eE]+),([-+0-9.eE]+)\]$"
-)
+PARAM_PATTERN = re.compile(r"^([A-Z0-9_]+)=([-+0-9.eE]+)\s+\[([-+0-9.eE]+),([-+0-9.eE]+)\]$")
 SET_PATTERN = re.compile(r"^OK\s+([A-Z0-9_]+)=([-+0-9.eE]+)")
-
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
-
-
-def is_text_input(widget) -> bool:
-    return isinstance(widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Spinbox))
 
 
 @dataclass
@@ -121,45 +405,31 @@ class PadState:
         with self.lock:
             self.mouse_dx += dx
             self.mouse_dy += dy
-            self.pending_yaw_deg = clamp(
-                self.pending_yaw_deg + dx * self.mouse_sensitivity,
-                -90.0,
-                90.0,
-            )
-            self.pending_pitch_deg = clamp(
-                self.pending_pitch_deg - dy * self.mouse_sensitivity,
-                -45.0,
-                45.0,
-            )
+            self.pending_yaw_deg = clamp(self.pending_yaw_deg + dx * self.mouse_sensitivity, -90.0, 90.0)
+            self.pending_pitch_deg = clamp(self.pending_pitch_deg - dy * self.mouse_sensitivity, -45.0, 45.0)
 
     def set_mouse_sensitivity(self, value: float) -> None:
-        with self.lock:
-            self.mouse_sensitivity = value
+        with self.lock: self.mouse_sensitivity = value
 
     def set_drive_scale(self, value: float) -> None:
-        with self.lock:
-            self.drive_scale = value
+        with self.lock: self.drive_scale = value
 
     def set_mouse_response_time(self, value: float) -> None:
-        with self.lock:
-            self.mouse_response_time = max(value, 0.02)
+        with self.lock: self.mouse_response_time = max(value, 0.02)
 
     def set_turret_rate(self, value: float) -> None:
-        with self.lock:
-            self.turret_rate_deg_s = max(value, 1.0)
+        with self.lock: self.turret_rate_deg_s = max(value, 1.0)
 
     @staticmethod
     def joystick_from_effective(value: float) -> float:
         value = clamp(value, -1.0, 1.0)
-        if abs(value) < 1e-4:
-            return 0.0
+        if abs(value) < 1e-4: return 0.0
         return math.copysign(0.15 + 0.85 * abs(value), value)
 
     @staticmethod
     def consume_pending(pending: float, rate_deg_s: float, dt: float) -> float:
         consumed = rate_deg_s * dt
-        if abs(consumed) >= abs(pending):
-            return 0.0
+        if abs(consumed) >= abs(pending): return 0.0
         return pending - consumed
 
     def snapshot(self) -> tuple[str, dict[str, float]]:
@@ -177,736 +447,515 @@ class PadState:
             joy_lx = clamp(left + right, -1.0, 1.0)
             stabilizer_button = 1 if "space" in keys else 0
 
-            yaw_rate_cmd = clamp(
-                self.pending_yaw_deg / self.mouse_response_time,
-                -self.turret_rate_deg_s,
-                self.turret_rate_deg_s,
-            )
-            pitch_rate_cmd = clamp(
-                self.pending_pitch_deg / self.mouse_response_time,
-                -self.turret_rate_deg_s,
-                self.turret_rate_deg_s,
-            )
-            joy_rx = self.joystick_from_effective(
-                yaw_rate_cmd / self.turret_rate_deg_s
-            )
-            joy_ry = self.joystick_from_effective(
-                -pitch_rate_cmd / self.turret_rate_deg_s
-            )
+            yaw_rate_cmd = clamp(self.pending_yaw_deg / self.mouse_response_time, -self.turret_rate_deg_s, self.turret_rate_deg_s)
+            pitch_rate_cmd = clamp(self.pending_pitch_deg / self.mouse_response_time, -self.turret_rate_deg_s, self.turret_rate_deg_s)
+            joy_rx = self.joystick_from_effective(yaw_rate_cmd / self.turret_rate_deg_s)
+            joy_ry = self.joystick_from_effective(-pitch_rate_cmd / self.turret_rate_deg_s)
 
-            self.pending_yaw_deg = self.consume_pending(
-                self.pending_yaw_deg,
-                yaw_rate_cmd,
-                dt,
-            )
-            self.pending_pitch_deg = self.consume_pending(
-                self.pending_pitch_deg,
-                pitch_rate_cmd,
-                dt,
-            )
-            sent_brake = round(brake, 3)
-            sent_throttle = round(throttle, 3)
-            sent_left_x = round(joy_lx, 3)
-            sent_right_x = round(joy_rx, 3)
-            sent_right_y = round(joy_ry, 3)
+            self.pending_yaw_deg = self.consume_pending(self.pending_yaw_deg, yaw_rate_cmd, dt)
+            self.pending_pitch_deg = self.consume_pending(self.pending_pitch_deg, pitch_rate_cmd, dt)
+
+            sent_brake, sent_throttle = round(brake, 3), round(throttle, 3)
+            sent_left_x, sent_right_x, sent_right_y = round(joy_lx, 3), round(joy_rx, 3), round(joy_ry, 3)
 
             values = {
-                "trigger_left": sent_brake,
-                "trigger_right": sent_throttle,
-                "left_x": sent_left_x,
-                "left_y": 0.0,
-                "right_x": sent_right_x,
-                "right_y": sent_right_y,
+                "trigger_left": sent_brake, "trigger_right": sent_throttle,
+                "left_x": sent_left_x, "left_y": 0.0,
+                "right_x": sent_right_x, "right_y": sent_right_y,
                 "button_a": float(stabilizer_button),
-                "mouse_dx": self.mouse_dx,
-                "mouse_dy": self.mouse_dy,
-                "pending_yaw_deg": self.pending_yaw_deg,
-                "pending_pitch_deg": self.pending_pitch_deg,
+                "mouse_dx": self.mouse_dx, "mouse_dy": self.mouse_dy,
+                "pending_yaw_deg": self.pending_yaw_deg, "pending_pitch_deg": self.pending_pitch_deg,
             }
-            self.mouse_dx = 0.0
-            self.mouse_dy = 0.0
-            command = (
-                f"pad tl={sent_brake:.3f} tr={sent_throttle:.3f} "
-                f"jlx={sent_left_x:.3f} jrx={sent_right_x:.3f} jry={sent_right_y:.3f} "
-                f"a={stabilizer_button}\n"
-            )
+            self.mouse_dx = self.mouse_dy = 0.0
+            command = f"pad tl={sent_brake:.3f} tr={sent_throttle:.3f} jlx={sent_left_x:.3f} jrx={sent_right_x:.3f} jry={sent_right_y:.3f} a={stabilizer_button}\n"
             return command, values
 
 
-class VirtualGamepadView(tk.Canvas):
-    def __init__(self, master, **kwargs):
-        super().__init__(
-            master,
-            bg=PANEL,
-            highlightthickness=1,
-            highlightbackground=GRID,
-            **kwargs,
-        )
+class QVirtualGamepadView(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.state = {
-            "trigger_left": 0.0,
-            "trigger_right": 0.0,
-            "left_x": 0.0,
-            "left_y": 0.0,
-            "right_x": 0.0,
-            "right_y": 0.0,
-            "button_a": 0.0,
-            "mouse_dx": 0.0,
-            "mouse_dy": 0.0,
-            "pending_yaw_deg": 0.0,
-            "pending_pitch_deg": 0.0,
+            key: 0.0
+            for key in [
+                "trigger_left", "trigger_right", "left_x", "left_y",
+                "right_x", "right_y", "button_a", "mouse_dx", "mouse_dy",
+                "pending_yaw_deg", "pending_pitch_deg",
+            ]
         }
-        self.bind("<Configure>", lambda _: self.render())
+        self.setMinimumSize(220, 130)
 
     def update_state(self, values):
         self.state.update(values)
-        self.render()
+        self.update()
 
-    def draw_trigger(self, x0, y0, width, height, value, label):
-        value = clamp(value, 0.0, 1.0)
-        self.create_rectangle(x0, y0, x0 + width, y0 + height, fill=BG, outline=GRID)
-        fill_height = height * value
-        if fill_height > 0.5:
-            self.create_rectangle(
-                x0 + 2,
-                y0 + height - fill_height,
-                x0 + width - 2,
-                y0 + height - 2,
-                fill=ACCENT,
-                outline="",
-            )
-        self.create_text(
-            x0 + width / 2,
-            y0 - 9,
-            text=f"{label} {value:.2f}",
-            fill=TEXT,
-            font=("Consolas", 9),
-        )
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(SURFACE))
 
-    def draw_stick(self, cx, cy, radius, x_value, y_value, label):
-        x_value = clamp(x_value, -1.0, 1.0)
-        y_value = clamp(y_value, -1.0, 1.0)
-        self.create_oval(
-            cx - radius,
-            cy - radius,
-            cx + radius,
-            cy + radius,
-            fill=BG,
-            outline=GRID,
-            width=2,
-        )
-        self.create_line(cx - radius, cy, cx + radius, cy, fill="#263849")
-        self.create_line(cx, cy - radius, cx, cy + radius, fill="#263849")
-        knob_x = cx + x_value * radius * 0.72
-        knob_y = cy + y_value * radius * 0.72
-        self.create_oval(
-            knob_x - 10,
-            knob_y - 10,
-            knob_x + 10,
-            knob_y + 10,
-            fill=ACCENT,
-            outline="#b9ddff",
-        )
-        self.create_text(
-            cx,
-            cy + radius + 15,
-            text=f"{label}  X {x_value:+.2f}  Y {y_value:+.2f}",
-            fill=MUTED,
-            font=("Consolas", 8),
-        )
-
-    def render(self):
-        self.delete("all")
-        width = max(self.winfo_width(), 10)
-        height = max(self.winfo_height(), 10)
-
-        self.create_text(
-            12,
-            10,
-            anchor="nw",
-            text="键鼠 → 虚拟手柄（实际发送值）",
-            fill=TEXT,
-            font=("Microsoft YaHei UI", 11, "bold"),
-        )
-        self.draw_trigger(28, 54, 28, 72, self.state["trigger_left"], "LT")
         self.draw_trigger(
-            width - 56,
-            54,
-            28,
-            72,
-            self.state["trigger_right"],
-            "RT",
+            painter, QRectF(12, 14, 72, 7), self.state["trigger_left"], "制动"
+        )
+        self.draw_trigger(
+            painter, QRectF(w - 84, 14, 72, 7), self.state["trigger_right"], "油门"
         )
 
-        stick_radius = min(48, max(34, width * 0.11))
+        radius = min(36.0, max(29.0, h * 0.25))
         self.draw_stick(
-            width * 0.31,
-            100,
-            stick_radius,
-            self.state["left_x"],
-            self.state["left_y"],
-            "左摇杆",
+            painter, w * 0.34, h * 0.48, radius,
+            self.state["left_x"], self.state["left_y"], "底盘",
         )
         self.draw_stick(
-            width * 0.69,
-            100,
-            stick_radius,
-            self.state["right_x"],
-            self.state["right_y"],
-            "右摇杆",
+            painter, w * 0.68, h * 0.48, radius,
+            self.state["right_x"], self.state["right_y"], "炮塔",
         )
 
-        button_x = width * 0.84
-        button_y = 36
         button_active = self.state["button_a"] >= 0.5
-        self.create_oval(
-            button_x - 13,
-            button_y - 13,
-            button_x + 13,
-            button_y + 13,
-            fill=GREEN if button_active else PANEL_ALT,
-            outline="#a9ffc9" if button_active else GRID,
-            width=2,
-        )
-        self.create_text(
-            button_x,
-            button_y,
-            text="A",
-            fill="white" if button_active else MUTED,
-            font=("Consolas", 11, "bold"),
+        button_center = QPointF(w - 28, h * 0.48)
+        painter.setBrush(QColor(GREEN if button_active else ELEVATED))
+        painter.setPen(QPen(QColor("#79EAB2" if button_active else BORDER), 1))
+        painter.drawEllipse(button_center, 12, 12)
+        painter.setPen(QColor(BG if button_active else MUTED))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.drawText(
+            QRectF(button_center.x() - 12, button_center.y() - 12, 24, 24),
+            Qt.AlignCenter,
+            "A",
         )
 
+        painter.setPen(QColor(MUTED))
+        painter.setFont(QFont("Cascadia Mono", 8))
         detail = (
-            f"鼠标 ΔX {self.state['mouse_dx']:+.0f}  ΔY {self.state['mouse_dy']:+.0f}    "
-            f"待转换 Yaw {self.state['pending_yaw_deg']:+.2f}°  "
-            f"Pitch {self.state['pending_pitch_deg']:+.2f}°"
+            f"DX {self.state['mouse_dx']:+.0f}  DY {self.state['mouse_dy']:+.0f}"
+            f"    YAW {self.state['pending_yaw_deg']:+.1f}°"
+            f"  PITCH {self.state['pending_pitch_deg']:+.1f}°"
         )
-        self.create_text(
-            width / 2,
-            height - 14,
-            text=detail,
-            fill=MUTED,
-            font=("Consolas", 8),
+        painter.drawText(QRectF(10, h - 24, w - 20, 16), Qt.AlignCenter, detail)
+
+    def draw_trigger(self, painter, rect, value, label):
+        value = clamp(value, 0.0, 1.0)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(ELEVATED))
+        painter.drawRoundedRect(rect, 3.5, 3.5)
+        if value > 0:
+            fill = QRectF(rect.x(), rect.y(), rect.width() * value, rect.height())
+            painter.setBrush(QColor(ACCENT))
+            painter.drawRoundedRect(fill, 3.5, 3.5)
+        painter.setPen(QColor(MUTED))
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
+        painter.drawText(
+            QRectF(rect.x(), rect.y() + 9, rect.width(), 14),
+            Qt.AlignCenter,
+            f"{label} {value:.2f}",
+        )
+
+    def draw_stick(self, painter, cx, cy, r, x, y, label):
+        x = clamp(x, -1.0, 1.0)
+        y = clamp(y, -1.0, 1.0)
+        painter.setBrush(QBrush(QColor(BG)))
+        painter.setPen(QPen(QColor(BORDER), 2))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        painter.setPen(QPen(QColor(GRID), 1))
+        painter.drawLine(QPointF(cx - r * 0.65, cy), QPointF(cx + r * 0.65, cy))
+        painter.drawLine(QPointF(cx, cy - r * 0.65), QPointF(cx, cy + r * 0.65))
+
+        kx = cx + x * r * 0.8
+        ky = cy + y * r * 0.8
+
+        painter.setBrush(QBrush(QColor(ACCENT)))
+        painter.setPen(QPen(QColor("#8FC3FF"), 1))
+        painter.drawEllipse(QPointF(kx, ky), 7, 7)
+
+        painter.setPen(QColor(MUTED))
+        painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
+        painter.drawText(
+            QRectF(cx - r, cy + r + 5, r * 2, 17), Qt.AlignCenter, label
         )
 
 
-class ThirdPersonTankView(tk.Canvas):
-    BOX_FACES = [
-        (0, 1, 2, 3),
-        (4, 7, 6, 5),
-        (0, 4, 5, 1),
-        (1, 5, 6, 2),
-        (2, 6, 7, 3),
-        (4, 0, 3, 7),
-    ]
+class QTelemetryChartView(QWidget):
+    capture_requested = Signal()
+    mouse_position_changed = Signal(float, float)
 
-    def __init__(self, master, **kwargs):
-        super().__init__(
-            master,
-            bg="#07111c",
-            highlightthickness=1,
-            highlightbackground=GRID,
-            cursor="crosshair",
-            **kwargs,
-        )
+    SERIES = {
+        "chassis_yaw_deg": ("车体", "#6B7C93"),
+        "turret_yaw_deg": ("炮塔", ACCENT),
+        "target_yaw_deg": ("目标", CYAN),
+        "chassis_pitch_deg": ("车体", "#6B7C93"),
+        "gun_pitch_deg": ("炮管", "#7A5AF8"),
+        "target_pitch_deg": ("目标", CYAN),
+        "yaw_voltage": ("Yaw 电压", RED),
+        "servo_command_deg": ("舵机命令", GREEN),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.state = {
-            "chassis_yaw_deg": 0.0,
-            "chassis_pitch_deg": 0.0,
-            "turret_yaw_deg": 0.0,
-            "turret_relative_yaw_deg": 0.0,
-            "gun_pitch_deg": 0.0,
-            "target_yaw_deg": 0.0,
-            "target_pitch_deg": 0.0,
-            "yaw_voltage": 0.0,
-            "servo_command_deg": 90.0,
-            "stabilizer_enabled": 0.0,
-            "imu_healthy": 0.0,
-            "yaw_sensor_healthy": 0.0,
+            key: 0.0
+            for key in [
+                "chassis_yaw_deg", "chassis_pitch_deg", "turret_yaw_deg",
+                "turret_relative_yaw_deg", "gun_pitch_deg", "target_yaw_deg",
+                "target_pitch_deg", "yaw_voltage", "servo_command_deg",
+                "stabilizer_enabled", "imu_healthy", "yaw_sensor_healthy",
+            ]
         }
         self.telemetry_stale = True
         self.mouse_captured = False
-        self.bind("<Configure>", lambda _: self.render())
+        self.timestamps = deque(maxlen=300)
+        self.history = {
+            key: deque(maxlen=300)
+            for key in self.SERIES
+        }
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumHeight(270)
 
-    @staticmethod
-    def add(a, b):
-        return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(SURFACE))
 
-    @staticmethod
-    def sub(a, b):
-        return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+        painter.setPen(QColor(TEXT))
+        painter.setFont(QFont("Microsoft YaHei UI", 13, QFont.Bold))
+        painter.drawText(18, 29, "关键运动遥测")
+        painter.setPen(QColor(MUTED))
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
+        hint = (
+            "鼠标已接管，按 Esc 急停并释放"
+            if self.mouse_captured
+            else "30 秒滚动窗口 · 点击曲线区接管炮塔鼠标输入"
+        )
+        painter.setPen(QColor(ACCENT if self.mouse_captured else MUTED))
+        painter.drawText(18, 48, hint)
 
-    @staticmethod
-    def mul(a, scalar):
-        return (a[0] * scalar, a[1] * scalar, a[2] * scalar)
-
-    @staticmethod
-    def dot(a, b):
-        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-    @staticmethod
-    def cross(a, b):
-        return (
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
+        status_color = (
+            RED if self.telemetry_stale
+            else GREEN if self.state["stabilizer_enabled"]
+            else YELLOW
+        )
+        status_text = (
+            "遥测离线" if self.telemetry_stale
+            else "双稳已开启" if self.state["stabilizer_enabled"]
+            else "手动模式"
+        )
+        self.draw_status_chip(
+            painter, QRectF(w - 118, 14, 100, 28), status_text, status_color
         )
 
-    @classmethod
-    def normalize(cls, vector):
-        length = math.sqrt(cls.dot(vector, vector))
-        if length < 1e-6:
-            return (0.0, 0.0, 1.0)
-        return cls.mul(vector, 1.0 / length)
+        chart_top = 62
+        gap = 8
+        chart_width = (w - 36 - gap) / 2
+        chart_height = (h - chart_top - 14 - gap) / 2
+        charts = [
+            (
+                QRectF(14, chart_top, chart_width, chart_height),
+                "Yaw 角度",
+                ["chassis_yaw_deg", "turret_yaw_deg", "target_yaw_deg"],
+                "°",
+            ),
+            (
+                QRectF(14 + chart_width + gap, chart_top, chart_width, chart_height),
+                "Pitch 角度",
+                ["chassis_pitch_deg", "gun_pitch_deg", "target_pitch_deg"],
+                "°",
+            ),
+            (
+                QRectF(14, chart_top + chart_height + gap, chart_width, chart_height),
+                "Yaw 电压输出",
+                ["yaw_voltage"],
+                "V",
+            ),
+            (
+                QRectF(
+                    14 + chart_width + gap,
+                    chart_top + chart_height + gap,
+                    chart_width,
+                    chart_height,
+                ),
+                "舵机命令",
+                ["servo_command_deg"],
+                "°",
+            ),
+        ]
+        for rect, title, keys, unit in charts:
+            self.draw_chart(painter, rect, title, keys, unit)
+
+    def draw_chart(self, painter, rect, title, keys, unit):
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.setBrush(QColor("#FAFCFE"))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        painter.setPen(QColor(TEXT))
+        painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+        painter.drawText(rect.adjusted(10, 6, -8, 0), Qt.AlignTop, title)
+
+        legend_x = rect.right() - 8
+        painter.setFont(QFont("Microsoft YaHei UI", 7))
+        for key in reversed(keys):
+            label, color = self.SERIES[key]
+            text_width = painter.fontMetrics().horizontalAdvance(label) + 16
+            legend_x -= text_width
+            painter.setPen(QPen(QColor(color), 2))
+            painter.drawLine(
+                QPointF(legend_x, rect.top() + 13),
+                QPointF(legend_x + 8, rect.top() + 13),
+            )
+            painter.setPen(QColor(MUTED))
+            painter.drawText(
+                QRectF(legend_x + 11, rect.top() + 5, text_width - 11, 16),
+                Qt.AlignVCenter,
+                label,
+            )
+
+        plot = rect.adjusted(36, 27, -10, -20)
+        painter.setPen(QPen(QColor(GRID), 1))
+        for index in range(5):
+            y = plot.top() + plot.height() * index / 4
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+        for index in range(7):
+            x = plot.left() + plot.width() * index / 6
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+
+        values = [
+            value
+            for key in keys
+            for value in self.history[key]
+        ]
+        if values:
+            low = min(min(values), 0.0)
+            high = max(max(values), 0.0)
+        else:
+            low, high = -1.0, 1.0
+        if math.isclose(low, high):
+            low -= 1.0
+            high += 1.0
+        padding = max((high - low) * 0.12, 0.25)
+        low -= padding
+        high += padding
+
+        painter.setPen(QColor(MUTED))
+        painter.setFont(QFont("Cascadia Mono", 7))
+        painter.drawText(
+            QRectF(rect.left() + 4, plot.top() - 6, 30, 14),
+            Qt.AlignRight,
+            f"{high:.1f}",
+        )
+        painter.drawText(
+            QRectF(rect.left() + 4, plot.bottom() - 7, 30, 14),
+            Qt.AlignRight,
+            f"{low:.1f}",
+        )
+        painter.drawText(
+            QRectF(plot.left(), plot.bottom() + 2, plot.width(), 14),
+            Qt.AlignRight,
+            f"{self.state[keys[-1]]:+.2f}{unit}",
+        )
+
+        if len(self.timestamps) < 2:
+            painter.setPen(QColor(MUTED))
+            painter.setFont(QFont("Microsoft YaHei UI", 8))
+            painter.drawText(plot, Qt.AlignCenter, "等待遥测数据")
+            return
+
+        end_time = self.timestamps[-1]
+        duration = 30.0
+        start_time = end_time - duration
+        painter.setPen(QColor(MUTED))
+        painter.setFont(QFont("Cascadia Mono", 7))
+        painter.drawText(
+            QRectF(plot.left(), plot.bottom() + 2, 40, 14),
+            Qt.AlignLeft,
+            "-30s",
+        )
+        painter.setClipRect(plot)
+        for key in keys:
+            samples = self.history[key]
+            if len(samples) < 2:
+                continue
+            points = []
+            offset = len(self.timestamps) - len(samples)
+            for index, value in enumerate(samples):
+                timestamp = self.timestamps[index + offset]
+                if timestamp < start_time:
+                    continue
+                x = plot.left() + (timestamp - start_time) / duration * plot.width()
+                y = plot.bottom() - (value - low) / (high - low) * plot.height()
+                points.append(QPointF(x, y))
+            if len(points) < 2:
+                continue
+            pen = QPen(QColor(self.SERIES[key][1]), 1.7)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.drawPolyline(QPolygonF(points))
+        painter.setClipping(False)
 
     @staticmethod
-    def orientation_basis(yaw_deg, pitch_deg=0.0):
-        yaw = math.radians(yaw_deg)
-        pitch = math.radians(pitch_deg)
-        right = (math.cos(yaw), 0.0, -math.sin(yaw))
-        forward = (
-            math.sin(yaw) * math.cos(pitch),
-            math.sin(pitch),
-            math.cos(yaw) * math.cos(pitch),
-        )
-        up = ThirdPersonTankView.cross(forward, right)
-        return right, up, forward
-
-    @classmethod
-    def local_to_world(cls, center, local, yaw_deg, pitch_deg=0.0):
-        right, up, forward = cls.orientation_basis(yaw_deg, pitch_deg)
-        return (
-            center[0] + right[0] * local[0] + up[0] * local[1] + forward[0] * local[2],
-            center[1] + right[1] * local[0] + up[1] * local[1] + forward[1] * local[2],
-            center[2] + right[2] * local[0] + up[2] * local[1] + forward[2] * local[2],
-        )
-
-    @staticmethod
-    def wrap_angle(angle_deg):
-        return (angle_deg + 180.0) % 360.0 - 180.0
+    def draw_status_chip(painter, rect, text, color):
+        fill = QColor(color)
+        fill.setAlpha(38)
+        painter.setBrush(fill)
+        painter.setPen(QPen(QColor(color), 1))
+        painter.drawRoundedRect(rect, 14, 14)
+        painter.setPen(QColor(color))
+        painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
+        painter.drawText(rect, Qt.AlignCenter, text)
 
     def update_telemetry(self, values):
         self.state.update(values)
+        self.timestamps.append(time.monotonic())
+        for key in self.history:
+            self.history[key].append(float(self.state[key]))
         self.telemetry_stale = False
-        self.render()
+        self.update()
 
     def set_telemetry_stale(self, stale):
         if self.telemetry_stale != stale:
             self.telemetry_stale = stale
-            self.render()
+            self.update()
 
-    def set_mouse_captured(self, captured: bool):
-        self.mouse_captured = captured
-        self.configure(cursor="none" if captured else "crosshair")
-        self.render()
+    def set_mouse_captured(self, captured):
+        self.mouse_captured = bool(captured)
+        self.setCursor(Qt.BlankCursor if captured else Qt.ArrowCursor)
+        self.update()
 
-    def camera_basis(self):
-        body = (0.0, 0.0, 0.0)
-        _, _, body_forward = self.orientation_basis(
-            self.state["chassis_yaw_deg"],
-            0.0,
-        )
-        camera = self.add(
-            self.sub(body, self.mul(body_forward, 8.0)),
-            (0.0, 5.3, 0.0),
-        )
-        target = self.add(body, self.add(self.mul(body_forward, 1.3), (0.0, 0.8, 0.0)))
-        camera_forward = self.normalize(self.sub(target, camera))
-        camera_right = self.normalize(self.cross((0.0, 1.0, 0.0), camera_forward))
-        camera_up = self.normalize(self.cross(camera_forward, camera_right))
-        return camera, camera_right, camera_up, camera_forward
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.capture_requested.emit()
+            event.accept()
 
-    def project(self, point, camera_basis):
-        camera, right, up, forward = camera_basis
-        relative = self.sub(point, camera)
-        depth = self.dot(relative, forward)
-        if depth <= 0.15:
-            return None
-        width = max(self.winfo_width(), 10)
-        height = max(self.winfo_height(), 10)
-        focal = min(width, height) * 1.05
-        x = width / 2 + self.dot(relative, right) * focal / depth
-        y = height * 0.54 - self.dot(relative, up) * focal / depth
-        return (x, y, depth)
-
-    @staticmethod
-    def shade(color, factor):
-        color = color.lstrip("#")
-        red = int(color[0:2], 16)
-        green = int(color[2:4], 16)
-        blue = int(color[4:6], 16)
-        red = int(clamp(red * factor, 0, 255))
-        green = int(clamp(green * factor, 0, 255))
-        blue = int(clamp(blue * factor, 0, 255))
-        return f"#{red:02x}{green:02x}{blue:02x}"
-
-    def box_faces(self, center, size, yaw_deg, pitch_deg, color, camera_basis):
-        half_x, half_y, half_z = size[0] / 2, size[1] / 2, size[2] / 2
-        local_vertices = [
-            (-half_x, -half_y, -half_z),
-            (half_x, -half_y, -half_z),
-            (half_x, half_y, -half_z),
-            (-half_x, half_y, -half_z),
-            (-half_x, -half_y, half_z),
-            (half_x, -half_y, half_z),
-            (half_x, half_y, half_z),
-            (-half_x, half_y, half_z),
-        ]
-        world_vertices = [
-            self.local_to_world(center, vertex, yaw_deg, pitch_deg)
-            for vertex in local_vertices
-        ]
-        projected = [self.project(vertex, camera_basis) for vertex in world_vertices]
-        faces = []
-        shade_factors = [0.55, 0.85, 0.70, 0.62, 1.0, 0.72]
-        for face_index, indices in enumerate(self.BOX_FACES):
-            points = [projected[index] for index in indices]
-            if any(point is None for point in points):
-                continue
-            coords = [(point[0], point[1]) for point in points]
-            depth = sum(point[2] for point in points) / len(points)
-            faces.append((depth, coords, self.shade(color, shade_factors[face_index])))
-        return faces
-
-    def draw_grid(self, camera_basis):
-        spacing = 2.0
-        extent = 18
-        for index in range(-extent, extent + 1):
-            x = index * spacing
-            p1 = self.project((x, 0.0, -extent * spacing), camera_basis)
-            p2 = self.project((x, 0.0, extent * spacing), camera_basis)
-            if p1 and p2:
-                self.create_line(p1[0], p1[1], p2[0], p2[1], fill="#163149")
-
-            z = index * spacing
-            p1 = self.project((-extent * spacing, 0.0, z), camera_basis)
-            p2 = self.project((extent * spacing, 0.0, z), camera_basis)
-            if p1 and p2:
-                self.create_line(p1[0], p1[1], p2[0], p2[1], fill="#163149")
-
-    def draw_direction_line(self, origin, yaw_deg, pitch_deg, length, color, camera_basis, dash=None, width=2):
-        yaw = math.radians(yaw_deg)
-        pitch = math.radians(pitch_deg)
-        direction = (
-            math.sin(yaw) * math.cos(pitch),
-            math.sin(pitch),
-            math.cos(yaw) * math.cos(pitch),
-        )
-        endpoint = self.add(origin, self.mul(direction, length))
-        start_2d = self.project(origin, camera_basis)
-        end_2d = self.project(endpoint, camera_basis)
-        if not start_2d or not end_2d:
-            return None
-        self.create_line(
-            start_2d[0],
-            start_2d[1],
-            end_2d[0],
-            end_2d[1],
-            fill=color,
-            width=width,
-            dash=dash,
-        )
-        return end_2d
-
-    def render(self):
-        self.delete("all")
-        width = max(self.winfo_width(), 10)
-        height = max(self.winfo_height(), 10)
-        camera_basis = self.camera_basis()
-        self.draw_grid(camera_basis)
-
-        body_center = (0.0, 0.55, 0.0)
-        body_yaw = self.state["chassis_yaw_deg"]
-        body_pitch = self.state["chassis_pitch_deg"]
-
-        face_queue = []
-        face_queue.extend(
-            self.box_faces(
-                body_center,
-                (3.1, 0.75, 5.0),
-                body_yaw,
-                body_pitch,
-                "#627348",
-                camera_basis,
-            )
-        )
-        for side in (-1.0, 1.0):
-            track_center = self.local_to_world(
-                body_center,
-                (side * 1.75, -0.08, 0.0),
-                body_yaw,
-                body_pitch,
-            )
-            face_queue.extend(
-                self.box_faces(
-                    track_center,
-                    (0.55, 0.55, 5.25),
-                    body_yaw,
-                    body_pitch,
-                    "#30363b",
-                    camera_basis,
-                )
-            )
-
-        turret_center = self.local_to_world(
-            body_center,
-            (0.0, 0.80, 0.0),
-            body_yaw,
-            body_pitch,
-        )
-        face_queue.extend(
-            self.box_faces(
-                turret_center,
-                (2.25, 0.78, 2.35),
-                self.state["turret_yaw_deg"],
-                body_pitch,
-                "#748955",
-                camera_basis,
-            )
-        )
-
-        for _, points, color in sorted(face_queue, key=lambda item: item[0], reverse=True):
-            flat = [coordinate for point in points for coordinate in point]
-            self.create_polygon(*flat, fill=color, outline="#202b32")
-
-        gun_origin = self.add(turret_center, (0.0, 0.18, 0.0))
-        barrel_tip = self.draw_direction_line(
-            gun_origin,
-            self.state["turret_yaw_deg"],
-            self.state["gun_pitch_deg"],
-            4.7,
-            "#172027",
-            camera_basis,
-            width=9,
-        )
-        self.draw_direction_line(
-            gun_origin,
-            self.state["turret_yaw_deg"],
-            self.state["gun_pitch_deg"],
-            4.7,
-            "#b2a86a",
-            camera_basis,
-            width=5,
-        )
-
-        target_tip = self.draw_direction_line(
-            gun_origin,
-            self.state["target_yaw_deg"],
-            self.state["target_pitch_deg"],
-            6.4,
-            ACCENT,
-            camera_basis,
-            dash=(6, 4),
-            width=2,
-        )
-        if target_tip:
-            x, y = target_tip[0], target_tip[1]
-            self.create_oval(x - 9, y - 9, x + 9, y + 9, outline=ACCENT, width=2)
-            self.create_line(x - 14, y, x + 14, y, fill=ACCENT)
-            self.create_line(x, y - 14, x, y + 14, fill=ACCENT)
-        if barrel_tip:
-            self.create_oval(
-                barrel_tip[0] - 3,
-                barrel_tip[1] - 3,
-                barrel_tip[0] + 3,
-                barrel_tip[1] + 3,
-                fill=YELLOW,
-                outline="",
-            )
-
-        sensors_ok = self.state["imu_healthy"] and self.state["yaw_sensor_healthy"]
-        status_color = RED if self.telemetry_stale else GREEN if sensors_ok else YELLOW
-        self.create_rectangle(0, 0, width, 42, fill="#07111c", outline="")
-        self.create_text(
-            12,
-            11,
-            anchor="nw",
-            text="第三人称实时遥测视图",
-            fill=TEXT,
-            font=("Microsoft YaHei UI", 11, "bold"),
-        )
-        self.create_text(
-            width - 12,
-            11,
-            anchor="ne",
-            text=(
-                "遥测过期"
-                if self.telemetry_stale
-                else "双稳 ON"
-                if self.state["stabilizer_enabled"]
-                else "双稳 OFF"
-            ),
-            fill=status_color,
-            font=("Microsoft YaHei UI", 10, "bold"),
-        )
-
-        yaw_error = self.wrap_angle(
-            self.state["target_yaw_deg"] - self.state["turret_yaw_deg"]
-        )
-        pitch_error = self.state["target_pitch_deg"] - self.state["gun_pitch_deg"]
-        info = (
-            f"车体 Y {self.state['chassis_yaw_deg']:+.1f}° / P {body_pitch:+.1f}°   "
-            f"炮塔世界 {self.state['turret_yaw_deg']:+.1f}°   "
-            f"相对 {self.state['turret_relative_yaw_deg']:+.1f}°\n"
-            f"炮管 {self.state['gun_pitch_deg']:+.1f}°   "
-            f"目标 Y {self.state['target_yaw_deg']:+.1f}° / P {self.state['target_pitch_deg']:+.1f}°   "
-            f"误差 {yaw_error:+.1f}° / {pitch_error:+.1f}°\n"
-            f"Yaw 输出 {self.state['yaw_voltage']:+.3f}V   "
-            f"舵机命令 {self.state['servo_command_deg']:.1f}°   "
-            f"IMU {'OK' if self.state['imu_healthy'] else 'ERR'} / "
-            f"AS5600 {'OK' if self.state['yaw_sensor_healthy'] else 'ERR'}"
-        )
-        self.create_rectangle(8, height - 70, width - 8, height - 8, fill="#07111c", outline=GRID)
-        self.create_text(
-            15,
-            height - 65,
-            anchor="nw",
-            text=info,
-            fill=MUTED,
-            font=("Consolas", 8),
-        )
-        self.create_text(
-            12,
-            49,
-            anchor="nw",
-            text="鼠标已捕获：输入只转换为右摇杆，模型仅跟随 ESP32 遥测"
-            if self.mouse_captured
-            else "点击视窗捕获鼠标；蓝色虚线为 ESP32 当前稳定目标",
-            fill=GREEN if self.mouse_captured else MUTED,
-            font=("Microsoft YaHei UI", 9),
-        )
+    def mouseMoveEvent(self, event):
+        self.mouse_position_changed.emit(event.position().x(), event.position().y())
+        event.accept()
 
 
-class ParameterRow:
-    def __init__(
-        self,
-        master,
-        name: str,
-        value: float,
-        minimum: float,
-        maximum: float,
-        label: str,
-        description: str,
-        send_callback,
-    ):
+class QParameterRow(QFrame):
+    def __init__(self, name, value, minimum, maximum, label, description, send_callback, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ParameterRow")
+        self.setProperty("dirty", False)
         self.name = name
         self.minimum = minimum
         self.maximum = maximum
         self.send_callback = send_callback
         self.dirty = False
-        self.variable = tk.DoubleVar(value=value)
-        self.entry_variable = tk.StringVar(value=self.format_value(value))
+        self.variable = value
+        self._syncing = False
 
-        self.frame = tk.Frame(master, bg=PANEL, padx=8, pady=7)
-        self.frame.pack(fill="x", padx=5, pady=3)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 11)
+        layout.setSpacing(6)
 
-        top = tk.Frame(self.frame, bg=PANEL)
-        top.pack(fill="x")
-        self.name_label = tk.Label(
-            top,
-            text=label,
-            bg=PANEL,
-            fg=TEXT,
-            anchor="w",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        )
-        self.name_label.pack(side="left")
-        tk.Label(
-            top,
-            text=name,
-            bg=PANEL,
-            fg=MUTED,
-            anchor="w",
-            font=("Consolas", 8),
-        ).pack(side="left", padx=(8, 0))
+        header = QHBoxLayout()
+        header.setSpacing(8)
 
-        self.entry = ttk.Entry(top, textvariable=self.entry_variable, width=11)
-        self.entry.pack(side="right", padx=(5, 0))
-        ttk.Button(top, text="应用", width=6, command=self.apply).pack(side="right")
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
+        self.lbl_title = QLabel(label)
+        self.lbl_title.setObjectName("ParameterTitle")
+        self.lbl_name = QLabel(name)
+        self.lbl_name.setObjectName("Mono")
+        self.lbl_name.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        title_box.addWidget(self.lbl_title)
+        title_box.addWidget(self.lbl_name)
+        header.addLayout(title_box)
+        header.addStretch()
 
-        tk.Label(
-            self.frame,
-            text=description,
-            bg=PANEL,
-            fg=MUTED,
-            anchor="w",
-            justify="left",
-            wraplength=650,
-            font=("Microsoft YaHei UI", 8),
-        ).pack(fill="x", pady=(2, 3))
+        self.entry = QLineEdit(self.format_value(value))
+        self.entry.setValidator(QDoubleValidator(minimum, maximum, 6, self.entry))
+        self.entry.setFixedWidth(92)
+        self.entry.setAlignment(Qt.AlignRight)
+        self.entry.textChanged.connect(self.mark_dirty)
+        self.entry.returnPressed.connect(self.apply)
+        header.addWidget(self.entry)
 
-        scale_row = tk.Frame(self.frame, bg=PANEL)
-        scale_row.pack(fill="x")
-        tk.Label(scale_row, text=self.format_value(minimum), bg=PANEL, fg=MUTED, width=9).pack(side="left")
-        self.scale = ttk.Scale(
-            scale_row,
-            from_=minimum,
-            to=maximum,
-            variable=self.variable,
-            command=self.on_scale,
-        )
-        self.scale.pack(side="left", fill="x", expand=True)
-        tk.Label(scale_row, text=self.format_value(maximum), bg=PANEL, fg=MUTED, width=9).pack(side="left")
+        self.btn_apply = QPushButton("应用")
+        self.btn_apply.setFocusPolicy(Qt.NoFocus)
+        self.btn_apply.setFixedWidth(58)
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self.apply)
+        header.addWidget(self.btn_apply)
+        layout.addLayout(header)
 
-        self.entry.bind("<Return>", lambda _: self.apply())
-        self.entry.bind("<KeyRelease>", lambda _: self.mark_dirty())
+        desc = QLabel(description)
+        desc.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        range_row = QHBoxLayout()
+        range_row.setSpacing(8)
+        min_label = QLabel(self.format_value(minimum))
+        min_label.setObjectName("Mono")
+        min_label.setStyleSheet(f"color: {MUTED}; font-size: 9px;")
+        min_label.setFixedWidth(58)
+        min_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        range_row.addWidget(min_label)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 10000)
+        self.slider.setValue(int((value - minimum) / (maximum - minimum) * 10000) if maximum != minimum else 0)
+        self.slider.valueChanged.connect(self.on_slider_moved)
+        range_row.addWidget(self.slider)
+
+        max_label = QLabel(self.format_value(maximum))
+        max_label.setObjectName("Mono")
+        max_label.setStyleSheet(f"color: {MUTED}; font-size: 9px;")
+        max_label.setFixedWidth(58)
+        max_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        range_row.addWidget(max_label)
+        layout.addLayout(range_row)
 
     @staticmethod
-    def format_value(value: float) -> str:
-        if abs(value) >= 100:
-            return f"{value:.2f}"
-        if abs(value) >= 10:
-            return f"{value:.3f}"
-        return f"{value:.5f}"
+    def format_value(v): return f"{v:.2f}" if abs(v) >= 100 else f"{v:.3f}" if abs(v) >= 10 else f"{v:.5f}"
 
-    def on_scale(self, raw_value: str) -> None:
-        value = float(raw_value)
-        self.entry_variable.set(self.format_value(value))
-        self.mark_dirty()
+    def on_slider_moved(self, pos):
+        val = self.minimum + (pos / 10000.0) * (self.maximum - self.minimum)
+        self.entry.setText(self.format_value(val))
 
-    def mark_dirty(self) -> None:
+    def mark_dirty(self):
+        if self._syncing:
+            return
         self.dirty = True
-        self.name_label.configure(fg=YELLOW)
+        self.setProperty("dirty", True)
+        self.btn_apply.setEnabled(True)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
-    def set_value(self, value: float) -> None:
-        value = clamp(value, self.minimum, self.maximum)
-        self.variable.set(value)
-        self.entry_variable.set(self.format_value(value))
+    def set_value(self, value):
+        self.variable = clamp(value, self.minimum, self.maximum)
+        self._syncing = True
+        self.entry.blockSignals(True)
+        self.entry.setText(self.format_value(self.variable))
+        self.entry.blockSignals(False)
+        self.slider.blockSignals(True)
+        self.slider.setValue(int((self.variable - self.minimum) / (self.maximum - self.minimum) * 10000) if self.maximum != self.minimum else 0)
+        self.slider.blockSignals(False)
+        self._syncing = False
         self.dirty = False
-        self.name_label.configure(fg=TEXT)
+        self.setProperty("dirty", False)
+        self.btn_apply.setEnabled(False)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
-    def get_value(self) -> float:
-        try:
-            return clamp(float(self.entry_variable.get()), self.minimum, self.maximum)
-        except ValueError:
-            return self.variable.get()
+    def apply(self):
+        try: val = clamp(float(self.entry.text()), self.minimum, self.maximum)
+        except ValueError: val = self.variable
+        self.set_value(val)
+        self.send_callback(self.name, val)
 
-    def apply(self) -> None:
-        value = self.get_value()
-        self.set_value(value)
-        self.send_callback(self.name, value)
-
-
-class ScrollableFrame(tk.Frame):
-    def __init__(self, master):
-        super().__init__(master, bg=BG)
-        canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        self.content = tk.Frame(canvas, bg=BG)
-        window = canvas.create_window((0, 0), window=self.content, anchor="nw")
-
-        self.content.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+    def get_value(self):
+        try: return clamp(float(self.entry.text()), self.minimum, self.maximum)
+        except ValueError: return self.variable
 
 
-class DebugGui:
-    def __init__(self, args: argparse.Namespace):
+class QConsoleMainWindow(QMainWindow):
+    def __init__(self, args):
+        super().__init__()
         self.args = args
         self.pad = PadState(mouse_sensitivity=args.mouse_sensitivity)
-        self.command_queue: queue.Queue[str] = queue.Queue()
-        self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.command_queue, self.ui_queue = queue.Queue(), queue.Queue()
         self.stop_event = threading.Event()
         self.connected = False
         self.emergency_stopped = False
@@ -914,300 +963,468 @@ class DebugGui:
         self.pad_command_lock = threading.Lock()
         self.mouse_captured = False
         self.mouse_warp_pending = False
-        self.rx_buffer = ""
-        self.parameter_rows: dict[str, ParameterRow] = {}
+        self.rx_buffer, self.parameter_rows = "", {}
         self.last_telemetry_at = 0.0
+        self._closing = False
 
-        self.root = tk.Tk()
-        self.root.title("Chieftain MK10 调试控制台")
-        self.root.geometry("1360x850")
-        self.root.minsize(1100, 700)
-        self.root.configure(bg=BG)
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.setWindowTitle("Chieftain MK10 Control Center")
+        self.resize(1380, 900)
+        self.setMinimumSize(1180, 800)
+        self.setStyleSheet(QSS_THEME)
 
-        self.configure_styles()
-        self.build_header()
-        self.build_main_area()
-        self.build_log_area()
+        self.build_ui()
         self.bind_inputs()
 
-    def configure_styles(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure(".", background=PANEL, foreground=TEXT, fieldbackground=PANEL_ALT)
-        style.configure("TButton", background=PANEL_ALT, foreground=TEXT, padding=6)
-        style.map("TButton", background=[("active", ACCENT)])
-        style.configure("TEntry", fieldbackground=PANEL_ALT, foreground=TEXT, insertcolor=TEXT)
-        style.configure("TScale", background=PANEL)
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=PANEL_ALT, foreground=TEXT, padding=(12, 7))
-        style.map("TNotebook.Tab", background=[("selected", ACCENT)])
+        self.timer_ui = QTimer()
+        self.timer_ui.timeout.connect(self.process_ui_events)
+        self.timer_ui.start(30)
+        self.timer_pad = QTimer()
+        self.timer_pad.timeout.connect(self.update_local_pad)
+        self.timer_pad.start(20)
 
-    def build_header(self) -> None:
-        header = tk.Frame(self.root, bg=PANEL, height=64)
-        header.pack(fill="x")
+    def build_ui(self):
+        central = QWidget(self)
+        central.setObjectName("AppRoot")
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(10)
 
-        tk.Label(
-            header,
-            text="CHIEFTAIN MK10",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Consolas", 18, "bold"),
-        ).pack(side="left", padx=(16, 8), pady=10)
-        tk.Label(
-            header,
-            text="PC 调试控制台",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Microsoft YaHei UI", 11),
-        ).pack(side="left")
+        header = QFrame(objectName="TopBar")
+        header.setFixedHeight(64)
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(18, 9, 14, 9)
+        h_layout.setSpacing(12)
 
-        self.connection_dot = tk.Label(header, text="●", bg=PANEL, fg=YELLOW, font=("Arial", 18))
-        self.connection_dot.pack(side="right", padx=(6, 16))
-        self.connection_label = tk.Label(
-            header,
-            text="等待扫描",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Microsoft YaHei UI", 10),
+        brand_box = QVBoxLayout()
+        brand_box.setSpacing(0)
+        logo = QLabel("CHIEFTAIN")
+        logo.setObjectName("HeroTitle")
+        logo.setStyleSheet(
+            f"font-size: 17px; font-weight: 800; color: {TEXT}; letter-spacing: 2px;"
         )
-        self.connection_label.pack(side="right")
-        ttk.Button(header, text="读取参数", command=lambda: self.enqueue_command("get")).pack(
-            side="right", padx=5, pady=10
-        )
+        descriptor = QLabel("MK10  ·  DEVICE CONTROL CENTER")
+        descriptor.setObjectName("Mono")
+        descriptor.setStyleSheet(f"font-size: 9px; color: {MUTED};")
+        brand_box.addWidget(logo)
+        brand_box.addWidget(descriptor)
+        h_layout.addLayout(brand_box)
+        h_layout.addStretch()
 
-    def build_main_area(self) -> None:
-        paned = tk.PanedWindow(
-            self.root,
-            orient="horizontal",
-            bg=BG,
-            sashwidth=6,
-            sashrelief="flat",
-            bd=0,
-        )
-        paned.pack(fill="both", expand=True, padx=10, pady=10)
+        device_label = QLabel(self.args.name)
+        device_label.setObjectName("Mono")
+        device_label.setStyleSheet(f"font-size: 10px; color: {MUTED};")
+        h_layout.addWidget(device_label)
 
-        controls = tk.Frame(paned, bg=BG, width=430)
-        parameters = tk.Frame(paned, bg=BG)
-        paned.add(controls, minsize=390)
-        paned.add(parameters, minsize=620)
+        status_box = QFrame(objectName="Inset")
+        status_box.setFixedHeight(36)
+        status_layout = QHBoxLayout(status_box)
+        status_layout.setContentsMargins(11, 0, 12, 0)
+        status_layout.setSpacing(7)
+        self.connection_dot = QLabel("●")
+        self.connection_dot.setStyleSheet(f"color: {YELLOW}; font-size: 12px;")
+        self.lbl_status = QLabel("正在扫描")
+        self.lbl_status.setStyleSheet(f"font-weight: 700; color: {YELLOW};")
+        status_layout.addWidget(self.connection_dot)
+        status_layout.addWidget(self.lbl_status)
+        h_layout.addWidget(status_box)
 
-        control_scroll = ScrollableFrame(controls)
-        control_scroll.pack(fill="both", expand=True)
-        self.build_control_panel(control_scroll.content)
-        self.build_parameter_panel(parameters)
+        btn_read_header = QPushButton("读取设备参数", objectName="Primary")
+        btn_read_header.setFocusPolicy(Qt.NoFocus)
+        btn_read_header.clicked.connect(lambda: self.enqueue_command("get"))
+        h_layout.addWidget(btn_read_header)
+        main_layout.addWidget(header)
 
-    def build_control_panel(self, parent) -> None:
-        status_card = tk.Frame(parent, bg=PANEL, padx=12, pady=10)
-        status_card.pack(fill="x", pady=(0, 8))
-        tk.Label(
-            status_card,
-            text="键鼠驾驶",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 13, "bold"),
-        ).pack(anchor="w")
-        tk.Label(
-            status_card,
-            text="W 油门  S 制动/倒车  A/D 转向  鼠标映射右摇杆  Space 映射 A 键",
-            bg=PANEL,
-            fg=MUTED,
-            justify="left",
-            wraplength=390,
-        ).pack(anchor="w", pady=(3, 6))
+        root_splitter = QSplitter(Qt.Vertical)
+        root_splitter.setChildrenCollapsible(False)
 
-        key_row = tk.Frame(status_card, bg=PANEL)
-        key_row.pack()
+        workspace = QWidget()
+        pane_layout = QHBoxLayout()
+        pane_layout.setContentsMargins(0, 0, 0, 0)
+        pane_layout.setSpacing(10)
+        workspace.setLayout(pane_layout)
+
+        left_pane = QVBoxLayout()
+        left_pane.setSpacing(10)
+
+        visual_panel = QFrame(objectName="TelemetryPanel")
+        visual_layout = QVBoxLayout(visual_panel)
+        visual_layout.setContentsMargins(0, 0, 0, 0)
+        visual_layout.setSpacing(0)
+        self.telemetry_view = QTelemetryChartView()
+        visual_layout.addWidget(self.telemetry_view, stretch=1)
+
+        tel_widget = QWidget()
+        tel_grid = QGridLayout(tel_widget)
+        tel_grid.setContentsMargins(10, 8, 10, 10)
+        tel_grid.setHorizontalSpacing(7)
+        tel_grid.setVerticalSpacing(7)
+        self.telemetry_labels = {}
+        fields = [
+            ("CHASSIS_Y", "车体 YAW"), ("CHASSIS_P", "车体 PITCH"),
+            ("TURRET_ABS", "炮塔 YAW"), ("GUN_P", "炮管 PITCH"),
+            ("TARGET_Y", "目标 YAW"), ("TARGET_P", "目标 PITCH"),
+        ]
+        for idx, (k, l) in enumerate(fields):
+            tile = QFrame(objectName="TelemetryTile")
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(10, 6, 10, 7)
+            tile_layout.setSpacing(0)
+            tile_layout.addWidget(QLabel(l, objectName="SubTitle"))
+            val = QLabel("+0.00°", objectName="LargeValue")
+            tile_layout.addWidget(val)
+            tel_grid.addWidget(tile, idx // 3, idx % 3)
+            self.telemetry_labels[k] = val
+        visual_layout.addWidget(tel_widget)
+        left_pane.addWidget(visual_panel, stretch=3)
+
+        ctrl_card = QFrame(objectName="ControlPanel")
+        ctrl_layout = QHBoxLayout(ctrl_card)
+        ctrl_layout.setContentsMargins(14, 12, 14, 12)
+        ctrl_layout.setSpacing(14)
+
+        kb_layout = QVBoxLayout()
+        kb_layout.setSpacing(6)
+        kb_layout.addWidget(QLabel("键盘输入", objectName="SectionTitle"))
+        kb_hint = QLabel("W/S 动力 · A/D 转向 · Space 双稳")
+        kb_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        kb_layout.addWidget(kb_hint)
+        grid = QGridLayout()
+        grid.setSpacing(5)
         self.key_labels = {}
-        for key in ["W", "A", "S", "D", "SPACE"]:
-            label = tk.Label(
-                key_row,
-                text=key,
-                width=7 if key == "SPACE" else 3,
-                height=2,
-                bg=PANEL_ALT,
-                fg=MUTED,
-                font=("Consolas", 10, "bold"),
-            )
-            label.pack(side="left", padx=3)
-            self.key_labels[key.lower()] = label
+        for k, r, c, cs in [("W",0,1,1), ("A",1,0,1), ("S",1,1,1), ("D",1,2,1), ("SPACE",2,0,3)]:
+            lbl = QLabel(k)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setMinimumHeight(27)
+            lbl.setStyleSheet(self.key_style(False))
+            grid.addWidget(lbl, r, c, 1, cs)
+            self.key_labels[k.lower()] = lbl
+        kb_layout.addLayout(grid)
+        ctrl_layout.addLayout(kb_layout)
 
-        self.gamepad_view = VirtualGamepadView(
-            parent,
-            height=185,
-        )
-        self.gamepad_view.pack(fill="x", pady=(0, 8))
+        divider_one = QFrame()
+        divider_one.setFrameShape(QFrame.VLine)
+        divider_one.setStyleSheet(f"color: {BORDER};")
+        ctrl_layout.addWidget(divider_one)
 
-        self.tank_view = ThirdPersonTankView(
-            parent,
-            height=330,
-        )
-        self.tank_view.pack(fill="x", pady=(0, 8))
-        self.tank_view.bind("<Button-1>", self.capture_mouse)
-        self.tank_view.bind("<Motion>", self.on_mouse_motion)
+        gamepad_layout = QVBoxLayout()
+        gamepad_layout.setSpacing(4)
+        gamepad_layout.addWidget(QLabel("虚拟手柄输出", objectName="SectionTitle"))
+        self.gamepad_view = QVirtualGamepadView()
+        gamepad_layout.addWidget(self.gamepad_view)
+        ctrl_layout.addLayout(gamepad_layout, stretch=1)
 
-        adjust_card = tk.Frame(parent, bg=PANEL, padx=12, pady=8)
-        adjust_card.pack(fill="x", pady=(0, 8))
+        divider_two = QFrame()
+        divider_two.setFrameShape(QFrame.VLine)
+        divider_two.setStyleSheet(f"color: {BORDER};")
+        ctrl_layout.addWidget(divider_two)
 
-        self.drive_scale_var = tk.DoubleVar(value=1.0)
-        self.mouse_sensitivity_var = tk.DoubleVar(value=self.args.mouse_sensitivity)
-        self.mouse_response_var = tk.DoubleVar(value=0.18)
+        tuning_layout = QVBoxLayout()
+        tuning_layout.setSpacing(5)
+        tuning_layout.addWidget(QLabel("输入调节", objectName="SectionTitle"))
         self.add_adjustment(
-            adjust_card,
-            "键盘最大输入",
-            self.drive_scale_var,
-            0.1,
-            1.0,
-            lambda value: self.pad.set_drive_scale(float(value)),
+            tuning_layout, "键盘最大输入", 0.1, 1.0, 1.0,
+            self.pad.set_drive_scale,
         )
         self.add_adjustment(
-            adjust_card,
-            "鼠标角度灵敏度",
-            self.mouse_sensitivity_var,
-            0.02,
-            0.50,
-            lambda value: self.pad.set_mouse_sensitivity(float(value)),
+            tuning_layout, "鼠标角度灵敏度", 0.02, 0.50,
+            self.args.mouse_sensitivity, self.pad.set_mouse_sensitivity,
         )
         self.add_adjustment(
-            adjust_card,
-            "鼠标转换时间",
-            self.mouse_response_var,
-            0.05,
-            0.60,
-            lambda value: self.pad.set_mouse_response_time(float(value)),
+            tuning_layout, "鼠标转换时间", 0.05, 0.60, 0.18,
+            self.pad.set_mouse_response_time,
         )
+        tuning_layout.addStretch()
+        ctrl_layout.addLayout(tuning_layout)
 
-        safety = tk.Frame(parent, bg=BG)
-        safety.pack(fill="x")
-        self.stop_button = tk.Button(
-            safety,
-            text="紧急停车",
-            bg=RED,
-            fg="white",
-            activebackground="#d94352",
-            activeforeground="white",
-            relief="flat",
-            font=("Microsoft YaHei UI", 12, "bold"),
-            command=self.emergency_stop,
-        )
-        self.stop_button.pack(side="left", fill="x", expand=True, padx=(0, 4), ipady=8)
-        self.arm_button = tk.Button(
-            safety,
-            text="解除急停",
-            bg=PANEL_ALT,
-            fg=TEXT,
-            activebackground=GREEN,
-            relief="flat",
-            font=("Microsoft YaHei UI", 11),
-            command=self.release_emergency_stop,
-        )
-        self.arm_button.pack(side="left", fill="x", expand=True, padx=(4, 0), ipady=8)
+        left_pane.addWidget(ctrl_card)
+        pane_layout.addLayout(left_pane, 6)
 
-        self.safety_label = tk.Label(
-            parent,
-            text="安全状态：等待连接",
-            bg=BG,
-            fg=MUTED,
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.safety_label.pack(anchor="w", pady=(5, 0))
+        right_pane = QVBoxLayout()
+        right_pane.setSpacing(10)
 
-    def add_adjustment(self, parent, label, variable, minimum, maximum, callback) -> None:
-        row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x", pady=3)
-        tk.Label(row, text=label, bg=PANEL, fg=MUTED, width=12, anchor="w").pack(side="left")
-        ttk.Scale(row, from_=minimum, to=maximum, variable=variable, command=callback).pack(
-            side="left", fill="x", expand=True
-        )
-        value_label = tk.Label(row, bg=PANEL, fg=TEXT, width=7, font=("Consolas", 9))
-        value_label.pack(side="right")
+        safe_card = QFrame(objectName="SafetyPanel")
+        safe_layout = QGridLayout(safe_card)
+        safe_layout.setContentsMargins(14, 12, 14, 12)
+        safe_layout.setHorizontalSpacing(10)
+        safe_layout.setVerticalSpacing(7)
 
-        def refresh(*_):
-            value_label.configure(text=f"{variable.get():.3f}")
+        safety_title = QLabel("安全与使能", objectName="SectionTitle")
+        safe_layout.addWidget(safety_title, 0, 0)
+        self.lbl_safety = QLabel("等待设备连接", objectName="StatusStrong")
+        self.lbl_safety.setStyleSheet(f"color: {MUTED}; font-weight: 700;")
+        self.lbl_safety.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        safe_layout.addWidget(self.lbl_safety, 0, 1)
 
-        variable.trace_add("write", refresh)
-        refresh()
+        safety_hint = QLabel("Esc 可立即急停；断链后 ESP32 将按固件策略超时停车。")
+        safety_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        safe_layout.addWidget(safety_hint, 1, 0, 1, 2)
 
-    def build_parameter_panel(self, parent) -> None:
-        toolbar = tk.Frame(parent, bg=PANEL, padx=8, pady=8)
-        toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Button(toolbar, text="从 ESP32 读取", command=lambda: self.enqueue_command("get")).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="应用全部改动", command=self.apply_all_parameters).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="保存到 ESP32", command=lambda: self.enqueue_command("save")).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="重新加载保存值", command=self.load_saved_parameters).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="恢复默认值", command=self.restore_defaults).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="一键导出", command=self.export_parameters).pack(side="left", padx=3)
+        safe_btns = QHBoxLayout()
+        btn_stop = QPushButton("紧急停车", objectName="Danger")
+        btn_stop.setFocusPolicy(Qt.NoFocus)
+        btn_stop.clicked.connect(self.emergency_stop)
+        btn_arm = QPushButton("解除急停 / 使能", objectName="Primary")
+        btn_arm.setFocusPolicy(Qt.NoFocus)
+        btn_arm.clicked.connect(self.release_emergency_stop)
+        safe_btns.addWidget(btn_stop)
+        safe_btns.addWidget(btn_arm)
+        safe_layout.addLayout(safe_btns, 2, 0, 1, 2)
+        right_pane.addWidget(safe_card)
 
-        self.parameter_status = tk.Label(
-            toolbar,
-            text="尚未读取参数",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.parameter_status.pack(side="right", padx=6)
+        param_card = QFrame(objectName="ParameterPanel")
+        p_layout = QVBoxLayout(param_card)
+        p_layout.setContentsMargins(10, 10, 10, 10)
+        p_layout.setSpacing(8)
 
-        self.notebook = ttk.Notebook(parent)
-        self.notebook.pack(fill="both", expand=True)
-        self.group_frames = {}
+        p_header = QHBoxLayout()
+        parameter_titles = QVBoxLayout()
+        parameter_titles.setSpacing(0)
+        parameter_titles.addWidget(QLabel("运行参数", objectName="SectionTitle"))
+        parameter_hint = QLabel("实时读取、修改并持久化 ESP32 控制参数")
+        parameter_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        parameter_titles.addWidget(parameter_hint)
+        p_header.addLayout(parameter_titles)
+        p_header.addStretch()
+        self.parameter_status = QLabel("尚未读取")
+        self.parameter_status.setStyleSheet(f"color: {MUTED}; font-weight: 700;")
+        p_header.addWidget(self.parameter_status)
+        p_layout.addLayout(p_header)
+
+        primary_tools = QHBoxLayout()
+        primary_tools.setSpacing(6)
+        btn_get = QPushButton("从设备读取", objectName="Primary")
+        btn_get.clicked.connect(lambda: self.enqueue_command("get"))
+        btn_apply_all = QPushButton("推送修改", objectName="Secondary")
+        btn_apply_all.clicked.connect(self.apply_all_parameters)
+        btn_save = QPushButton("写入 Flash", objectName="Secondary")
+        btn_save.clicked.connect(lambda: self.enqueue_command("save"))
+        for button in (btn_get, btn_apply_all, btn_save):
+            button.setFocusPolicy(Qt.NoFocus)
+            primary_tools.addWidget(button)
+        p_layout.addLayout(primary_tools)
+
+        secondary_tools = QHBoxLayout()
+        secondary_tools.setSpacing(6)
+        btn_load = QPushButton("加载保存值", objectName="Quiet")
+        btn_load.clicked.connect(self.load_saved_parameters)
+        btn_defaults = QPushButton("恢复默认", objectName="Quiet")
+        btn_defaults.clicked.connect(self.restore_defaults)
+        btn_export = QPushButton("导出参数", objectName="Quiet")
+        btn_export.clicked.connect(self.export_parameters)
+        for button in (btn_load, btn_defaults, btn_export):
+            button.setFocusPolicy(Qt.NoFocus)
+            secondary_tools.addWidget(button)
+        p_layout.addLayout(secondary_tools)
+
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setDocumentMode(True)
+        self.tab_widget.tabBar().setExpanding(True)
+        self.tab_widget.tabBar().setUsesScrollButtons(False)
+        self.tab_widget.tabBar().setElideMode(Qt.ElideRight)
+        self.tab_pages = {}
+        self.tab_empty_labels = {}
         for group in GROUP_ORDER:
-            frame = ScrollableFrame(self.notebook)
-            self.notebook.add(frame, text=group)
-            self.group_frames[group] = frame.content
+            scroll = QScrollArea(widgetResizable=True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            content = QWidget()
+            layout = QVBoxLayout(content)
+            layout.setContentsMargins(0, 0, 0, 8)
+            layout.setSpacing(0)
+            empty_label = QLabel("连接设备后点击“从设备读取”")
+            empty_label.setAlignment(Qt.AlignCenter)
+            empty_label.setStyleSheet(f"color: {MUTED}; padding: 40px;")
+            layout.addWidget(empty_label)
+            layout.addStretch()
+            scroll.setWidget(content)
+            self.tab_pages[group] = layout
+            self.tab_empty_labels[group] = empty_label
+            self.tab_widget.addTab(scroll, group)
+        p_layout.addWidget(self.tab_widget)
+        right_pane.addWidget(param_card, stretch=1)
 
-    def build_log_area(self) -> None:
-        container = tk.Frame(self.root, bg=PANEL, padx=8, pady=7)
-        container.pack(fill="x", padx=10, pady=(0, 10))
+        pane_layout.addLayout(right_pane, 4)
+        root_splitter.addWidget(workspace)
 
-        command_row = tk.Frame(container, bg=PANEL)
-        command_row.pack(fill="x")
-        tk.Label(command_row, text="手动命令", bg=PANEL, fg=MUTED).pack(side="left")
-        self.command_entry = ttk.Entry(command_row)
-        self.command_entry.pack(side="left", fill="x", expand=True, padx=7)
-        self.command_entry.bind("<Return>", self.submit_manual_command)
-        ttk.Button(command_row, text="发送", command=self.submit_manual_command).pack(side="left")
-        ttk.Button(command_row, text="清空日志", command=self.clear_log).pack(side="left", padx=(5, 0))
+        console_panel = QFrame(objectName="ConsolePanel")
+        console_layout = QVBoxLayout(console_panel)
+        console_layout.setContentsMargins(12, 9, 12, 12)
+        console_layout.setSpacing(7)
 
-        self.log = tk.Text(
-            container,
-            height=8,
-            bg="#080d13",
-            fg="#b9c8d8",
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Consolas", 9),
-            state="disabled",
+        console_header = QHBoxLayout()
+        console_header.setSpacing(8)
+        console_accent = QFrame(objectName="ConsoleAccent")
+        console_accent.setFixedSize(4, 22)
+        console_header.addWidget(console_accent)
+        console_header.addWidget(QLabel("通信终端", objectName="SectionTitle"))
+        console_header.addStretch()
+        btn_clear_log = QPushButton("清空日志", objectName="Quiet")
+        btn_clear_log.setFocusPolicy(Qt.NoFocus)
+        btn_clear_log.clicked.connect(self.clear_log)
+        console_header.addWidget(btn_clear_log)
+        console_layout.addLayout(console_header)
+
+        self.log = QTextEdit()
+        self.log.setObjectName("ConsoleLog")
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(74)
+        self.log.setPlaceholderText("BLE 扫描、设备响应和参数操作会显示在这里。")
+        console_layout.addWidget(self.log, stretch=1)
+
+        command_row = QHBoxLayout()
+        command_label = QLabel("命令")
+        command_label.setStyleSheet(f"color: {MUTED};")
+        command_row.addWidget(command_label)
+        self.command_entry = QLineEdit()
+        self.command_entry.setObjectName("ConsoleCommand")
+        self.command_entry.setPlaceholderText("例如：get、save、set REAL_TURRET_VEL 22.5")
+        self.command_entry.returnPressed.connect(self.submit_manual_command)
+        command_row.addWidget(self.command_entry, stretch=1)
+        btn_send = QPushButton("发送", objectName="Primary")
+        btn_send.setFocusPolicy(Qt.NoFocus)
+        btn_send.clicked.connect(self.submit_manual_command)
+        command_row.addWidget(btn_send)
+        console_layout.addLayout(command_row)
+
+        root_splitter.addWidget(console_panel)
+        root_splitter.setStretchFactor(0, 5)
+        root_splitter.setStretchFactor(1, 1)
+        root_splitter.setSizes([680, 145])
+        main_layout.addWidget(root_splitter, stretch=1)
+
+    @staticmethod
+    def key_style(active):
+        if active:
+            return (
+                f"background: {ACCENT}; border: 1px solid {ACCENT_HOVER};"
+                f" border-radius: 6px; padding: 4px; font-weight: 700;"
+                f" font-family: 'Cascadia Mono', 'Consolas'; color: white;"
+            )
+        return (
+            f"background: {SURFACE}; border: 1px solid {BORDER};"
+            f" border-radius: 6px; padding: 4px; font-weight: 700;"
+            f" font-family: 'Cascadia Mono', 'Consolas'; color: {MUTED};"
         )
-        self.log.pack(fill="x", pady=(6, 0))
 
-    def bind_inputs(self) -> None:
-        self.root.bind_all("<KeyPress>", self.on_key_press)
-        self.root.bind_all("<KeyRelease>", self.on_key_release)
-        self.root.bind_all("<Escape>", self.on_escape)
-        self.root.bind("<FocusOut>", self.on_window_focus_out)
+    def add_adjustment(self, parent_layout, label, minimum, maximum, value, callback):
+        row = QVBoxLayout()
+        row.setSpacing(1)
+        label_row = QHBoxLayout()
+        name_label = QLabel(label)
+        name_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        value_label = QLabel(f"{value:.3f}")
+        value_label.setObjectName("Mono")
+        value_label.setStyleSheet(f"color: {TEXT}; font-size: 10px;")
+        label_row.addWidget(name_label)
+        label_row.addStretch()
+        label_row.addWidget(value_label)
+        row.addLayout(label_row)
 
-    def start_ble_thread(self) -> None:
-        thread = threading.Thread(target=lambda: asyncio.run(self.ble_main()), daemon=True)
-        thread.start()
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 1000)
+        if maximum != minimum:
+            slider.setValue(round((value - minimum) / (maximum - minimum) * 1000))
 
-    def run(self) -> None:
-        self.start_ble_thread()
-        self.root.after(40, self.process_ui_events)
-        self.root.after(20, self.update_local_pad)
-        self.root.mainloop()
+        def on_change(position):
+            current = minimum + position / 1000.0 * (maximum - minimum)
+            value_label.setText(f"{current:.3f}")
+            callback(current)
 
-    def close(self) -> None:
-        self.emergency_stop()
-        self.root.after(120, self.finish_close)
+        slider.valueChanged.connect(on_change)
+        row.addWidget(slider)
+        parent_layout.addLayout(row)
 
-    def finish_close(self) -> None:
-        self.stop_event.set()
-        self.root.destroy()
+    def bind_inputs(self):
+        self.telemetry_view.capture_requested.connect(self.capture_mouse)
+        self.telemetry_view.mouse_position_changed.connect(self.on_mouse_motion)
+        QApplication.instance().installEventFilter(self)
 
-    def enqueue_command(self, command: str, show_in_log: bool = True) -> None:
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.ApplicationDeactivate:
+            self.pad.clear()
+            for label in self.key_labels.values():
+                label.setStyleSheet(self.key_style(False))
+            self.release_mouse()
+            return False
+
+        if event.type() not in (QEvent.KeyPress, QEvent.KeyRelease):
+            return super().eventFilter(watched, event)
+        if event.isAutoRepeat():
+            return True
+
+        if event.key() == Qt.Key_Escape and event.type() == QEvent.KeyPress:
+            self.emergency_stop()
+            return True
+
+        focus_w = QApplication.focusWidget()
+        if isinstance(focus_w, (QLineEdit, QTextEdit)):
+            return super().eventFilter(watched, event)
+
+        key_map = {Qt.Key_W: "w", Qt.Key_A: "a", Qt.Key_S: "s", Qt.Key_D: "d", Qt.Key_Space: "space"}
+        key = key_map.get(event.key())
+        if key:
+            if event.type() == QEvent.KeyPress:
+                is_new = self.pad.key_down(key)
+                self.key_labels[key].setStyleSheet(self.key_style(True))
+                if key == "space" and is_new:
+                    self.append_log("Space 已映射为手柄 A 键，等待设备遥测确认。\n", ACCENT)
+            else:
+                self.pad.key_up(key)
+                self.key_labels[key].setStyleSheet(self.key_style(False))
+            return True
+        return super().eventFilter(watched, event)
+
+    def capture_mouse(self):
+        if self.emergency_stopped:
+            self.append_log("急停已锁存，请先解除急停。\n", RED)
+            return
+        self.mouse_captured = True
+        self.telemetry_view.set_mouse_captured(True)
+        self.telemetry_view.setMouseTracking(True)
+        self.telemetry_view.setFocus(Qt.MouseFocusReason)
+        self.telemetry_view.grabMouse()
+
+    def release_mouse(self):
+        if self.mouse_captured:
+            self.telemetry_view.releaseMouse()
+            self.mouse_captured = False
+            self.telemetry_view.set_mouse_captured(False)
+            self.mouse_warp_pending = False
+
+    def on_mouse_motion(self, x, y):
+        if not self.mouse_captured: return
+        cx, cy = self.telemetry_view.width() // 2, self.telemetry_view.height() // 2
+        dx, dy = x - cx, y - cy
+
+        if self.mouse_warp_pending:
+            if abs(dx) <= 2 and abs(dy) <= 2:
+                self.mouse_warp_pending = False
+                return
+
+        if dx or dy:
+            self.pad.add_mouse_delta(dx, dy)
+            self.mouse_warp_pending = True
+            QCursor.setPos(self.telemetry_view.mapToGlobal(QPoint(cx, cy)))
+
+    def emergency_stop(self):
+        self.pad.clear()
+        self.release_mouse()
+        for label in self.key_labels.values():
+            label.setStyleSheet(self.key_style(False))
+
+        self.emergency_stopped = True
+        self.lbl_safety.setText("急停已锁存")
+        self.lbl_safety.setStyleSheet(f"color: {RED}; font-weight: bold; font-size: 13px;")
+        self.enqueue_command("stop")
+
+    def release_emergency_stop(self):
+        self.pad.clear()
+        self.emergency_stopped = False
+        self.lbl_safety.setText("系统已使能")
+        self.lbl_safety.setStyleSheet(f"color: {GREEN}; font-weight: bold; font-size: 13px;")
+        self.enqueue_command("arm")
+
+    def enqueue_command(self, command, show_in_log=True):
         command = command.strip()
         if not command:
             return
@@ -1215,31 +1432,26 @@ class DebugGui:
         if show_in_log:
             self.append_log(f"> {command}\n", ACCENT)
 
-    def submit_manual_command(self, event=None) -> None:
-        command = self.command_entry.get()
-        self.command_entry.delete(0, "end")
+    def submit_manual_command(self):
+        command = self.command_entry.text()
+        self.command_entry.clear()
         self.enqueue_command(command)
 
-    def append_log(self, text: str, color: str = TEXT) -> None:
-        self.log.configure(state="normal")
-        tag = f"color_{color}"
-        if tag not in self.log.tag_names():
-            self.log.tag_configure(tag, foreground=color)
-        self.log.insert("end", text, tag)
-        self.log.see("end")
-        self.log.configure(state="disabled")
+    def append_log(self, text, color=TEXT):
+        escaped = html.escape(text).replace("\n", "<br>")
+        self.log.moveCursor(QTextCursor.End)
+        self.log.insertHtml(
+            f'<span style="color:{color}; font-family:Consolas;">{escaped}</span>'
+        )
+        self.log.moveCursor(QTextCursor.End)
 
-    def clear_log(self) -> None:
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+    def clear_log(self):
+        self.log.clear()
 
-    def process_ui_events(self) -> None:
+    def process_ui_events(self):
         while True:
-            try:
-                event_type, payload = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
+            try: event_type, payload = self.ui_queue.get_nowait()
+            except queue.Empty: break
 
             if event_type == "status":
                 self.set_connection_status(str(payload))
@@ -1248,178 +1460,170 @@ class DebugGui:
             elif event_type == "log":
                 self.append_log(str(payload), MUTED)
 
-        telemetry_stale = (
-            self.last_telemetry_at == 0.0
-            or time.monotonic() - self.last_telemetry_at > 0.5
-        )
-        self.tank_view.set_telemetry_stale(telemetry_stale)
+        telemetry_stale = (self.last_telemetry_at == 0.0 or time.monotonic() - self.last_telemetry_at > 0.5)
+        self.telemetry_view.set_telemetry_stale(telemetry_stale)
 
-        if not self.stop_event.is_set():
-            self.root.after(40, self.process_ui_events)
+    def set_connection_status(self, status):
+        labels = {
+            "扫描中": "正在扫描",
+            "已连接": "设备在线",
+            "连接断开": "连接断开",
+            "连接失败": "连接失败",
+        }
+        color = GREEN if status == "已连接" else YELLOW if status == "扫描中" else RED
+        self.lbl_status.setText(labels.get(status, status))
+        self.lbl_status.setStyleSheet(f"color: {color}; font-weight: 700;")
+        self.connection_dot.setStyleSheet(f"color: {color}; font-size: 12px;")
 
-    def update_local_pad(self) -> None:
-        pad_command, values = self.pad.snapshot()
-        with self.pad_command_lock:
-            self.latest_pad_command = pad_command
-        self.update_control_visuals(values)
-
-        if not self.stop_event.is_set():
-            self.root.after(20, self.update_local_pad)
-
-    def get_latest_pad_command(self) -> str:
-        with self.pad_command_lock:
-            return self.latest_pad_command
-
-    def set_connection_status(self, status: str) -> None:
-        self.connection_label.configure(text=status)
         if status == "已连接":
             self.connected = True
-            self.connection_dot.configure(fg=GREEN)
-            self.safety_label.configure(text="安全状态：输入链路正常", fg=GREEN)
-        elif status == "扫描中":
-            self.connected = False
-            self.last_telemetry_at = 0.0
-            self.rx_buffer = ""
-            self.connection_dot.configure(fg=YELLOW)
-        else:
-            self.connected = False
-            self.last_telemetry_at = 0.0
-            self.rx_buffer = ""
-            self.connection_dot.configure(fg=RED)
-            self.safety_label.configure(text="安全状态：连接断开，ESP32 将超时停车", fg=RED)
+            if not self.emergency_stopped:
+                self.lbl_safety.setText("输入链路正常")
+                self.lbl_safety.setStyleSheet(f"color: {GREEN}; font-weight: 700;")
+            return
 
-    def consume_rx_text(self, text: str) -> None:
+        self.connected = False
+        self.last_telemetry_at = 0.0
+        self.rx_buffer = ""
+        if not self.emergency_stopped:
+            if status == "扫描中":
+                self.lbl_safety.setText("等待设备连接")
+                self.lbl_safety.setStyleSheet(f"color: {YELLOW}; font-weight: 700;")
+            else:
+                self.lbl_safety.setText("链路中断")
+                self.lbl_safety.setStyleSheet(f"color: {RED}; font-weight: 700;")
+
+    def update_local_pad(self):
+        pad_command, values = self.pad.snapshot()
+        with self.pad_command_lock: self.latest_pad_command = pad_command
+        self.gamepad_view.update_state(values)
+
+    def get_latest_pad_command(self) -> str:
+        with self.pad_command_lock: return self.latest_pad_command
+
+    def consume_rx_text(self, text):
         self.rx_buffer += text
         while "\n" in self.rx_buffer:
             line, self.rx_buffer = self.rx_buffer.split("\n", 1)
             self.process_rx_line(line.strip())
 
-    def process_rx_line(self, line: str) -> None:
+    def process_rx_line(self, line):
         if not line:
             return
         if line == "PARAMS":
-            self.parameter_status.configure(text="正在读取参数...", fg=YELLOW)
+            self.parameter_status.setText("正在读取...")
+            self.parameter_status.setStyleSheet(f"color: {YELLOW}; font-weight: 700;")
             return
         if line == "END_PARAMS":
-            self.parameter_status.configure(text=f"已读取 {len(self.parameter_rows)} 个参数", fg=GREEN)
-            self.append_log("参数列表读取完成\n", GREEN)
+            self.parameter_status.setText(f"已读取 {len(self.parameter_rows)} 项")
+            self.parameter_status.setStyleSheet(f"color: {GREEN}; font-weight: 700;")
+            self.append_log("参数列表读取完成。\n", GREEN)
             return
         if line.startswith("STATE ESTOP="):
             self.emergency_stopped = line.endswith("1")
             if self.emergency_stopped:
-                self.safety_label.configure(text="安全状态：急停已锁存", fg=RED)
+                self.lbl_safety.setText("急停已锁存")
+                self.lbl_safety.setStyleSheet(f"color: {RED}; font-weight: 700;")
             else:
-                self.safety_label.configure(text="安全状态：输入链路正常", fg=GREEN)
+                self.lbl_safety.setText("输入链路正常")
+                self.lbl_safety.setStyleSheet(f"color: {GREEN}; font-weight: 700;")
             return
         if line.startswith("TEL "):
-            telemetry = {}
-            for token in line.split()[1:]:
-                if "=" not in token:
-                    continue
-                key, value = token.split("=", 1)
-                try:
-                    telemetry[key] = float(value)
-                except ValueError:
-                    return
-
-            required = {"cy", "cp", "ty", "tr", "gp", "yt", "pt", "yv", "sv", "st", "ih", "yh"}
-            if not required.issubset(telemetry):
-                return
-
-            self.last_telemetry_at = time.monotonic()
-            self.tank_view.update_telemetry(
-                {
-                    "chassis_yaw_deg": telemetry["cy"],
-                    "chassis_pitch_deg": telemetry["cp"],
-                    "turret_yaw_deg": telemetry["ty"],
-                    "turret_relative_yaw_deg": telemetry["tr"],
-                    "gun_pitch_deg": telemetry["gp"],
-                    "target_yaw_deg": telemetry["yt"],
-                    "target_pitch_deg": telemetry["pt"],
-                    "yaw_voltage": telemetry["yv"],
-                    "servo_command_deg": telemetry["sv"],
-                    "stabilizer_enabled": telemetry["st"],
-                    "imu_healthy": telemetry["ih"],
-                    "yaw_sensor_healthy": telemetry["yh"],
-                }
-            )
+            self.parse_telemetry(line)
             return
 
         match = PARAM_PATTERN.match(line)
         if match:
-            name = match.group(1)
-            self.update_parameter(
-                name,
-                float(match.group(2)),
-                float(match.group(3)),
-                float(match.group(4)),
-            )
+            self.update_parameter_row(match.group(1), float(match.group(2)), float(match.group(3)), float(match.group(4)))
             return
 
         set_match = SET_PATTERN.match(line)
         if set_match:
-            name = set_match.group(1)
-            value = float(set_match.group(2))
-            if name in self.parameter_rows:
-                self.parameter_rows[name].set_value(value)
-            if name == "REAL_TURRET_VEL":
-                self.pad.set_turret_rate(value)
+            name, val = set_match.group(1), float(set_match.group(2))
+            if name in self.parameter_rows: self.parameter_rows[name].set_value(val)
+            if name == "REAL_TURRET_VEL": self.pad.set_turret_rate(val)
 
         if "emergency_stop_latched" in line:
             self.emergency_stopped = True
-            self.safety_label.configure(text="安全状态：急停已锁存", fg=RED)
+            self.lbl_safety.setText("急停已锁存")
+            self.lbl_safety.setStyleSheet(f"color: {RED}; font-weight: 700;")
         elif "emergency_stop_released" in line:
             self.emergency_stopped = False
-            self.safety_label.configure(text="安全状态：急停已解除", fg=GREEN)
+            self.lbl_safety.setText("系统已使能")
+            self.lbl_safety.setStyleSheet(f"color: {GREEN}; font-weight: 700;")
 
         color = RED if line.startswith("ERR") else GREEN if line.startswith("OK") else MUTED
         self.append_log(line + "\n", color)
 
-    def update_parameter(self, name: str, value: float, minimum: float, maximum: float) -> None:
+    def parse_telemetry(self, line):
+        telemetry = {}
+        for token in line.split()[1:]:
+            if "=" not in token: continue
+            k, v = token.split("=", 1)
+            try: telemetry[k] = float(v)
+            except ValueError: return
+
+        required = {"cy", "cp", "ty", "tr", "gp", "yt", "pt", "yv", "sv", "st", "ih", "yh"}
+        if not required.issubset(telemetry): return
+        self.last_telemetry_at = time.monotonic()
+
+        data = {
+            "chassis_yaw_deg": telemetry["cy"], "chassis_pitch_deg": telemetry["cp"],
+            "turret_yaw_deg": telemetry["ty"], "turret_relative_yaw_deg": telemetry["tr"],
+            "gun_pitch_deg": telemetry["gp"], "target_yaw_deg": telemetry["yt"], "target_pitch_deg": telemetry["pt"],
+            "yaw_voltage": telemetry["yv"], "servo_command_deg": telemetry["sv"],
+            "stabilizer_enabled": telemetry["st"], "imu_healthy": telemetry["ih"], "yaw_sensor_healthy": telemetry["yh"],
+        }
+        self.telemetry_view.update_telemetry(data)
+        self.update_telemetry_ui(data)
+
+    def update_telemetry_ui(self, data):
+        self.telemetry_labels["CHASSIS_Y"].setText(f"{data['chassis_yaw_deg']:+.2f}°")
+        self.telemetry_labels["CHASSIS_P"].setText(f"{data['chassis_pitch_deg']:+.2f}°")
+        self.telemetry_labels["TURRET_ABS"].setText(f"{data['turret_yaw_deg']:+.2f}°")
+        self.telemetry_labels["GUN_P"].setText(f"{data['gun_pitch_deg']:+.2f}°")
+        self.telemetry_labels["TARGET_Y"].setText(f"{data['target_yaw_deg']:+.2f}°")
+        self.telemetry_labels["TARGET_P"].setText(f"{data['target_pitch_deg']:+.2f}°")
+
+    def update_parameter_row(self, name, value, lo, hi):
         if name in self.parameter_rows:
             self.parameter_rows[name].set_value(value)
-            if name == "REAL_TURRET_VEL":
-                self.pad.set_turret_rate(value)
+            if name == "REAL_TURRET_VEL": self.pad.set_turret_rate(value)
             return
 
-        group, label, description = PARAM_META.get(name, ("其他", name, "ESP32 运行时可调参数"))
-        row = ParameterRow(
-            self.group_frames[group],
-            name,
-            value,
-            minimum,
-            maximum,
-            label,
-            description,
-            self.send_parameter,
-        )
+        group, label, desc = PARAM_META.get(name, ("其他", name, "ESP32 运行时可调参数"))
+        row = QParameterRow(name, value, lo, hi, label, desc, self.send_parameter)
         self.parameter_rows[name] = row
-        if name == "REAL_TURRET_VEL":
-            self.pad.set_turret_rate(value)
+        self.tab_empty_labels[group].hide()
+        self.tab_pages[group].insertWidget(self.tab_pages[group].count() - 1, row)
+        if name == "REAL_TURRET_VEL": self.pad.set_turret_rate(value)
 
-    def send_parameter(self, name: str, value: float) -> None:
-        self.enqueue_command(f"set {name} {value:.6f}")
+    def send_parameter(self, name, val):
+        self.parameter_status.setText("正在更新...")
+        self.parameter_status.setStyleSheet(f"color: {YELLOW}; font-weight: 700;")
+        self.enqueue_command(f"set {name} {val:.6f}")
 
-    def apply_all_parameters(self) -> None:
-        dirty_rows = [row for row in self.parameter_rows.values() if row.dirty]
-        if not dirty_rows:
-            self.append_log("没有待应用的参数改动\n", MUTED)
+    def apply_all_parameters(self):
+        dirty = [row for row in self.parameter_rows.values() if row.dirty]
+        if not dirty:
+            self.append_log("没有待推送的参数改动。\n", MUTED)
             return
-        for row in dirty_rows:
+        for row in dirty:
             row.apply()
-        self.parameter_status.configure(text=f"已发送 {len(dirty_rows)} 项修改", fg=YELLOW)
+        self.parameter_status.setText(f"已推送 {len(dirty)} 项")
+        self.parameter_status.setStyleSheet(f"color: {YELLOW}; font-weight: 700;")
 
-    def load_saved_parameters(self) -> None:
+    def load_saved_parameters(self):
         self.enqueue_command("load")
         self.enqueue_command("get", show_in_log=False)
 
-    def restore_defaults(self) -> None:
+    def restore_defaults(self):
         self.enqueue_command("defaults")
         self.enqueue_command("get", show_in_log=False)
 
-    def export_parameters(self) -> None:
+    def export_parameters(self):
         if not self.parameter_rows:
-            self.append_log("当前没有可导出的参数，请先连接 ESP32 并读取参数\n", YELLOW)
+            self.append_log("当前没有可导出的参数，请先读取设备参数。\n", YELLOW)
             return
 
         exported_at = datetime.now().astimezone()
@@ -1433,8 +1637,7 @@ class DebugGui:
         for name in sorted(self.parameter_rows):
             row = self.parameter_rows[name]
             group, label, description = PARAM_META.get(
-                name,
-                ("其他", name, "ESP32 运行时可调参数"),
+                name, ("其他", name, "ESP32 运行时可调参数")
             )
             parameters[name] = {
                 "value": row.get_value(),
@@ -1452,7 +1655,7 @@ class DebugGui:
             "ble_device": self.args.name,
             "esp32_connected": self.connected,
             "parameter_count": len(parameters),
-            "note": "pending_unsent_edit=true 表示该界面值尚未点击应用发送给 ESP32",
+            "note": "pending_unsent_edit=true 表示该界面值尚未发送给 ESP32",
             "parameters": parameters,
         }
         json_path.write_text(
@@ -1467,10 +1670,10 @@ class DebugGui:
             f"导出时已连接: {'是' if self.connected else '否'}",
             f"参数数量: {len(parameters)}",
             "",
-            "下面的命令可在 PC 调试控制台中逐行发送：",
+            "下面的命令可在调试控制台中逐行发送：",
         ]
         for name, item in parameters.items():
-            dirty_mark = "  # 注意：界面中尚未应用" if item["pending_unsent_edit"] else ""
+            dirty_mark = "  # 注意：界面中尚未推送" if item["pending_unsent_edit"] else ""
             text_lines.append(f"set {name} {item['value']:.6f}{dirty_mark}")
 
         text_lines.extend(["", "参数清单："])
@@ -1485,119 +1688,12 @@ class DebugGui:
         dirty_count = sum(
             1 for item in parameters.values() if item["pending_unsent_edit"]
         )
-        self.parameter_status.configure(
-            text=f"已导出 {len(parameters)} 个参数",
-            fg=GREEN,
-        )
+        self.parameter_status.setText(f"已导出 {len(parameters)} 项")
+        self.parameter_status.setStyleSheet(f"color: {GREEN}; font-weight: 700;")
         self.append_log(f"参数已导出：{json_path}\n", GREEN)
         self.append_log(f"命令清单：{text_path}\n", GREEN)
         if dirty_count:
-            self.append_log(
-                f"注意：导出内容中有 {dirty_count} 项尚未点击应用\n",
-                YELLOW,
-            )
-
-    def emergency_stop(self) -> None:
-        self.pad.clear()
-        self.release_mouse()
-        self.emergency_stopped = True
-        self.safety_label.configure(text="安全状态：正在请求急停", fg=RED)
-        self.enqueue_command("stop")
-
-    def release_emergency_stop(self) -> None:
-        self.pad.clear()
-        self.enqueue_command("arm")
-
-    def normalize_key(self, event) -> str:
-        if event.keysym == "space":
-            return "space"
-        return event.keysym.lower()
-
-    def on_key_press(self, event) -> None:
-        if is_text_input(event.widget):
-            return
-        key = self.normalize_key(event)
-        if key not in {"w", "a", "s", "d", "space"}:
-            return
-        is_new = self.pad.key_down(key)
-        self.set_key_indicator(key, True)
-        if key == "space" and is_new:
-            self.append_log("已映射手柄 A 键；双稳结果等待 ESP32 遥测确认\n", ACCENT)
-
-    def on_key_release(self, event) -> None:
-        key = self.normalize_key(event)
-        if key in {"w", "a", "s", "d", "space"}:
-            self.pad.key_up(key)
-            self.set_key_indicator(key, False)
-
-    def set_key_indicator(self, key: str, active: bool) -> None:
-        label = self.key_labels.get(key)
-        if label:
-            label.configure(bg=ACCENT if active else PANEL_ALT, fg="white" if active else MUTED)
-
-    def clear_key_indicators(self) -> None:
-        for key in ["w", "a", "s", "d", "space"]:
-            self.set_key_indicator(key, False)
-
-    def on_escape(self, event=None) -> None:
-        self.emergency_stop()
-
-    def on_window_focus_out(self, event) -> None:
-        self.root.after(20, self.clear_if_window_inactive)
-
-    def clear_if_window_inactive(self) -> None:
-        if self.root.focus_displayof() is None:
-            self.pad.clear()
-            self.clear_key_indicators()
-            self.release_mouse()
-
-    def capture_mouse(self, event=None) -> None:
-        if self.emergency_stopped:
-            self.append_log("急停锁存中，请先解除急停\n", RED)
-            return
-        self.mouse_captured = True
-        self.tank_view.set_mouse_captured(True)
-        self.tank_view.grab_set()
-        self.tank_view.focus_set()
-        self.root.after_idle(self.warp_mouse_to_center)
-
-    def release_mouse(self) -> None:
-        if self.mouse_captured:
-            try:
-                self.tank_view.grab_release()
-            except tk.TclError:
-                pass
-        self.mouse_captured = False
-        self.tank_view.set_mouse_captured(False)
-
-    def warp_mouse_to_center(self) -> None:
-        if not self.mouse_captured:
-            return
-        width = max(self.tank_view.winfo_width(), 10)
-        height = max(self.tank_view.winfo_height(), 10)
-        self.mouse_warp_pending = True
-        self.tank_view.event_generate("<Motion>", warp=True, x=width // 2, y=height // 2)
-
-    def on_mouse_motion(self, event) -> None:
-        if not self.mouse_captured:
-            return
-        width = max(self.tank_view.winfo_width(), 10)
-        height = max(self.tank_view.winfo_height(), 10)
-        center_x = width / 2
-        center_y = height / 2
-
-        if self.mouse_warp_pending and abs(event.x - center_x) <= 2 and abs(event.y - center_y) <= 2:
-            self.mouse_warp_pending = False
-            return
-
-        dx = event.x - center_x
-        dy = event.y - center_y
-        if dx or dy:
-            self.pad.add_mouse_delta(dx, dy)
-        self.root.after_idle(self.warp_mouse_to_center)
-
-    def update_control_visuals(self, values: dict[str, float]) -> None:
-        self.gamepad_view.update_state(values)
+            self.append_log(f"其中 {dirty_count} 项尚未推送到设备。\n", YELLOW)
 
     async def find_device(self):
         self.ui_queue.put(("status", "扫描中"))
@@ -1605,62 +1701,73 @@ class DebugGui:
 
         def match(device, advertisement_data):
             names = {device.name, advertisement_data.local_name}
-            service_uuids = {uuid.lower() for uuid in advertisement_data.service_uuids}
-            return self.args.name in names or SERVICE_UUID.lower() in service_uuids
+            service_uuids = {
+                uuid.lower() for uuid in (advertisement_data.service_uuids or [])
+            }
+            return (
+                self.args.name in names
+                or SERVICE_UUID.lower() in service_uuids
+            )
 
         device = await BleakScanner.find_device_by_filter(match, timeout=12.0)
         if device is None:
             raise RuntimeError("未找到 Chieftain MK10 调试 BLE 设备")
         return device
 
-    async def ble_main(self) -> None:
+    async def ble_main(self):
         while not self.stop_event.is_set():
             try:
                 device = await self.find_device()
                 self.ui_queue.put(("log", f"正在连接：{device.name} {device.address}\n"))
                 async with BleakClient(device) as client:
                     self.ui_queue.put(("status", "已连接"))
-                    self.ui_queue.put(("log", "BLE 已连接，开始以 50Hz 发送控制输入\n"))
+                    self.ui_queue.put(("log", "BLE 已连接，开始以 50Hz 发送控制输入。\n"))
 
-                    def on_notify(_, data: bytearray):
+                    def on_notify(_, data):
                         self.ui_queue.put(("rx", data.decode(errors="replace")))
 
                     await client.start_notify(TX_UUID, on_notify)
                     await client.write_gatt_char(RX_UUID, b"get\n", response=False)
 
                     while not self.stop_event.is_set() and client.is_connected:
-                        pad_command = self.get_latest_pad_command()
-                        await client.write_gatt_char(RX_UUID, pad_command.encode(), response=False)
-
+                        await client.write_gatt_char(RX_UUID, self.get_latest_pad_command().encode(), response=False)
                         while True:
-                            try:
-                                command = self.command_queue.get_nowait()
-                            except queue.Empty:
-                                break
-                            await client.write_gatt_char(RX_UUID, command.encode(), response=False)
+                            try: cmd = self.command_queue.get_nowait()
+                            except queue.Empty: break
+                            await client.write_gatt_char(RX_UUID, cmd.encode(), response=False)
                         await asyncio.sleep(0.02)
-
                 self.ui_queue.put(("status", "连接断开"))
             except Exception as exc:
                 self.ui_queue.put(("status", "连接失败"))
                 self.ui_queue.put(("log", f"BLE 错误：{exc}\n2 秒后重试...\n"))
                 await asyncio.sleep(2.0)
 
+    def closeEvent(self, event):
+        if self._closing:
+            event.accept()
+            return
+        self._closing = True
+        event.ignore()
+        self.emergency_stop()
+        QTimer.singleShot(150, self.finish_close)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Chieftain MK10 PC BLE debug controller")
-    parser.add_argument("--name", default="ChieftainMK10-Debug", help="ESP32 BLE device name")
-    parser.add_argument(
-        "--mouse-sensitivity",
-        type=float,
-        default=0.12,
-        help="virtual angular displacement generated per mouse pixel",
-    )
+    def finish_close(self):
+        self.stop_event.set()
+        self.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", default="ChieftainMK10-Debug")
+    parser.add_argument("--mouse-sensitivity", type=float, default=0.12)
     args = parser.parse_args()
 
-    gui = DebugGui(args)
-    gui.run()
-
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    gui = QConsoleMainWindow(args)
+    gui.showNormal()
+    threading.Thread(target=lambda: asyncio.run(gui.ble_main()), daemon=True).start()
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()

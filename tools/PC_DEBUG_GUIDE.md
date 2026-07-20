@@ -3,8 +3,11 @@
 ## 安装
 
 ```powershell
-py -m pip install -r tools\requirements-pc-debug.txt
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m pip install -r tools\requirements-pc-debug.txt
 ```
+
+界面使用 PySide6。依赖文件会同时安装 `PySide6` 和 `bleak`。
+启动脚本会检查这两个依赖；若尚未安装，会显示与上面等价的安装命令。
 
 ## 启动
 
@@ -17,7 +20,7 @@ tools\run_pc_debug.bat
 或在项目目录运行：
 
 ```powershell
-py tools\pc_debug_controller.py
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" tools\pc_debug_controller.py
 ```
 
 ESP32 固件中的 `Config::PC_DEBUG_MODE` 当前为 `true`，此时 Xbox 手柄不会启动。
@@ -32,7 +35,7 @@ ESP32 固件中的 `Config::PC_DEBUG_MODE` 当前为 `true`，此时 Xbox 手柄
 - `Space`：转换为手柄 A 键，由 ESP32 切换双轴稳定器
 - `Esc`：急停并释放鼠标
 
-点击左侧第三人称 3D 视窗后进入鼠标捕获状态。PC 只负责把鼠标位移暂存为待执行角位移，再按“鼠标转换时间”生成一段虚拟右摇杆输入。PC 不运行炮塔 PID、不维护双稳目标，也不预测车辆姿态。
+点击左侧遥测曲线区后进入鼠标捕获状态。PC 只负责把鼠标位移暂存为待执行角位移，再按“鼠标转换时间”生成一段虚拟右摇杆输入。PC 不运行炮塔 PID、不维护双稳目标，也不预测车辆姿态。
 
 虚拟手柄面板显示实际发给 ESP32 的数据：
 
@@ -44,25 +47,24 @@ ESP32 固件中的 `Config::PC_DEBUG_MODE` 当前为 `true`，此时 Xbox 手柄
 
 虚拟手柄可视化与 BLE 连接相互独立。即使界面仍处于“扫描中”，也可以先检查键鼠映射；连接成功后，PC 会以 50Hz 发送面板所显示的最新手柄数据。
 
-3D 视窗中：
+遥测曲线区使用 ESP32 以 10Hz 回传的真实数据，显示最近约 30 秒的滚动趋势：
 
-- 坦克模型只使用 ESP32 以 10Hz 回传的真实遥测
-- 车体 yaw 由炮塔世界 yaw 和 AS5600 相对角组合得到
-- 车体 pitch、炮塔世界/相对 yaw、炮管 pitch 均来自传感器状态
-- 蓝色虚线表示 ESP32 当前双稳目标，实体炮管表示测得的实际姿态
-- 同时显示 yaw 电压、舵机命令、双稳开关和传感器健康状态
-- 超过 0.5 秒未收到新数据时冻结模型，并显示“遥测过期”
+- `Yaw 角度`：车体 yaw、炮塔世界 yaw、双稳目标 yaw
+- `Pitch 角度`：车体 pitch、炮管 pitch、双稳目标 pitch
+- `Yaw 电压输出`：炮塔 yaw 电机当前电压命令
+- `舵机命令`：炮管舵机当前角度命令
+- 超过 0.5 秒未收到新数据时冻结曲线，并显示“遥测离线”
 
 ## 参数
 
 连接后窗口会自动读取 ESP32 参数，并按炮塔、炮管、虚拟惯量、底盘和履带速度环分组。
 
 - `应用`：发送单项参数
-- `应用全部改动`：发送所有黄色标记的参数
-- `保存到 ESP32`：写入 NVS，断电保留
-- `重新加载保存值`：从 NVS 恢复
-- `恢复默认值`：恢复代码默认值，但不会自动写入 NVS
-- `一键导出`：将当前面板参数导出到 `tools\parameter_exports`，同时生成 JSON 存档和 TXT 命令清单
+- `推送修改`：发送所有黄色标记的参数
+- `写入 Flash`：写入 NVS，断电保留
+- `加载保存值`：从 NVS 恢复
+- `恢复默认`：恢复代码默认值，但不会自动写入 NVS
+- `导出参数`：将当前面板参数导出到 `tools\parameter_exports`，同时生成 JSON 存档和 TXT 命令清单
 
 导出文件使用时间戳命名。JSON 包含参数值、范围、中文说明以及是否存在尚未点击“应用”的修改；TXT 中的 `set PARAM VALUE` 命令可以在调试控制台中逐行发送，用于恢复本次配置。建议测试定型后先“从 ESP32 读取”确认，再执行导出。
 
