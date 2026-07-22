@@ -354,7 +354,8 @@ PARAM_META = {
     "YAW_SENSITIVITY": ("底盘动力学", "底盘转向灵敏度", "低速时最大差速目标"),
     "SPEED_SENS_K": ("底盘动力学", "随速转向衰减", "越大高速时转向越不敏感"),
 
-    "TRACK_FF_KS": ("履带速度环", "静摩擦前馈 Ks", "履带开始运动时克服静摩擦的 PWM"),
+    "TRACK_FF_KS_START": ("履带速度环", "起步静摩擦前馈", "履带从静止起转时克服静摩擦的 PWM"),
+    "TRACK_FF_KS_RUN": ("履带速度环", "保持静摩擦前馈", "履带已经转起来后用于维持运动的 PWM"),
     "TRACK_FF_KV": ("履带速度环", "速度前馈 Kv", "目标速度对应的 PWM 前馈"),
     "TRACK_FF_KA": ("履带速度环", "加速度前馈 Ka", "目标加速度对应的 PWM 前馈"),
     "TRACK_FF_KSLOPE": ("履带速度环", "坡度前馈", "坡道保持所需的 PWM 前馈"),
@@ -374,6 +375,7 @@ class PadState:
     mouse_sensitivity: float = 0.12
     mouse_response_time: float = 0.18
     drive_scale: float = 1.0
+    turn_key_scale: float = 0.3
     turret_rate_deg_s: float = 22.5
     keys: set[str] = field(default_factory=set)
     pending_yaw_deg: float = 0.0
@@ -439,11 +441,12 @@ class PadState:
             self.last_update = now
             keys = set(self.keys)
             drive_scale = self.drive_scale
+            turn_key_scale = self.turn_key_scale
 
             throttle = drive_scale if "w" in keys else 0.0
             brake = drive_scale if "s" in keys else 0.0
-            left = -drive_scale if "a" in keys else 0.0
-            right = drive_scale if "d" in keys else 0.0
+            left = -turn_key_scale if "a" in keys else 0.0
+            right = turn_key_scale if "d" in keys else 0.0
             joy_lx = clamp(left + right, -1.0, 1.0)
             stabilizer_button = 1 if "space" in keys else 0
 

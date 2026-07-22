@@ -51,6 +51,7 @@ namespace Config {
     const float VBAT_LPF = 0.1f;                    // 电压低通滤波系数
     const float VBAT_WARN = 10.8f;                  // 3S 低压预警阈值
     const float VBAT_CUTOFF = 10.2f;                // 3S 低压切断阈值
+    const bool ENABLE_BATTERY_MONITOR = false;      // false: 使用外置低压报警器，禁用 VN 采样与软件低压切断
 
     // [底盘动力引脚]
     const uint8_t R_IN1 = 25, R_IN2 = 33, R_PWM = 32; // 右侧直流驱动
@@ -60,7 +61,9 @@ namespace Config {
     const uint8_t PWM_RES = 8;                        // 8位分辨率 (0-255)
     const float MOTOR_PWM_DEADZONE = 1.0f;            // 输出小于该值时完全断开电机
     const float TRACK_STOP_DEADZONE_KMH = 0.5f;       // 履带速度死区
-    const float TRACK_FF_KS = 32.0f;                  // 静摩擦前馈 PWM
+    const float TRACK_FF_KS_START = 55.0f;            // 起步静摩擦前馈 PWM，用于破除履带静摩擦
+    const float TRACK_FF_KS_RUN = 32.0f;              // 运行保持静摩擦前馈 PWM，转起来后避免持续猛冲
+    const float TRACK_START_RELEASE_KMH = 1.0f;       // 实测速度超过该值后从起步前馈切到保持前馈
     const float TRACK_FF_KV = 4.4f;                   // 速度前馈 PWM/(km/h)
     const float TRACK_FF_KA = 2.2f;                   // 加速度前馈 PWM/(km/h/s)
     const float TRACK_FF_KSLOPE = 18.0f;              // 坡度保持前馈 PWM
@@ -109,6 +112,11 @@ namespace Config {
     // [横向动力学与随速感应]
     const float YAW_SENSITIVITY = 25.0f;   // 最大差速分量
     const float SPEED_SENS_K = 0.08f;      // 随速衰减系数 (越高，高速时方向盘越“重”)
+    const float TURN_ACCEL_PIVOT = 3.0f;   // 原地转向差速建立速度 (km/h/s)，像另一组油门慢慢建立
+    const float TURN_BRAKE_PIVOT = 8.0f;   // 原地转向摩擦/反向刹车回正速度 (km/h/s)
+    const float TURN_ACCEL_MOVING = 7.0f;  // 行进中转向差速建立速度 (km/h/s)
+    const float TURN_BRAKE_MOVING = 12.0f; // 行进中转向松杆回正速度 (km/h/s)
+    const float TURN_MOVING_BLEND_KMH = 8.0f; // 从原地转向仿真过渡到行进双流分配的速度尺度
     const float YAW_INERTIA_ALPHA_TAU = 0.04f;          // yaw 角加速度低通时间常数
     const float YAW_INERTIA_ALPHA_DEADZONE_DPS2 = 25.0f;// yaw 角加速度死区
     const float YAW_INERTIA_ALPHA_MAX_DPS2 = 500.0f;    // yaw 角加速度限幅
@@ -171,7 +179,8 @@ namespace Tune {
     float linearJerkAccel = Config::LINEAR_JERK_ACCEL;
     float linearJerkBrake = Config::LINEAR_JERK_BRAKE;
 
-    float trackFfKs = Config::TRACK_FF_KS;
+    float trackFfKsStart = Config::TRACK_FF_KS_START;
+    float trackFfKsRun = Config::TRACK_FF_KS_RUN;
     float trackFfKv = Config::TRACK_FF_KV;
     float trackFfKa = Config::TRACK_FF_KA;
     float trackFfKslope = Config::TRACK_FF_KSLOPE;
@@ -218,7 +227,8 @@ namespace Tune {
         {"LINEAR_JERK_ACCEL", "ljacc", &linearJerkAccel, Config::LINEAR_JERK_ACCEL, 0.0f, 8.0f},
         {"LINEAR_JERK_BRAKE", "ljbrk", &linearJerkBrake, Config::LINEAR_JERK_BRAKE, 0.0f, 20.0f},
 
-        {"TRACK_FF_KS", "trkks", &trackFfKs, Config::TRACK_FF_KS, 0.0f, 120.0f},
+        {"TRACK_FF_KS_START", "tksst", &trackFfKsStart, Config::TRACK_FF_KS_START, 0.0f, 160.0f},
+        {"TRACK_FF_KS_RUN", "tksrn", &trackFfKsRun, Config::TRACK_FF_KS_RUN, 0.0f, 120.0f},
         {"TRACK_FF_KV", "trkkv", &trackFfKv, Config::TRACK_FF_KV, 0.0f, 20.0f},
         {"TRACK_FF_KA", "trkka", &trackFfKa, Config::TRACK_FF_KA, 0.0f, 20.0f},
         {"TRACK_FF_KSLOPE", "trksl", &trackFfKslope, Config::TRACK_FF_KSLOPE, -80.0f, 80.0f},
@@ -369,6 +379,8 @@ private:
     float lastTarget = 0.0f;
     float filteredTargetAccel = 0.0f;
     bool wasTargetActive = false;
+    bool startBoostActive = false;
+    float lastDir = 0.0f;
 
 public:
     float calculate(float target, float actual, float dt, float pitchAngleDeg, float externalPwm) {
@@ -385,6 +397,14 @@ public:
         }
 
         bool targetActive = abs(target) >= Config::TRACK_STOP_DEADZONE_KMH;
+        float dir = (target > 0.0f) ? 1.0f : -1.0f;
+        if (targetActive && (!wasTargetActive || dir != lastDir)) {
+            startBoostActive = true;
+        }
+        if (!targetActive || abs(actual) >= Config::TRACK_START_RELEASE_KMH) {
+            startBoostActive = false;
+        }
+
         float targetAccel = 0.0f;
         if (targetActive && wasTargetActive) {
             targetAccel = constrain((target - lastTarget) / dt,
@@ -397,12 +417,13 @@ public:
 
         float ff = 0.0f;
         if (targetActive) {
-            float dir = (target > 0.0f) ? 1.0f : -1.0f;
-            ff = (Tune::trackFfKs * dir) +
+            float staticFf = startBoostActive ? Tune::trackFfKsStart : Tune::trackFfKsRun;
+            ff = (staticFf * dir) +
                  (Tune::trackFfKv * target) +
                  (Tune::trackFfKa * filteredTargetAccel) +
                  (Tune::trackFfKslope * sin(pitchAngleDeg * DEG_TO_RAD));
         }
+        lastDir = targetActive ? dir : 0.0f;
 
         float error = target - actual;
         if (abs(target) < Config::TRACK_STOP_DEADZONE_KMH) {
@@ -425,6 +446,8 @@ public:
         lastTarget = 0.0f;
         filteredTargetAccel = 0.0f;
         wasTargetActive = false;
+        startBoostActive = false;
+        lastDir = 0.0f;
     }
 };
 
@@ -760,7 +783,27 @@ public:
         
         // 目标自转速度
         float target_spin_v = joyX_squared * dynamic_sens;
-        spinV = target_spin_v;
+        // 低速/原地转向更像另一组“转向油门”：先克服履带搓地阻力，反向输入先刹到接近 0。
+        // 行进中则更接近双流传动的速度分配，允许更快跟随目标差速。
+        float movingBlend = constrain(abs(v_real) / Config::TURN_MOVING_BLEND_KMH, 0.0f, 1.0f);
+        float pivotBlend = 1.0f - movingBlend;
+        bool turnInputActive = abs(joyX_adj) >= 0.12f;
+        bool pivotReverseBrake = turnInputActive &&
+                                 (target_spin_v * spinV < 0.0f) &&
+                                 (abs(spinV) > Config::TRACK_STOP_DEADZONE_KMH);
+
+        float pivotTargetSpin = pivotReverseBrake ? 0.0f : target_spin_v;
+        float effectiveTargetSpin = pivotTargetSpin * pivotBlend + target_spin_v * movingBlend;
+
+        float turnAccelLimit = Config::TURN_ACCEL_PIVOT +
+                               (Config::TURN_ACCEL_MOVING - Config::TURN_ACCEL_PIVOT) * movingBlend;
+        float turnBrakeLimit = Config::TURN_BRAKE_PIVOT +
+                               (Config::TURN_BRAKE_MOVING - Config::TURN_BRAKE_PIVOT) * movingBlend;
+        bool turnBuilds = (effectiveTargetSpin * spinV >= 0.0f) &&
+                          (abs(effectiveTargetSpin) > abs(spinV)) &&
+                          !pivotReverseBrake;
+        float turnRateLimit = turnBuilds ? turnAccelLimit : turnBrakeLimit;
+        spinV = moveToward(spinV, effectiveTargetSpin, turnRateLimit * dt);
 
         // ==========================================
         // 双流耦合输出 (保持不变)
@@ -1591,6 +1634,12 @@ private:
     }
 
     void updateBatteryMonitor() {
+        if (!Config::ENABLE_BATTERY_MONITOR) {
+            batteryValid = false;
+            batteryVoltage = 0.0f;
+            return;
+        }
+
         uint32_t nowMs = millis();
         if ((uint32_t)(nowMs - lastBatterySampleMs) < Config::VBAT_SAMPLE_MS) return;
         lastBatterySampleMs = nowMs;
@@ -1610,10 +1659,12 @@ private:
     }
 
     bool batteryCritical() const {
+        if (!Config::ENABLE_BATTERY_MONITOR) return false;
         return batteryValid && batteryVoltage <= Config::VBAT_CUTOFF;
     }
 
     bool batteryWarning() const {
+        if (!Config::ENABLE_BATTERY_MONITOR) return false;
         return batteryValid && batteryVoltage <= Config::VBAT_WARN;
     }
 
@@ -1656,10 +1707,14 @@ public:
         Serial.begin(921600);
         Wire.begin(Config::I2C_FOC_SDA, Config::I2C_FOC_SCL); Wire.setClock(400000); 
         Wire1.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL); Wire1.setClock(400000); 
-        analogReadResolution(12);
-        analogSetPinAttenuation(Config::VBAT_ADC_PIN, ADC_11db);
-        pinMode(Config::VBAT_ADC_PIN, INPUT);
-        updateBatteryMonitor();
+        if (Config::ENABLE_BATTERY_MONITOR) {
+            analogReadResolution(12);
+            analogSetPinAttenuation(Config::VBAT_ADC_PIN, ADC_11db);
+            pinMode(Config::VBAT_ADC_PIN, INPUT);
+            updateBatteryMonitor();
+        } else {
+            LOG_ALWAYS(">>> Battery monitor disabled; use external low-voltage alarm.\n");
+        }
         chassis.init();
         chassisReady = true;
         turretReady = turret.init();
@@ -1768,7 +1823,7 @@ TaskHandle_t FOC_TaskHandle;
 void FocTask(void *pvParameters) {
     for (;;) {
         robot.runFOC_Only(); 
-        vTaskDelay(0); // 必须保留，让出微秒级CPU时间给系统底层（如看门狗），防止崩溃
+        vTaskDelay(pdMS_TO_TICKS(1)); // 给 CPU0 idle/watchdog 留出时间，炮塔未就绪时也不会空转重启
     }
 }
 
