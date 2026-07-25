@@ -60,20 +60,26 @@ namespace Config {
     const uint32_t PWM_FREQ = 10000;                  // 电机控制频率 10kHz
     const uint8_t PWM_RES = 8;                        // 8位分辨率 (0-255)
     const float MOTOR_PWM_DEADZONE = 1.0f;            // 输出小于该值时完全断开电机
-    const float TRACK_STOP_DEADZONE_KMH = 0.5f;       // 履带速度死区
-    const float TRACK_FF_KS_START = 55.0f;            // 起步静摩擦前馈 PWM，用于破除履带静摩擦
-    const float TRACK_FF_KS_RUN = 32.0f;              // 运行保持静摩擦前馈 PWM，转起来后避免持续猛冲
-    const float TRACK_START_RELEASE_KMH = 1.0f;       // 实测速度超过该值后从起步前馈切到保持前馈
+    const float TRACK_STOP_DEADZONE_KMH = 0.10f;      // 履带速度死区；保留低速调试能力，避免 0.3km/h 被直接归零
+    const float TRACK_FF_KS_START = 90.0f;            // 起步静摩擦前馈 PWM，用于破除履带静摩擦
+    const float TRACK_FF_KS_RUN = 45.0f;              // 运行保持静摩擦前馈 PWM，转起来后避免持续猛冲
+    const uint32_t TRACK_START_BOOST_MAX_MS = 220;    // 起步前馈最长持续时间，避免低速目标一直吃大 PWM
+    const float TRACK_START_RELEASE_RATIO = 0.55f;    // 实测速度达到目标速度该比例后释放起步前馈
+    const float TRACK_START_RELEASE_MIN_KMH = 0.18f;  // 释放阈值下限，避免编码器低速抖动导致过早释放
     const float TRACK_FF_KV = 4.4f;                   // 速度前馈 PWM/(km/h)
-    const float TRACK_FF_KA = 2.2f;                   // 加速度前馈 PWM/(km/h/s)
-    const float TRACK_FF_KSLOPE = 18.0f;              // 坡度保持前馈 PWM
+    const float TRACK_FF_KA = 0.8f;                   // 加速度前馈 PWM/(km/h/s)，调试初期偏保守，避免阶跃时猛冲
     const float TRACK_FF_MAX_ACCEL = 80.0f;           // 前馈使用的目标加速度限幅
     const float TRACK_FF_ACCEL_LPF = 0.25f;           // 目标加速度前馈低通，抑制死区边缘脉冲
-    const float TRACK_PI_KP = 2.0f;                   // 履带速度 PI 比例项
+    const float TRACK_PI_KP = 3.0f;                   // 履带速度 PI 比例项
     const float TRACK_PI_KI = 0.25f;                  // 履带速度 PI 积分项
     const float TRACK_PI_MAX_I = 80.0f;               // 履带速度 PI 积分限幅
     const float TRACK_PI_MAX_CORRECTION = 90.0f;      // PI 只做误差修正，主输出交给前馈
     const float TRACK_EXTERNAL_PWM_MAX = 70.0f;        // 外部惯量 PWM 总修正限幅
+    const float TRACK_STALL_TARGET_MIN_KMH = 0.45f;   // 堵转检测最低目标速度；低速起步测试不触发
+    const float TRACK_STALL_PWM_MIN = 95.0f;           // 堵转检测最低 PWM；小 PWM 推不动不算堵转
+    const float TRACK_STALL_ACTUAL_MAX_KMH = 0.08f;   // 实际速度低于该值且持续高 PWM，认为可能堵转
+    const uint32_t TRACK_STALL_GRACE_MS = 650;         // 堵转判定持续时间，给正常起步留出余量
+    const float TRACK_STALL_CLEAR_TARGET_KMH = 0.12f; // 松开目标到该速度以下后清除堵转锁存
     const uint32_t ENCODER_SAMPLE_US = 5000;          // 编码器测速周期，对齐 200Hz 控制环
     const float ENCODER_SPEED_LPF = 0.35f;            // 编码器速度低通，降低低速量化抖动
 
@@ -183,7 +189,6 @@ namespace Tune {
     float trackFfKsRun = Config::TRACK_FF_KS_RUN;
     float trackFfKv = Config::TRACK_FF_KV;
     float trackFfKa = Config::TRACK_FF_KA;
-    float trackFfKslope = Config::TRACK_FF_KSLOPE;
     float trackPiKp = Config::TRACK_PI_KP;
     float trackPiKi = Config::TRACK_PI_KI;
 
@@ -231,7 +236,6 @@ namespace Tune {
         {"TRACK_FF_KS_RUN", "tksrn", &trackFfKsRun, Config::TRACK_FF_KS_RUN, 0.0f, 120.0f},
         {"TRACK_FF_KV", "trkkv", &trackFfKv, Config::TRACK_FF_KV, 0.0f, 20.0f},
         {"TRACK_FF_KA", "trkka", &trackFfKa, Config::TRACK_FF_KA, 0.0f, 20.0f},
-        {"TRACK_FF_KSLOPE", "trksl", &trackFfKslope, Config::TRACK_FF_KSLOPE, -80.0f, 80.0f},
         {"TRACK_PI_KP", "tpikp", &trackPiKp, Config::TRACK_PI_KP, 0.0f, 12.0f},
         {"TRACK_PI_KI", "tpiki", &trackPiKi, Config::TRACK_PI_KI, 0.0f, 6.0f},
 
@@ -380,10 +384,11 @@ private:
     float filteredTargetAccel = 0.0f;
     bool wasTargetActive = false;
     bool startBoostActive = false;
+    uint32_t startBoostSinceMs = 0;
     float lastDir = 0.0f;
 
 public:
-    float calculate(float target, float actual, float dt, float pitchAngleDeg, float externalPwm) {
+    float calculate(float target, float actual, float dt, float externalPwm) {
         if (dt <= 0.0f) dt = 0.001f;
         if (dt > 0.05f) dt = 0.05f;
         externalPwm = constrain(externalPwm,
@@ -400,8 +405,14 @@ public:
         float dir = (target > 0.0f) ? 1.0f : -1.0f;
         if (targetActive && (!wasTargetActive || dir != lastDir)) {
             startBoostActive = true;
+            startBoostSinceMs = millis();
         }
-        if (!targetActive || abs(actual) >= Config::TRACK_START_RELEASE_KMH) {
+        float releaseSpeed = max(Config::TRACK_START_RELEASE_MIN_KMH,
+                                 abs(target) * Config::TRACK_START_RELEASE_RATIO);
+        bool boostTimedOut = startBoostActive &&
+                             ((uint32_t)(millis() - startBoostSinceMs) >= Config::TRACK_START_BOOST_MAX_MS);
+        bool boostSpeedReached = startBoostActive && abs(actual) >= releaseSpeed;
+        if (!targetActive || boostTimedOut || boostSpeedReached) {
             startBoostActive = false;
         }
 
@@ -420,8 +431,7 @@ public:
             float staticFf = startBoostActive ? Tune::trackFfKsStart : Tune::trackFfKsRun;
             ff = (staticFf * dir) +
                  (Tune::trackFfKv * target) +
-                 (Tune::trackFfKa * filteredTargetAccel) +
-                 (Tune::trackFfKslope * sin(pitchAngleDeg * DEG_TO_RAD));
+                 (Tune::trackFfKa * filteredTargetAccel);
         }
         lastDir = targetActive ? dir : 0.0f;
 
@@ -447,6 +457,7 @@ public:
         filteredTargetAccel = 0.0f;
         wasTargetActive = false;
         startBoostActive = false;
+        startBoostSinceMs = 0;
         lastDir = 0.0f;
     }
 };
@@ -542,15 +553,76 @@ class TankTrack {
 public:
     DCMotor motor; CustomEncoder encoder; TrackVelocityController controller;
     float currentSpeed = 0, targetSpeed = 0;
-    TankTrack(DCMotor m, CustomEncoder e) : motor(m), encoder(e) {}
+    float lastPwm = 0;
+    bool stallLatched = false;
+private:
+    const char* label;
+    uint32_t stallCandidateSinceMs = 0;
+
+    void clearStallIfReleased() {
+        if (abs(targetSpeed) <= Config::TRACK_STALL_CLEAR_TARGET_KMH) {
+            stallLatched = false;
+            stallCandidateSinceMs = 0;
+        }
+    }
+
+    bool updateStallProtection() {
+        if (abs(targetSpeed) < Config::TRACK_STALL_TARGET_MIN_KMH ||
+            abs(lastPwm) < Config::TRACK_STALL_PWM_MIN ||
+            abs(currentSpeed) > Config::TRACK_STALL_ACTUAL_MAX_KMH) {
+            stallCandidateSinceMs = 0;
+            return false;
+        }
+
+        uint32_t nowMs = millis();
+        if (stallCandidateSinceMs == 0) {
+            stallCandidateSinceMs = nowMs;
+            return false;
+        }
+
+        if ((uint32_t)(nowMs - stallCandidateSinceMs) < Config::TRACK_STALL_GRACE_MS) {
+            return false;
+        }
+
+        stallLatched = true;
+        stallCandidateSinceMs = 0;
+        controller.reset();
+        LOG_ALWAYS("!!! Track stall latched: %s target=%.2f actual=%.2f pwm=%.1f\n",
+                   label, targetSpeed, currentSpeed, lastPwm);
+        return true;
+    }
+
+public:
+    TankTrack(DCMotor m, CustomEncoder e, const char* trackLabel) : motor(m), encoder(e), label(trackLabel) {}
     void init() { motor.init(); encoder.init(); }
-    void update(float target, float dt, float pitchAngleDeg, float externalPwm) {
+    void update(float target, float dt, float externalPwm) {
         targetSpeed = target;
         currentSpeed = encoder.getRealSpeedKMH();
         if (abs(targetSpeed) < Config::TRACK_STOP_DEADZONE_KMH) targetSpeed = 0;
-        motor.drive(controller.calculate(targetSpeed, currentSpeed, dt, pitchAngleDeg, externalPwm));
+        clearStallIfReleased();
+
+        if (stallLatched) {
+            lastPwm = 0;
+            motor.drive(0);
+            return;
+        }
+
+        lastPwm = controller.calculate(targetSpeed, currentSpeed, dt, externalPwm);
+        if (updateStallProtection()) {
+            lastPwm = 0;
+            motor.drive(0);
+            return;
+        }
+        motor.drive(lastPwm);
     }
-    void stop() { targetSpeed = 0; controller.reset(); motor.drive(0); }
+    void stop() {
+        targetSpeed = 0;
+        lastPwm = 0;
+        stallLatched = false;
+        stallCandidateSinceMs = 0;
+        controller.reset();
+        motor.drive(0);
+    }
 };
 
 // 专为重型内燃机设计的油门平滑器：踩油门迟滞(模拟涡轮/转速爬升)，松油门瞬间切断
@@ -684,9 +756,11 @@ private:
 public:
     TankChassis() : 
         rightTrack(DCMotor(Config::R_IN1, Config::R_IN2, Config::R_PWM, Config::PWM_CH_R, false),
-                   CustomEncoder(Config::R_ENCA, Config::R_ENCB, PCNT_UNIT_0)),
+                   CustomEncoder(Config::R_ENCA, Config::R_ENCB, PCNT_UNIT_0),
+                   "right"),
         leftTrack (DCMotor(Config::L_IN1, Config::L_IN2, Config::L_PWM, Config::PWM_CH_L, true),
-                   CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1)),
+                   CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1),
+                   "left"),
         engineSmoother(0.8f, 10.0f),  // 参数可调：0.8表示油门踩到底需1秒多建立全扭矩
         brakeSmoother(4.0f, 10.0f)    // 参数可调：刹车建立很快
     {}
@@ -819,8 +893,29 @@ public:
             Lv_tgt *= ratio; Rv_tgt *= ratio;
         }
 
-        leftTrack.update(Lv_tgt, dt, gradePitch, pitchInertiaPwm + yawInertiaPwm);
-        rightTrack.update(Rv_tgt, dt, gradePitch, pitchInertiaPwm - yawInertiaPwm);
+        leftTrack.update(Lv_tgt, dt, pitchInertiaPwm + yawInertiaPwm);
+        rightTrack.update(Rv_tgt, dt, pitchInertiaPwm - yawInertiaPwm);
+    }
+
+    void processDirectTrackTargets(float leftTarget, float rightTarget, float dt, float pitchAngle) {
+        updateGradePitch(pitchAngle, dt);
+        v_real = (leftTarget + rightTarget) * 0.5f;
+        spinV = (leftTarget - rightTarget) * 0.5f;
+        longitudinalAccel = 0.0f;
+        leftTrack.update(leftTarget, dt, 0.0f);
+        rightTrack.update(rightTarget, dt, 0.0f);
+    }
+
+    void getTrackTelemetry(float& leftTarget, float& leftActual, float& leftPwm, bool& leftStalled,
+                           float& rightTarget, float& rightActual, float& rightPwm, bool& rightStalled) const {
+        leftTarget = leftTrack.targetSpeed;
+        leftActual = leftTrack.currentSpeed;
+        leftPwm = leftTrack.lastPwm;
+        leftStalled = leftTrack.stallLatched;
+        rightTarget = rightTrack.targetSpeed;
+        rightActual = rightTrack.currentSpeed;
+        rightPwm = rightTrack.lastPwm;
+        rightStalled = rightTrack.stallLatched;
     }
 
     void stop() { 
@@ -852,6 +947,14 @@ struct TurretTelemetry {
     float targetPitchDeg = 0.0f;
     float yawVoltage = 0.0f;
     float servoCommandDeg = 90.0f;
+    float leftTrackTargetKmh = 0.0f;
+    float leftTrackActualKmh = 0.0f;
+    float leftTrackPwm = 0.0f;
+    float rightTrackTargetKmh = 0.0f;
+    float rightTrackActualKmh = 0.0f;
+    float rightTrackPwm = 0.0f;
+    bool leftTrackStalled = false;
+    bool rightTrackStalled = false;
     bool stabilizationEnabled = false;
     bool imuHealthy = false;
     bool yawSensorHealthy = false;
@@ -1332,11 +1435,19 @@ struct DebugControlInput {
     bool active = false;
 };
 
+struct DebugTrackTestInput {
+    float leftTargetKmh = 0.0f;
+    float rightTargetKmh = 0.0f;
+    uint32_t untilMs = 0;
+    bool active = false;
+};
+
 class PcDebugBridge {
 private:
     Preferences prefs;
     NimBLECharacteristic* txCharacteristic = nullptr;
     DebugControlInput input;
+    DebugTrackTestInput trackTest;
     portMUX_TYPE inputMux = portMUX_INITIALIZER_UNLOCKED;
     SemaphoreHandle_t txMutex = nullptr;
     QueueHandle_t telemetryQueue = nullptr;
@@ -1374,6 +1485,39 @@ private:
         portEXIT_CRITICAL(&inputMux);
     }
 
+    void updateTrackTestInput(const String& command) {
+        String lower = command;
+        lower.toLowerCase();
+
+        DebugTrackTestInput next;
+        next.leftTargetKmh = constrain(readKeyValue(lower, "lt", 0.0f), -12.0f, 12.0f);
+        next.rightTargetKmh = constrain(readKeyValue(lower, "rt", 0.0f), -12.0f, 12.0f);
+        uint32_t durationMs = (uint32_t)constrain(readKeyValue(lower, "ms", 2000.0f), 100.0f, 10000.0f);
+        next.untilMs = millis() + durationMs;
+        next.active = true;
+
+        portENTER_CRITICAL(&inputMux);
+        trackTest = next;
+        input = DebugControlInput();
+        portEXIT_CRITICAL(&inputMux);
+
+        String response = "OK track lt=";
+        response += String(next.leftTargetKmh, 2);
+        response += " rt=";
+        response += String(next.rightTargetKmh, 2);
+        response += " ms=";
+        response += String(durationMs);
+        response += "\n";
+        notifyText(response);
+    }
+
+    void stopTrackTestInput() {
+        portENTER_CRITICAL(&inputMux);
+        trackTest = DebugTrackTestInput();
+        portEXIT_CRITICAL(&inputMux);
+        notifyText("OK track_stop\n");
+    }
+
     void notifyBleText(const String& text) {
         if (!txCharacteristic || !connected) return;
         if (txMutex && xSemaphoreTake(txMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
@@ -1387,7 +1531,7 @@ private:
             txCharacteristic->setValue(chunk.c_str());
             txCharacteristic->notify();
             offset += chunk.length();
-            delay(2);
+            delay(8); // Windows/Bleak 对连续 notify 比较敏感，稍微放慢可避免长响应丢包
         }
         if (txMutex) xSemaphoreGive(txMutex);
     }
@@ -1400,7 +1544,7 @@ private:
 
     void notifyTelemetryNow(const TurretTelemetry& telemetry) {
         String out;
-        out.reserve(180);
+        out.reserve(260);
         out += "TEL cy="; out += String(telemetry.chassisYawDeg, 2);
         out += " cp="; out += String(telemetry.chassisPitchDeg, 2);
         out += " ty="; out += String(telemetry.turretWorldYawDeg, 2);
@@ -1410,6 +1554,14 @@ private:
         out += " pt="; out += String(telemetry.targetPitchDeg, 2);
         out += " yv="; out += String(telemetry.yawVoltage, 3);
         out += " sv="; out += String(telemetry.servoCommandDeg, 2);
+        out += " ltt="; out += String(telemetry.leftTrackTargetKmh, 2);
+        out += " lta="; out += String(telemetry.leftTrackActualKmh, 2);
+        out += " ltp="; out += String(telemetry.leftTrackPwm, 1);
+        out += " rtt="; out += String(telemetry.rightTrackTargetKmh, 2);
+        out += " rta="; out += String(telemetry.rightTrackActualKmh, 2);
+        out += " rtp="; out += String(telemetry.rightTrackPwm, 1);
+        out += " lts="; out += (telemetry.leftTrackStalled ? "1" : "0");
+        out += " rts="; out += (telemetry.rightTrackStalled ? "1" : "0");
         out += " st="; out += (telemetry.stabilizationEnabled ? "1" : "0");
         out += " ih="; out += (telemetry.imuHealthy ? "1" : "0");
         out += " yh="; out += (telemetry.yawSensorHealthy ? "1" : "0");
@@ -1437,6 +1589,18 @@ private:
             updatePadInput(command);
             return;
         }
+        if (lower == "track stop") {
+            stopTrackTestInput();
+            return;
+        }
+        if (lower.startsWith("track ")) {
+            if (emergencyStopLatched) {
+                notifyText("ERR emergency_stop_latched\n");
+                return;
+            }
+            updateTrackTestInput(command);
+            return;
+        }
         if (lower == "get") {
             String out = "STATE ESTOP=";
             out += emergencyStopLatched ? "1\n" : "0\n";
@@ -1450,6 +1614,7 @@ private:
             emergencyStopLatched = true;
             portENTER_CRITICAL(&inputMux);
             input = DebugControlInput();
+            trackTest = DebugTrackTestInput();
             input.emergencyStop = true;
             input.active = true;
             input.lastPacketMs = millis();
@@ -1486,6 +1651,8 @@ private:
             notifyText(
                 "COMMANDS\n"
                 "pad tl=0 tr=0 jlx=0 jrx=0 jry=0 a=0\n"
+                "track lt=0 rt=0 ms=2000\n"
+                "track stop\n"
                 "get\n"
                 "set PARAM VALUE\n"
                 "save\n"
@@ -1600,6 +1767,21 @@ public:
                ((uint32_t)(millis() - out.lastPacketMs) <= Config::DEBUG_INPUT_TIMEOUT_MS);
     }
 
+    bool readTrackTest(DebugTrackTestInput& out) {
+        if (!Config::PC_DEBUG_MODE) return false;
+
+        portENTER_CRITICAL(&inputMux);
+        out = trackTest;
+        bool expired = out.active && ((int32_t)(millis() - out.untilMs) >= 0);
+        if (expired) {
+            trackTest = DebugTrackTestInput();
+            out = trackTest;
+        }
+        portEXIT_CRITICAL(&inputMux);
+
+        return out.active;
+    }
+
     void sendTelemetry(const TurretTelemetry& telemetry) {
         if (!Config::PC_DEBUG_MODE || !connected || !telemetryQueue) return;
         xQueueOverwrite(telemetryQueue, &telemetry);
@@ -1699,6 +1881,18 @@ private:
         return true;
     }
 
+    void appendChassisTelemetry(TurretTelemetry& telemetry) const {
+        if (!chassisReady) return;
+        chassis.getTrackTelemetry(telemetry.leftTrackTargetKmh,
+                                  telemetry.leftTrackActualKmh,
+                                  telemetry.leftTrackPwm,
+                                  telemetry.leftTrackStalled,
+                                  telemetry.rightTrackTargetKmh,
+                                  telemetry.rightTrackActualKmh,
+                                  telemetry.rightTrackPwm,
+                                  telemetry.rightTrackStalled);
+    }
+
 public:
     TankRobot() : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
 
@@ -1777,13 +1971,25 @@ public:
                     LOG_ALWAYS("!!! Battery cutoff active: %.2fV\n", batteryVoltage);
                 }
             } else {
+                DebugTrackTestInput trackTest;
+                bool handledTrackTest = false;
+                if (chassisReady && pcDebug.readTrackTest(trackTest)) {
+                    float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
+                    chassis.processDirectTrackTargets(trackTest.leftTargetKmh,
+                                                      trackTest.rightTargetKmh,
+                                                      dtCtrl,
+                                                      pAngle);
+                    if (turretReady) turret.updateStabilization(dtCtrl);
+                    handledTrackTest = true;
+                }
+
                 DebugControlInput input;
-                if (chassisReady && readControlInput(input)) {
+                if (!handledTrackTest && chassisReady && readControlInput(input)) {
                     if (input.emergencyStop) {
                         chassis.stop();
                         if (turretReady) turret.enterDisconnectedState();
                     } else {
-                        // 坡度角用于坡度前馈，pitch/yaw rate 用于生成虚拟旋转惯量。
+                        // 坡度角用于底盘动力学中的重力分量，pitch/yaw rate 用于生成虚拟旋转惯量。
                         float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
                         float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
                         float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
@@ -1796,7 +2002,7 @@ public:
                             LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
                         }
                     }
-                } else {
+                } else if (!handledTrackTest) {
                     if (chassisReady) chassis.stop();
                     if (turretReady) turret.enterDisconnectedState();
                 }
@@ -1804,11 +2010,12 @@ public:
         }
 
         uint32_t nowMs = millis();
-        if (Config::PC_DEBUG_MODE && turretReady &&
+        if (Config::PC_DEBUG_MODE && (chassisReady || turretReady) &&
             (uint32_t)(nowMs - lastTelemetryMs) >= Config::DEBUG_TELEMETRY_INTERVAL_MS) {
             lastTelemetryMs = nowMs;
             TurretTelemetry telemetry;
-            turret.getTelemetry(telemetry);
+            if (turretReady) turret.getTelemetry(telemetry);
+            appendChassisTelemetry(telemetry);
             pcDebug.sendTelemetry(telemetry);
         }
     }

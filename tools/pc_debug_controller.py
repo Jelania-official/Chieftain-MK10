@@ -358,7 +358,6 @@ PARAM_META = {
     "TRACK_FF_KS_RUN": ("履带速度环", "保持静摩擦前馈", "履带已经转起来后用于维持运动的 PWM"),
     "TRACK_FF_KV": ("履带速度环", "速度前馈 Kv", "目标速度对应的 PWM 前馈"),
     "TRACK_FF_KA": ("履带速度环", "加速度前馈 Ka", "目标加速度对应的 PWM 前馈"),
-    "TRACK_FF_KSLOPE": ("履带速度环", "坡度前馈", "坡道保持所需的 PWM 前馈"),
     "TRACK_PI_KP": ("履带速度环", "速度环 Kp", "编码器速度误差的比例修正"),
     "TRACK_PI_KI": ("履带速度环", "速度环 Ki", "编码器速度误差的积分修正"),
 }
@@ -591,6 +590,12 @@ class QTelemetryChartView(QWidget):
         "target_pitch_deg": ("目标", CYAN),
         "yaw_voltage": ("Yaw 电压", RED),
         "servo_command_deg": ("舵机命令", GREEN),
+        "left_track_target_kmh": ("左目标", ACCENT),
+        "left_track_actual_kmh": ("左实际", GREEN),
+        "right_track_target_kmh": ("右目标", CYAN),
+        "right_track_actual_kmh": ("右实际", YELLOW),
+        "left_track_pwm": ("左 PWM", "#7A5AF8"),
+        "right_track_pwm": ("右 PWM", RED),
     }
 
     def __init__(self, parent=None):
@@ -602,6 +607,8 @@ class QTelemetryChartView(QWidget):
                 "turret_relative_yaw_deg", "gun_pitch_deg", "target_yaw_deg",
                 "target_pitch_deg", "yaw_voltage", "servo_command_deg",
                 "stabilizer_enabled", "imu_healthy", "yaw_sensor_healthy",
+                "left_track_target_kmh", "left_track_actual_kmh", "left_track_pwm",
+                "right_track_target_kmh", "right_track_actual_kmh", "right_track_pwm",
             ]
         }
         self.telemetry_stale = True
@@ -654,21 +661,21 @@ class QTelemetryChartView(QWidget):
         charts = [
             (
                 QRectF(14, chart_top, chart_width, chart_height),
-                "Yaw 角度",
-                ["chassis_yaw_deg", "turret_yaw_deg", "target_yaw_deg"],
-                "°",
+                "左履带速度",
+                ["left_track_target_kmh", "left_track_actual_kmh"],
+                "km/h",
             ),
             (
                 QRectF(14 + chart_width + gap, chart_top, chart_width, chart_height),
-                "Pitch 角度",
-                ["chassis_pitch_deg", "gun_pitch_deg", "target_pitch_deg"],
-                "°",
+                "右履带速度",
+                ["right_track_target_kmh", "right_track_actual_kmh"],
+                "km/h",
             ),
             (
                 QRectF(14, chart_top + chart_height + gap, chart_width, chart_height),
-                "Yaw 电压输出",
-                ["yaw_voltage"],
-                "V",
+                "履带 PWM 输出",
+                ["left_track_pwm", "right_track_pwm"],
+                "",
             ),
             (
                 QRectF(
@@ -677,8 +684,8 @@ class QTelemetryChartView(QWidget):
                     chart_width,
                     chart_height,
                 ),
-                "舵机命令",
-                ["servo_command_deg"],
+                "车体 Pitch",
+                ["chassis_pitch_deg"],
                 "°",
             ),
         ]
@@ -960,7 +967,12 @@ class QConsoleMainWindow(QMainWindow):
         self.pad = PadState(mouse_sensitivity=args.mouse_sensitivity)
         self.command_queue, self.ui_queue = queue.Queue(), queue.Queue()
         self.stop_event = threading.Event()
+        self.device_response_event = threading.Event()
         self.connected = False
+        self.device_responsive = False
+        self.device_ready_logged = False
+        self.pad_stream_enabled = False
+        self.last_telemetry_parse_warning_at = 0.0
         self.emergency_stopped = False
         self.latest_pad_command = "pad tl=0.000 tr=0.000 jlx=0.000 jrx=0.000 jry=0.000 a=0\n"
         self.pad_command_lock = threading.Lock()
@@ -968,6 +980,7 @@ class QConsoleMainWindow(QMainWindow):
         self.mouse_warp_pending = False
         self.rx_buffer, self.parameter_rows = "", {}
         self.last_telemetry_at = 0.0
+        self.track_samples = deque(maxlen=80)
         self._closing = False
 
         self.setWindowTitle("Chieftain MK10 Control Center")
@@ -1079,7 +1092,7 @@ class QConsoleMainWindow(QMainWindow):
             tel_grid.addWidget(tile, idx // 3, idx % 3)
             self.telemetry_labels[k] = val
         visual_layout.addWidget(tel_widget)
-        left_pane.addWidget(visual_panel, stretch=3)
+        left_pane.addWidget(visual_panel, stretch=5)
 
         ctrl_card = QFrame(objectName="ControlPanel")
         ctrl_layout = QHBoxLayout(ctrl_card)
@@ -1140,9 +1153,6 @@ class QConsoleMainWindow(QMainWindow):
         tuning_layout.addStretch()
         ctrl_layout.addLayout(tuning_layout)
 
-        left_pane.addWidget(ctrl_card)
-        pane_layout.addLayout(left_pane, 6)
-
         right_pane = QVBoxLayout()
         right_pane.setSpacing(10)
 
@@ -1174,6 +1184,114 @@ class QConsoleMainWindow(QMainWindow):
         safe_btns.addWidget(btn_arm)
         safe_layout.addLayout(safe_btns, 2, 0, 1, 2)
         right_pane.addWidget(safe_card)
+
+        track_card = QFrame(objectName="ControlPanel")
+        track_layout = QVBoxLayout(track_card)
+        track_layout.setContentsMargins(14, 12, 14, 12)
+        track_layout.setSpacing(8)
+
+        track_header = QVBoxLayout()
+        track_header.setSpacing(0)
+        track_header.addWidget(QLabel("履带测试台", objectName="SectionTitle"))
+        track_hint = QLabel("给左右履带发送固定目标速度，用于起步、阶跃和保持速度调参。")
+        track_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        track_header.addWidget(track_hint)
+        track_layout.addLayout(track_header)
+
+        track_inputs = QGridLayout()
+        track_inputs.setHorizontalSpacing(10)
+        track_inputs.setVerticalSpacing(8)
+        self.track_left_entry = QLineEdit("0.80")
+        self.track_right_entry = QLineEdit("0.80")
+        self.track_duration_entry = QLineEdit("2500")
+        for entry, width in [
+            (self.track_left_entry, 96),
+            (self.track_right_entry, 96),
+            (self.track_duration_entry, 104),
+        ]:
+            entry.setAlignment(Qt.AlignRight)
+            entry.setMinimumWidth(width)
+            entry.setMinimumHeight(32)
+        self.track_left_entry.setValidator(QDoubleValidator(-12.0, 12.0, 3))
+        self.track_right_entry.setValidator(QDoubleValidator(-12.0, 12.0, 3))
+        self.track_duration_entry.setValidator(QDoubleValidator(100.0, 10000.0, 0))
+        track_inputs.addWidget(QLabel("左目标 km/h"), 0, 0)
+        track_inputs.addWidget(self.track_left_entry, 0, 1)
+        track_inputs.addWidget(QLabel("右目标 km/h"), 1, 0)
+        track_inputs.addWidget(self.track_right_entry, 1, 1)
+        track_inputs.addWidget(QLabel("持续 ms"), 2, 0)
+        track_inputs.addWidget(self.track_duration_entry, 2, 1)
+        btn_track_send = QPushButton("发送测试", objectName="Primary")
+        btn_track_send.setFocusPolicy(Qt.NoFocus)
+        btn_track_send.setMinimumHeight(32)
+        btn_track_send.clicked.connect(self.send_track_test)
+        track_inputs.addWidget(btn_track_send, 3, 0, 1, 2)
+        track_inputs.setColumnStretch(1, 1)
+        track_layout.addLayout(track_inputs)
+
+        preset_grid = QGridLayout()
+        preset_grid.setHorizontalSpacing(8)
+        preset_grid.setVerticalSpacing(8)
+        presets = [
+            ("低速起步 0.3", lambda: self.send_track_preset(+0.3, +0.3)),
+            ("低速保持 0.6", lambda: self.send_track_preset(+0.6, +0.6)),
+            ("阶跃前进 1.5", lambda: self.send_track_preset(+1.5, +1.5)),
+            ("双履带后退", lambda: self.send_track_preset(-0.6, -0.6)),
+            ("原地左转", lambda: self.send_track_preset(-0.6, +0.6)),
+            ("原地右转", lambda: self.send_track_preset(+0.6, -0.6)),
+            ("只测左履带", lambda: self.send_track_preset(+0.8, 0.0)),
+            ("只测右履带", lambda: self.send_track_preset(0.0, +0.8)),
+        ]
+        for index, (text, callback) in enumerate(presets):
+            button = QPushButton(text, objectName="Secondary")
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setMinimumHeight(34)
+            button.clicked.connect(callback)
+            preset_grid.addWidget(button, index // 2, index % 2)
+        btn_track_stop = QPushButton("履带停止", objectName="Danger")
+        btn_track_stop.setFocusPolicy(Qt.NoFocus)
+        btn_track_stop.setMinimumHeight(36)
+        btn_track_stop.clicked.connect(self.stop_track_test)
+        preset_grid.addWidget(btn_track_stop, 4, 0, 1, 2)
+        track_layout.addLayout(preset_grid)
+
+        track_tel_grid = QGridLayout()
+        track_tel_grid.setHorizontalSpacing(8)
+        track_tel_grid.setVerticalSpacing(8)
+        self.track_telemetry_labels = {}
+        track_fields = [
+            ("LT_TGT", "左目标"), ("LT_ACT", "左实际"), ("LT_ERR", "左误差"), ("LT_PWM", "左 PWM"),
+            ("RT_TGT", "右目标"), ("RT_ACT", "右实际"), ("RT_ERR", "右误差"), ("RT_PWM", "右 PWM"),
+        ]
+        for idx, (key, label) in enumerate(track_fields):
+            tile = QFrame(objectName="TelemetryTile")
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(10, 6, 10, 7)
+            tile_layout.setSpacing(0)
+            tile_layout.addWidget(QLabel(label, objectName="SubTitle"))
+            val = QLabel("0.00", objectName="LargeValue")
+            val.setStyleSheet("font-size: 15px;")
+            tile_layout.addWidget(val)
+            track_tel_grid.addWidget(tile, idx // 2, idx % 2)
+            self.track_telemetry_labels[key] = val
+        track_layout.addLayout(track_tel_grid)
+
+        self.track_advice_label = QLabel(
+            "调参顺序：先测 0.3 起步调 KS_START，再测 0.6 保持调 KS_RUN/KV，最后测 1.5 阶跃再考虑 KA/PI。"
+        )
+        self.track_advice_label.setWordWrap(True)
+        self.track_advice_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        track_layout.addWidget(self.track_advice_label)
+
+        self.control_tabs = QTabWidget()
+        self.control_tabs.setDocumentMode(True)
+        self.control_tabs.tabBar().setExpanding(True)
+        self.drive_tab = ctrl_card
+        self.track_tab = track_card
+        self.control_tabs.addTab(ctrl_card, "驾驶控制")
+        self.control_tabs.addTab(track_card, "履带调参")
+        self.control_tabs.setCurrentWidget(track_card)
+        left_pane.addWidget(self.control_tabs, stretch=2)
 
         param_card = QFrame(objectName="ParameterPanel")
         p_layout = QVBoxLayout(param_card)
@@ -1246,7 +1364,8 @@ class QConsoleMainWindow(QMainWindow):
         p_layout.addWidget(self.tab_widget)
         right_pane.addWidget(param_card, stretch=1)
 
-        pane_layout.addLayout(right_pane, 4)
+        pane_layout.addLayout(left_pane, 7)
+        pane_layout.addLayout(right_pane, 3)
         root_splitter.addWidget(workspace)
 
         console_panel = QFrame(objectName="ConsolePanel")
@@ -1280,7 +1399,7 @@ class QConsoleMainWindow(QMainWindow):
         command_row.addWidget(command_label)
         self.command_entry = QLineEdit()
         self.command_entry.setObjectName("ConsoleCommand")
-        self.command_entry.setPlaceholderText("例如：get、save、set REAL_TURRET_VEL 22.5")
+        self.command_entry.setPlaceholderText("例如：get、save、set TRACK_FF_KS_START 55、track lt=0.8 rt=0.8 ms=2500")
         self.command_entry.returnPressed.connect(self.submit_manual_command)
         command_row.addWidget(self.command_entry, stretch=1)
         btn_send = QPushButton("发送", objectName="Primary")
@@ -1336,6 +1455,39 @@ class QConsoleMainWindow(QMainWindow):
         slider.valueChanged.connect(on_change)
         row.addWidget(slider)
         parent_layout.addLayout(row)
+
+    @staticmethod
+    def _read_float_entry(entry, fallback, minimum, maximum):
+        try:
+            return clamp(float(entry.text()), minimum, maximum)
+        except ValueError:
+            entry.setText(f"{fallback:.2f}")
+            return fallback
+
+    def send_track_test(self):
+        left = self._read_float_entry(self.track_left_entry, 0.0, -12.0, 12.0)
+        right = self._read_float_entry(self.track_right_entry, 0.0, -12.0, 12.0)
+        duration = round(self._read_float_entry(self.track_duration_entry, 2500.0, 100.0, 10000.0))
+        self.track_left_entry.setText(f"{left:.2f}")
+        self.track_right_entry.setText(f"{right:.2f}")
+        self.track_duration_entry.setText(str(duration))
+        self.track_samples.clear()
+        self.track_advice_label.setText("测试已发送：先看起步是否动，再看实际速度是否贴近目标，最后看 PWM 是否接近饱和。")
+        self.enqueue_command(f"track lt={left:.3f} rt={right:.3f} ms={duration}")
+
+    def send_track_preset(self, left, right):
+        duration = round(self._read_float_entry(self.track_duration_entry, 2500.0, 100.0, 10000.0))
+        self.track_left_entry.setText(f"{left:.2f}")
+        self.track_right_entry.setText(f"{right:.2f}")
+        self.track_duration_entry.setText(str(duration))
+        self.track_samples.clear()
+        self.track_advice_label.setText("预设测试已发送：等待 0.5 秒后看目标/实际/误差/PWM 的趋势。")
+        self.enqueue_command(f"track lt={left:.3f} rt={right:.3f} ms={duration}")
+
+    def stop_track_test(self):
+        self.track_samples.clear()
+        self.track_advice_label.setText("履带测试已停止。调参时建议一次只改一个参数，再重复同一个测试输入。")
+        self.enqueue_command("track stop")
 
     def bind_inputs(self):
         self.telemetry_view.capture_requested.connect(self.capture_mouse)
@@ -1469,23 +1621,46 @@ class QConsoleMainWindow(QMainWindow):
     def set_connection_status(self, status):
         labels = {
             "扫描中": "正在扫描",
-            "已连接": "设备在线",
+            "已连接": "BLE已连接",
+            "等待响应": "等待设备响应",
+            "已响应": "设备在线",
             "连接断开": "连接断开",
             "连接失败": "连接失败",
         }
-        color = GREEN if status == "已连接" else YELLOW if status == "扫描中" else RED
+        color = GREEN if status == "已响应" else YELLOW if status in ("扫描中", "已连接", "等待响应") else RED
         self.lbl_status.setText(labels.get(status, status))
         self.lbl_status.setStyleSheet(f"color: {color}; font-weight: 700;")
         self.connection_dot.setStyleSheet(f"color: {color}; font-size: 12px;")
 
         if status == "已连接":
             self.connected = True
+            self.device_responsive = False
+            self.device_ready_logged = False
+            if not self.emergency_stopped:
+                self.lbl_safety.setText("BLE已连接，等待ESP32回包")
+                self.lbl_safety.setStyleSheet(f"color: {YELLOW}; font-weight: 700;")
+            return
+
+        if status == "等待响应":
+            self.connected = True
+            self.device_responsive = False
+            self.device_ready_logged = False
+            if not self.emergency_stopped:
+                self.lbl_safety.setText("等待设备响应")
+                self.lbl_safety.setStyleSheet(f"color: {YELLOW}; font-weight: 700;")
+            return
+
+        if status == "已响应":
+            self.connected = True
+            self.device_responsive = True
             if not self.emergency_stopped:
                 self.lbl_safety.setText("输入链路正常")
                 self.lbl_safety.setStyleSheet(f"color: {GREEN}; font-weight: 700;")
             return
 
         self.connected = False
+        self.device_responsive = False
+        self.device_ready_logged = False
         self.last_telemetry_at = 0.0
         self.rx_buffer = ""
         if not self.emergency_stopped:
@@ -1500,6 +1675,10 @@ class QConsoleMainWindow(QMainWindow):
         pad_command, values = self.pad.snapshot()
         with self.pad_command_lock: self.latest_pad_command = pad_command
         self.gamepad_view.update_state(values)
+        self.pad_stream_enabled = (
+            self.mouse_captured or
+            (hasattr(self, "control_tabs") and self.control_tabs.currentWidget() is self.drive_tab)
+        )
 
     def get_latest_pad_command(self) -> str:
         with self.pad_command_lock: return self.latest_pad_command
@@ -1546,6 +1725,10 @@ class QConsoleMainWindow(QMainWindow):
             if name in self.parameter_rows: self.parameter_rows[name].set_value(val)
             if name == "REAL_TURRET_VEL": self.pad.set_turret_rate(val)
 
+        if line == "OK pc_debug_connected":
+            self.append_log(line + "\n", GREEN)
+            return
+
         if "emergency_stop_latched" in line:
             self.emergency_stopped = True
             self.lbl_safety.setText("急停已锁存")
@@ -1564,10 +1747,15 @@ class QConsoleMainWindow(QMainWindow):
             if "=" not in token: continue
             k, v = token.split("=", 1)
             try: telemetry[k] = float(v)
-            except ValueError: return
+            except ValueError:
+                self.warn_telemetry_parse_failure(line, f"{k}={v}")
+                return
 
         required = {"cy", "cp", "ty", "tr", "gp", "yt", "pt", "yv", "sv", "st", "ih", "yh"}
-        if not required.issubset(telemetry): return
+        if not required.issubset(telemetry):
+            missing = ",".join(sorted(required - set(telemetry)))
+            self.warn_telemetry_parse_failure(line, f"缺字段: {missing}")
+            return
         self.last_telemetry_at = time.monotonic()
 
         data = {
@@ -1576,9 +1764,107 @@ class QConsoleMainWindow(QMainWindow):
             "gun_pitch_deg": telemetry["gp"], "target_yaw_deg": telemetry["yt"], "target_pitch_deg": telemetry["pt"],
             "yaw_voltage": telemetry["yv"], "servo_command_deg": telemetry["sv"],
             "stabilizer_enabled": telemetry["st"], "imu_healthy": telemetry["ih"], "yaw_sensor_healthy": telemetry["yh"],
+            "left_track_target_kmh": telemetry.get("ltt", 0.0),
+            "left_track_actual_kmh": telemetry.get("lta", 0.0),
+            "left_track_pwm": telemetry.get("ltp", 0.0),
+            "right_track_target_kmh": telemetry.get("rtt", 0.0),
+            "right_track_actual_kmh": telemetry.get("rta", 0.0),
+            "right_track_pwm": telemetry.get("rtp", 0.0),
+            "left_track_stalled": telemetry.get("lts", 0.0) >= 0.5,
+            "right_track_stalled": telemetry.get("rts", 0.0) >= 0.5,
         }
+        data["left_track_error_kmh"] = data["left_track_target_kmh"] - data["left_track_actual_kmh"]
+        data["right_track_error_kmh"] = data["right_track_target_kmh"] - data["right_track_actual_kmh"]
         self.telemetry_view.update_telemetry(data)
         self.update_telemetry_ui(data)
+
+    def warn_telemetry_parse_failure(self, line, reason):
+        now = time.monotonic()
+        if now - self.last_telemetry_parse_warning_at < 2.0:
+            return
+        self.last_telemetry_parse_warning_at = now
+        preview = line if len(line) <= 160 else line[:157] + "..."
+        self.append_log(f"遥测解析失败：{reason}；收到：{preview}\n", YELLOW)
+
+    def update_track_advice(self, data):
+        now = time.monotonic()
+        if data.get("left_track_stalled") or data.get("right_track_stalled"):
+            sides = []
+            if data.get("left_track_stalled"):
+                sides.append("左履带")
+            if data.get("right_track_stalled"):
+                sides.append("右履带")
+            self.track_advice_label.setText(
+                f"{'、'.join(sides)}触发堵转保护：该侧已断电。先停止测试，检查卡滞/打齿/履带张紧/编码器方向，再重新发送命令。"
+            )
+            self.track_advice_label.setStyleSheet(f"color: {RED}; font-size: 10px;")
+            return
+
+        target_mag = max(abs(data["left_track_target_kmh"]), abs(data["right_track_target_kmh"]))
+        actual_mag = max(abs(data["left_track_actual_kmh"]), abs(data["right_track_actual_kmh"]))
+        pwm_mag = max(abs(data["left_track_pwm"]), abs(data["right_track_pwm"]))
+
+        if target_mag < 0.10:
+            self.track_samples.clear()
+            self.track_advice_label.setText(
+                "当前没有履带目标。建议先点“低速起步 0.3”，只改一个参数后重复同一个测试。"
+            )
+            self.track_advice_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+            return
+
+        self.track_samples.append((
+            now,
+            data["left_track_target_kmh"], data["left_track_actual_kmh"], data["left_track_pwm"],
+            data["right_track_target_kmh"], data["right_track_actual_kmh"], data["right_track_pwm"],
+        ))
+        recent = [sample for sample in self.track_samples if now - sample[0] <= 2.5]
+        if len(recent) < 4:
+            self.track_advice_label.setText("正在收集履带响应数据……保持同一个测试输入 1~2 秒。")
+            self.track_advice_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+            return
+
+        def avg(values):
+            return sum(values) / len(values)
+
+        avg_lt = avg(abs(s[1]) for s in recent)
+        avg_la = avg(abs(s[2]) for s in recent)
+        avg_lp = avg(abs(s[3]) for s in recent)
+        avg_rt = avg(abs(s[4]) for s in recent)
+        avg_ra = avg(abs(s[5]) for s in recent)
+        avg_rp = avg(abs(s[6]) for s in recent)
+        avg_target = max((avg_lt + avg_rt) * 0.5, 0.001)
+        avg_actual = (avg_la + avg_ra) * 0.5
+        avg_pwm = (avg_lp + avg_rp) * 0.5
+        error_ratio = (avg_target - avg_actual) / avg_target
+        side_diff = abs(avg_la - avg_ra)
+
+        if avg_actual < 0.08 and avg_pwm > 180:
+            advice = "PWM 已经很大但履带几乎不动：优先查机械阻力、打齿、电机供电和编码器方向，不建议继续猛加参数。"
+            color = RED
+        elif avg_actual < 0.08:
+            advice = "目标存在但履带基本没起步：小步增加 TRACK_FF_KS_START，每次 +5 左右，直到能稳定破静摩擦。"
+            color = YELLOW
+        elif target_mag <= 0.7 and error_ratio > 0.35:
+            advice = "低速能动但明显跟不上：先加 TRACK_FF_KS_RUN；如果各速度都偏低，再加 TRACK_FF_KV。"
+            color = YELLOW
+        elif error_ratio > 0.25:
+            advice = "中速/高速整体偏慢：优先增加 TRACK_FF_KV；若只是刚起步慢，再小幅增加 TRACK_FF_KA。"
+            color = YELLOW
+        elif error_ratio < -0.25:
+            advice = "实际速度明显高于目标：降低 TRACK_FF_KS_RUN 或 TRACK_FF_KV；如果是刚启动猛冲，降低 KS_START 或 KA。"
+            color = YELLOW
+        elif side_diff > max(0.20, avg_target * 0.35):
+            advice = "左右实际速度差比较大：先比较左右机械阻力、编码器方向和接线；参数暂时不要用单边误差硬补。"
+            color = YELLOW
+        elif avg_pwm > 220:
+            advice = "跟随基本可以但 PWM 接近饱和：负载偏重，注意 TB6612/电机发热；参数余量不多。"
+            color = YELLOW
+        else:
+            advice = "这组输入下响应基本健康：若仍觉得手感慢，再小幅调 KA/KP；若要保存参数，确认多跑几次后再 save。"
+            color = GREEN
+
+        self.track_advice_label.setText(advice)
+        self.track_advice_label.setStyleSheet(f"color: {color}; font-size: 10px;")
 
     def update_telemetry_ui(self, data):
         self.telemetry_labels["CHASSIS_Y"].setText(f"{data['chassis_yaw_deg']:+.2f}°")
@@ -1587,6 +1873,16 @@ class QConsoleMainWindow(QMainWindow):
         self.telemetry_labels["GUN_P"].setText(f"{data['gun_pitch_deg']:+.2f}°")
         self.telemetry_labels["TARGET_Y"].setText(f"{data['target_yaw_deg']:+.2f}°")
         self.telemetry_labels["TARGET_P"].setText(f"{data['target_pitch_deg']:+.2f}°")
+        if hasattr(self, "track_telemetry_labels"):
+            self.track_telemetry_labels["LT_TGT"].setText(f"{data['left_track_target_kmh']:+.2f}")
+            self.track_telemetry_labels["LT_ACT"].setText(f"{data['left_track_actual_kmh']:+.2f}")
+            self.track_telemetry_labels["LT_ERR"].setText(f"{data['left_track_error_kmh']:+.2f}")
+            self.track_telemetry_labels["LT_PWM"].setText(f"{data['left_track_pwm']:+.0f}")
+            self.track_telemetry_labels["RT_TGT"].setText(f"{data['right_track_target_kmh']:+.2f}")
+            self.track_telemetry_labels["RT_ACT"].setText(f"{data['right_track_actual_kmh']:+.2f}")
+            self.track_telemetry_labels["RT_ERR"].setText(f"{data['right_track_error_kmh']:+.2f}")
+            self.track_telemetry_labels["RT_PWM"].setText(f"{data['right_track_pwm']:+.0f}")
+            self.update_track_advice(data)
 
     def update_parameter_row(self, name, value, lo, hi):
         if name in self.parameter_rows:
@@ -1724,20 +2020,55 @@ class QConsoleMainWindow(QMainWindow):
                 self.ui_queue.put(("log", f"正在连接：{device.name} {device.address}\n"))
                 async with BleakClient(device) as client:
                     self.ui_queue.put(("status", "已连接"))
-                    self.ui_queue.put(("log", "BLE 已连接，开始以 50Hz 发送控制输入。\n"))
+                    self.ui_queue.put(("log", "BLE 已连接，正在等待 ESP32 应用层响应。\n"))
+                    self.device_response_event.clear()
 
                     def on_notify(_, data):
-                        self.ui_queue.put(("rx", data.decode(errors="replace")))
+                        text = data.decode(errors="replace")
+                        if text:
+                            self.device_response_event.set()
+                        if text and not self.device_responsive:
+                            self.device_responsive = True
+                            self.ui_queue.put(("status", "已响应"))
+                            if not self.device_ready_logged:
+                                self.device_ready_logged = True
+                                self.ui_queue.put(("log", "已收到 ESP32 回包，控制链路可用。\n"))
+                        if text:
+                            self.ui_queue.put(("rx", text))
 
                     await client.start_notify(TX_UUID, on_notify)
+                    await asyncio.sleep(0.30)
+                    self.ui_queue.put(("status", "等待响应"))
                     await client.write_gatt_char(RX_UUID, b"get\n", response=False)
 
+                    handshake_deadline = time.monotonic() + 1.8
+                    while (
+                        not self.stop_event.is_set()
+                        and client.is_connected
+                        and not self.device_response_event.is_set()
+                        and time.monotonic() < handshake_deadline
+                    ):
+                        await asyncio.sleep(0.05)
+
+                    if not self.device_response_event.is_set():
+                        self.ui_queue.put((
+                            "log",
+                            "警告：BLE 已连接，但 1.8 秒内没有收到 ESP32 回包；暂缓 50Hz 控制包，只发送手动命令。\n",
+                        ))
+
+                    last_probe_at = 0.0
                     while not self.stop_event.is_set() and client.is_connected:
-                        await client.write_gatt_char(RX_UUID, self.get_latest_pad_command().encode(), response=False)
                         while True:
                             try: cmd = self.command_queue.get_nowait()
                             except queue.Empty: break
                             await client.write_gatt_char(RX_UUID, cmd.encode(), response=False)
+                            await asyncio.sleep(0.03)
+
+                        if self.device_response_event.is_set() and self.pad_stream_enabled:
+                            await client.write_gatt_char(RX_UUID, self.get_latest_pad_command().encode(), response=False)
+                        elif time.monotonic() - last_probe_at >= 1.0:
+                            last_probe_at = time.monotonic()
+                            await client.write_gatt_char(RX_UUID, b"get\n", response=False)
                         await asyncio.sleep(0.02)
                 self.ui_queue.put(("status", "连接断开"))
             except Exception as exc:
