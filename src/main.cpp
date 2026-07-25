@@ -6,8 +6,6 @@
 #include <ESP32Servo.h>
 #include <SimpleFOC.h>
 #include <driver/pcnt.h>
-#include <Preferences.h>
-#include <NimBLEDevice.h>
 #include <string>
 
 // ==========================================
@@ -32,13 +30,6 @@ DebugChannel currentChannel = CHASSIS_ONLY; // <-- [在此切换频道]
 namespace Config {
     // [通讯配置]
     const char* XBOX_MAC = "28:ea:0b:d9:0b:9f"; // 手柄蓝牙MAC地址
-    const bool PC_DEBUG_MODE = true;             // true: PC BLE 键鼠调试；false: Xbox 手柄
-    const char* DEBUG_BLE_NAME = "ChieftainMK10-Debug";
-    const char* DEBUG_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-    const char* DEBUG_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-    const char* DEBUG_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
-    const uint32_t DEBUG_INPUT_TIMEOUT_MS = 350; // PC 输入包超时后停车
-    const uint32_t DEBUG_TELEMETRY_INTERVAL_MS = 100; // 10Hz，避免遥测通知阻塞控制循环
 
     // [I2C 端口分配]
     const uint8_t I2C_FOC_SDA = 17, I2C_FOC_SCL = 16; // 磁编码器(AS5600)总线
@@ -148,6 +139,11 @@ namespace Config {
     const uint8_t SERVO_PIN = 15;           // 俯仰舵机引脚
     const uint8_t FOC_PWM_A = 19, FOC_PWM_B = 18, FOC_PWM_C = 5; // 无刷驱动引脚
     const float REAL_TURRET_VEL = 22.5f;    // 真车转塔速度 (deg/s)
+    const float YAW_OUTER_KP = 2.2f;
+    const float YAW_OUTER_KD = 0.5f;
+    const float YAW_INNER_KP = 0.18f;
+    const float YAW_INNER_KI = 0.01f;
+    const float YAW_INNER_KD = 0.002f;
     const float YAW_OUTER_RATE_MAX = 25.0f; // yaw 外环最大目标角速度，略高于真车满速避免追不上手柄目标
     const float YAW_VOLTAGE_MAX = 6.0f;     // 给 SimpleFOC torque/voltage 目标的总限幅
     const float YAW_CHASSIS_FF_GAIN = 0.6f; // 底盘 yaw 角速度前馈增益
@@ -177,155 +173,6 @@ namespace Config {
     const uint8_t AS5600_ADDR = 0x36;
     const uint8_t AS5600_ANGLE_REG = 0x0C;
     const uint32_t VBAT_SAMPLE_MS = 100;          // 电池电压采样周期
-}
-
-namespace Tune {
-    float realAccel = Config::REAL_ACCEL;
-    float realBrake = Config::REAL_BRAKE;
-    float linearJerkAccel = Config::LINEAR_JERK_ACCEL;
-    float linearJerkBrake = Config::LINEAR_JERK_BRAKE;
-
-    float trackFfKsStart = Config::TRACK_FF_KS_START;
-    float trackFfKsRun = Config::TRACK_FF_KS_RUN;
-    float trackFfKv = Config::TRACK_FF_KV;
-    float trackFfKa = Config::TRACK_FF_KA;
-    float trackPiKp = Config::TRACK_PI_KP;
-    float trackPiKi = Config::TRACK_PI_KI;
-
-    float slopeGravityMax = Config::SLOPE_GRAVITY_MAX;
-    float gradePitchTau = Config::GRADE_PITCH_TAU;
-    float yawSensitivity = Config::YAW_SENSITIVITY;
-    float speedSensK = Config::SPEED_SENS_K;
-
-    float vInertiaPwmGain = Config::V_INERTIA_PWM_GAIN;
-    float vInertiaPwmMax = Config::V_INERTIA_PWM_MAX;
-    float yawInertiaPwmGain = Config::YAW_INERTIA_PWM_GAIN;
-    float yawInertiaPwmMax = Config::YAW_INERTIA_PWM_MAX;
-
-    float realTurretVel = Config::REAL_TURRET_VEL;
-    float yawOuterKp = 2.2f;
-    float yawOuterKd = 0.5f;
-    float yawInnerKp = 0.18f;
-    float yawInnerKi = 0.01f;
-    float yawInnerKd = 0.002f;
-    float yawOuterRateMax = Config::YAW_OUTER_RATE_MAX;
-    float yawVoltageMax = Config::YAW_VOLTAGE_MAX;
-    float yawChassisFfGain = Config::YAW_CHASSIS_FF_GAIN;
-    float pitchAccTau = Config::PITCH_ACC_TAU;
-    float pitchStabKp = Config::PITCH_STAB_KP;
-    float pitchStabKd = Config::PITCH_STAB_KD;
-    float pitchChassisFf = Config::PITCH_CHASSIS_FF;
-    float pitchServoRateDeadzoneDps = Config::PITCH_SERVO_RATE_DEADZONE_DPS;
-
-    struct Param {
-        const char* name;
-        const char* key;
-        float* value;
-        float defaultValue;
-        float minValue;
-        float maxValue;
-    };
-
-    Param params[] = {
-        {"REAL_ACCEL", "racc", &realAccel, Config::REAL_ACCEL, 0.0f, 12.0f},
-        {"REAL_BRAKE", "rbrk", &realBrake, Config::REAL_BRAKE, 0.0f, 25.0f},
-        {"LINEAR_JERK_ACCEL", "ljacc", &linearJerkAccel, Config::LINEAR_JERK_ACCEL, 0.0f, 8.0f},
-        {"LINEAR_JERK_BRAKE", "ljbrk", &linearJerkBrake, Config::LINEAR_JERK_BRAKE, 0.0f, 20.0f},
-
-        {"TRACK_FF_KS_START", "tksst", &trackFfKsStart, Config::TRACK_FF_KS_START, 0.0f, 160.0f},
-        {"TRACK_FF_KS_RUN", "tksrn", &trackFfKsRun, Config::TRACK_FF_KS_RUN, 0.0f, 120.0f},
-        {"TRACK_FF_KV", "trkkv", &trackFfKv, Config::TRACK_FF_KV, 0.0f, 20.0f},
-        {"TRACK_FF_KA", "trkka", &trackFfKa, Config::TRACK_FF_KA, 0.0f, 20.0f},
-        {"TRACK_PI_KP", "tpikp", &trackPiKp, Config::TRACK_PI_KP, 0.0f, 12.0f},
-        {"TRACK_PI_KI", "tpiki", &trackPiKi, Config::TRACK_PI_KI, 0.0f, 6.0f},
-
-        {"SLOPE_GRAVITY_MAX", "slpmax", &slopeGravityMax, Config::SLOPE_GRAVITY_MAX, 0.0f, 40.0f},
-        {"GRADE_PITCH_TAU", "grtau", &gradePitchTau, Config::GRADE_PITCH_TAU, 0.02f, 3.0f},
-        {"YAW_SENSITIVITY", "yawsens", &yawSensitivity, Config::YAW_SENSITIVITY, 0.0f, 80.0f},
-        {"SPEED_SENS_K", "spdk", &speedSensK, Config::SPEED_SENS_K, 0.0f, 1.0f},
-
-        {"V_INERTIA_PWM_GAIN", "vign", &vInertiaPwmGain, Config::V_INERTIA_PWM_GAIN, -1.0f, 1.0f},
-        {"V_INERTIA_PWM_MAX", "vimax", &vInertiaPwmMax, Config::V_INERTIA_PWM_MAX, 0.0f, 120.0f},
-        {"YAW_INERTIA_PWM_GAIN", "yign", &yawInertiaPwmGain, Config::YAW_INERTIA_PWM_GAIN, -1.0f, 1.0f},
-        {"YAW_INERTIA_PWM_MAX", "yimax", &yawInertiaPwmMax, Config::YAW_INERTIA_PWM_MAX, 0.0f, 120.0f},
-
-        {"REAL_TURRET_VEL", "rtvel", &realTurretVel, Config::REAL_TURRET_VEL, 1.0f, 60.0f},
-        {"YAW_OUTER_KP", "yokp", &yawOuterKp, 2.2f, 0.0f, 20.0f},
-        {"YAW_OUTER_KD", "yokd", &yawOuterKd, 0.5f, 0.0f, 10.0f},
-        {"YAW_INNER_KP", "yikp", &yawInnerKp, 0.18f, 0.0f, 5.0f},
-        {"YAW_INNER_KI", "yiki", &yawInnerKi, 0.01f, 0.0f, 2.0f},
-        {"YAW_INNER_KD", "yikd", &yawInnerKd, 0.002f, 0.0f, 1.0f},
-        {"YAW_OUTER_RATE_MAX", "yomax", &yawOuterRateMax, Config::YAW_OUTER_RATE_MAX, 1.0f, 80.0f},
-        {"YAW_VOLTAGE_MAX", "yvmax", &yawVoltageMax, Config::YAW_VOLTAGE_MAX, 1.0f, 12.0f},
-        {"YAW_CHASSIS_FF_GAIN", "yff", &yawChassisFfGain, Config::YAW_CHASSIS_FF_GAIN, -2.0f, 2.0f},
-        {"PITCH_ACC_TAU", "ptau", &pitchAccTau, Config::PITCH_ACC_TAU, 0.02f, 5.0f},
-        {"PITCH_STAB_KP", "pkp", &pitchStabKp, Config::PITCH_STAB_KP, 0.0f, 250.0f},
-        {"PITCH_STAB_KD", "pkd", &pitchStabKd, Config::PITCH_STAB_KD, -5.0f, 5.0f},
-        {"PITCH_CHASSIS_FF", "pff", &pitchChassisFf, Config::PITCH_CHASSIS_FF, -3.0f, 3.0f},
-        {"PITCH_SERVO_RATE_DEADZONE_DPS", "pdz", &pitchServoRateDeadzoneDps, Config::PITCH_SERVO_RATE_DEADZONE_DPS, 0.0f, 10.0f},
-    };
-
-    const size_t PARAM_COUNT = sizeof(params) / sizeof(params[0]);
-
-    Param* findParam(const String& rawName) {
-        String name = rawName;
-        name.trim();
-        name.toUpperCase();
-        for (size_t i = 0; i < PARAM_COUNT; ++i) {
-            if (name.equals(params[i].name)) return &params[i];
-        }
-        return nullptr;
-    }
-
-    bool setParam(const String& name, float value, String& response) {
-        Param* param = findParam(name);
-        if (!param || !isfinite(value)) {
-            response = "ERR unknown_or_invalid_param\n";
-            return false;
-        }
-
-        float clamped = constrain(value, param->minValue, param->maxValue);
-        *(param->value) = clamped;
-        response = "OK ";
-        response += param->name;
-        response += "=";
-        response += String(clamped, 6);
-        if (clamped != value) response += " CLAMPED";
-        response += "\n";
-        return true;
-    }
-
-    void appendList(String& out) {
-        for (size_t i = 0; i < PARAM_COUNT; ++i) {
-            out += params[i].name;
-            out += "=";
-            out += String(*(params[i].value), 6);
-            out += " [";
-            out += String(params[i].minValue, 3);
-            out += ",";
-            out += String(params[i].maxValue, 3);
-            out += "]\n";
-        }
-    }
-
-    void resetDefaults() {
-        for (size_t i = 0; i < PARAM_COUNT; ++i) {
-            *(params[i].value) = params[i].defaultValue;
-        }
-    }
-
-    void load(Preferences& prefs) {
-        for (size_t i = 0; i < PARAM_COUNT; ++i) {
-            *(params[i].value) = prefs.getFloat(params[i].key, params[i].defaultValue);
-            *(params[i].value) = constrain(*(params[i].value), params[i].minValue, params[i].maxValue);
-        }
-    }
-
-    void save(Preferences& prefs) {
-        for (size_t i = 0; i < PARAM_COUNT; ++i) {
-            prefs.putFloat(params[i].key, *(params[i].value));
-        }
-    }
 }
 
 portMUX_TYPE turretStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -359,19 +206,19 @@ public:
     CustomPID outer; CustomPID inner; float ff_gain;
     CascadePID(CustomPID out, CustomPID in, float ff = 0.0f) : outer(out), inner(in), ff_gain(ff) {}
     float calculate(float posRef, float posFdb, float velFdb, float chassisVel, float dt) {
-        outer.kp = Tune::yawOuterKp;
-        outer.kd = Tune::yawOuterKd;
-        outer.maxOut = Tune::yawOuterRateMax;
-        inner.kp = Tune::yawInnerKp;
-        inner.ki = Tune::yawInnerKi;
-        inner.kd = Tune::yawInnerKd;
-        inner.maxOut = Tune::yawVoltageMax;
-        ff_gain = Tune::yawChassisFfGain;
+        outer.kp = Config::YAW_OUTER_KP;
+        outer.kd = Config::YAW_OUTER_KD;
+        outer.maxOut = Config::YAW_OUTER_RATE_MAX;
+        inner.kp = Config::YAW_INNER_KP;
+        inner.ki = Config::YAW_INNER_KI;
+        inner.kd = Config::YAW_INNER_KD;
+        inner.maxOut = Config::YAW_VOLTAGE_MAX;
+        ff_gain = Config::YAW_CHASSIS_FF_GAIN;
         float targetVel = outer.calculate(posRef, posFdb, dt);
         float innerOut = inner.calculate(targetVel, velFdb, dt);
         return constrain(innerOut + (ff_gain * chassisVel),
-                         -Tune::yawVoltageMax,
-                         Tune::yawVoltageMax);
+                         -Config::YAW_VOLTAGE_MAX,
+                         Config::YAW_VOLTAGE_MAX);
     }
     void reset() { outer.reset(); inner.reset(); }
 };
@@ -428,10 +275,10 @@ public:
 
         float ff = 0.0f;
         if (targetActive) {
-            float staticFf = startBoostActive ? Tune::trackFfKsStart : Tune::trackFfKsRun;
+            float staticFf = startBoostActive ? Config::TRACK_FF_KS_START : Config::TRACK_FF_KS_RUN;
             ff = (staticFf * dir) +
-                 (Tune::trackFfKv * target) +
-                 (Tune::trackFfKa * filteredTargetAccel);
+                 (Config::TRACK_FF_KV * target) +
+                 (Config::TRACK_FF_KA * filteredTargetAccel);
         }
         lastDir = targetActive ? dir : 0.0f;
 
@@ -443,8 +290,8 @@ public:
         }
         integral = constrain(integral, -Config::TRACK_PI_MAX_I, Config::TRACK_PI_MAX_I);
 
-        float correction = constrain((Tune::trackPiKp * error) +
-                                     (Tune::trackPiKi * integral),
+        float correction = constrain((Config::TRACK_PI_KP * error) +
+                                     (Config::TRACK_PI_KI * integral),
                                      -Config::TRACK_PI_MAX_CORRECTION,
                                      Config::TRACK_PI_MAX_CORRECTION);
 
@@ -703,10 +550,10 @@ private:
         }
 
         return constrain(-Config::V_INERTIA_PWM_SIGN *
-                         Tune::vInertiaPwmGain *
+                        Config::V_INERTIA_PWM_GAIN *
                          effectiveAlpha,
-                         -Tune::vInertiaPwmMax,
-                         Tune::vInertiaPwmMax);
+                        -Config::V_INERTIA_PWM_MAX,
+                        Config::V_INERTIA_PWM_MAX);
     }
 
     float calculateYawInertiaPwm(float yawRateDeg, float dt) {
@@ -735,10 +582,10 @@ private:
         }
 
         return constrain(-Config::YAW_INERTIA_PWM_SIGN *
-                         Tune::yawInertiaPwmGain *
+                        Config::YAW_INERTIA_PWM_GAIN *
                          effectiveAlpha,
-                         -Tune::yawInertiaPwmMax,
-                         Tune::yawInertiaPwmMax);
+                        -Config::YAW_INERTIA_PWM_MAX,
+                        Config::YAW_INERTIA_PWM_MAX);
     }
 
     float updateGradePitch(float pitchAngleDeg, float dt) {
@@ -748,7 +595,7 @@ private:
             return gradePitchDeg;
         }
 
-        float gradeBlend = dt / (Tune::gradePitchTau + dt);
+        float gradeBlend = dt / (Config::GRADE_PITCH_TAU + dt);
         gradePitchDeg += gradeBlend * (pitchAngleDeg - gradePitchDeg);
         return gradePitchDeg;
     }
@@ -797,9 +644,9 @@ public:
         float eff_brake    = brakeSmoother.update(raw_brake, dt);
 
         // 2. 计算各独立作用力（换算为加速度，单位 km/h/s）
-        float force_engine = eff_throttle * Tune::realAccel * desiredDir;
+        float force_engine = eff_throttle * Config::REAL_ACCEL * desiredDir;
 
-        float force_brake = eff_brake * Tune::realBrake;
+        float force_brake = eff_brake * Config::REAL_BRAKE;
 
         // 阻力：始终与当前运动方向相反
         float resDir = (v_real > 0.1f) ? 1.0f : ((v_real < -0.1f) ? -1.0f : (v_real / 0.1f));
@@ -808,7 +655,7 @@ public:
         float force_resist = -(airResist + rollResist) * resDir;
 
         // 坡度重力分量
-        float force_slope = -Tune::slopeGravityMax * sin(gradePitch * DEG_TO_RAD);
+        float force_slope = -Config::SLOPE_GRAVITY_MAX * sin(gradePitch * DEG_TO_RAD);
 
         // 3. 施加刹车力的方向判定
         // 刹车力是没有主动方向的，它只能去“抵消”当前的速度。
@@ -831,7 +678,7 @@ public:
 
         // 5. jerk 限制后的实际纵向加速度。持续加速时车身持续抬头/低头，而不是只在起步瞬间响应。
         bool accelerationBuilds = (a_net * longitudinalAccel >= 0.0f) && (abs(a_net) > abs(longitudinalAccel));
-        float jerkLimit = accelerationBuilds ? Tune::linearJerkAccel : Tune::linearJerkBrake;
+        float jerkLimit = accelerationBuilds ? Config::LINEAR_JERK_ACCEL : Config::LINEAR_JERK_BRAKE;
         longitudinalAccel = moveToward(longitudinalAccel, a_net, jerkLimit * dt);
         if (abs(a_net) < 0.02f && abs(longitudinalAccel) < 0.02f) longitudinalAccel = 0.0f;
 
@@ -853,7 +700,7 @@ public:
         float joyX_squared = copysign(joyX_adj * joyX_adj, joyX_adj); 
         
         // 随速感应灵敏度
-        float dynamic_sens = Tune::yawSensitivity / (1.0f + abs(v_real) * Tune::speedSensK);
+        float dynamic_sens = Config::YAW_SENSITIVITY / (1.0f + abs(v_real) * Config::SPEED_SENS_K);
         
         // 目标自转速度
         float target_spin_v = joyX_squared * dynamic_sens;
@@ -937,29 +784,6 @@ public:
 // ==========================================
 // 5. 炮塔双稳系统 (22.5°/s 现实限速)
 // ==========================================
-struct TurretTelemetry {
-    float chassisYawDeg = 0.0f;
-    float chassisPitchDeg = 0.0f;
-    float turretWorldYawDeg = 0.0f;
-    float turretRelativeYawDeg = 0.0f;
-    float gunPitchDeg = 0.0f;
-    float targetYawDeg = 0.0f;
-    float targetPitchDeg = 0.0f;
-    float yawVoltage = 0.0f;
-    float servoCommandDeg = 90.0f;
-    float leftTrackTargetKmh = 0.0f;
-    float leftTrackActualKmh = 0.0f;
-    float leftTrackPwm = 0.0f;
-    float rightTrackTargetKmh = 0.0f;
-    float rightTrackActualKmh = 0.0f;
-    float rightTrackPwm = 0.0f;
-    bool leftTrackStalled = false;
-    bool rightTrackStalled = false;
-    bool stabilizationEnabled = false;
-    bool imuHealthy = false;
-    bool yawSensorHealthy = false;
-};
-
 // 炮塔部分分成三层：
 // 1. 读取 IMU/编码器，得到底盘姿态、炮管姿态和炮塔方位；
 // 2. 处理玩家输入，维护“世界系目标朝向”和“炮管目标俯仰”；
@@ -1151,9 +975,9 @@ public:
         : mpuC(c), mpuT(t), yawMotor(7), 
           yawDriver(Config::FOC_PWM_A, Config::FOC_PWM_B, Config::FOC_PWM_C),
           yawSensor(AS5600_I2C),
-          yawPID(CustomPID(2.2, 0.0, 0.5, 0.0, Tune::yawOuterRateMax),
-                 CustomPID(0.18, 0.01, 0.002, 5.0, Tune::yawVoltageMax),
-                 Tune::yawChassisFfGain) {}
+          yawPID(CustomPID(Config::YAW_OUTER_KP, 0.0f, Config::YAW_OUTER_KD, 0.0f, Config::YAW_OUTER_RATE_MAX),
+                 CustomPID(Config::YAW_INNER_KP, Config::YAW_INNER_KI, Config::YAW_INNER_KD, 5.0f, Config::YAW_VOLTAGE_MAX),
+                 Config::YAW_CHASSIS_FF_GAIN) {}
 
     bool init() {
         ESP32PWM::allocateTimer(2);
@@ -1259,7 +1083,7 @@ public:
         setImuHealthy(true);
 
         // 2. 俯仰角 (Pitch) 互补滤波：陀螺仪管快速稳定，加速度计只慢速纠漂。
-        float pitchAccelBlend = dt / (Tune::pitchAccTau + dt);
+        float pitchAccelBlend = dt / (Config::PITCH_ACC_TAU + dt);
         float pitchGyroPrediction = pitchFiltered + t_gx_cal_deg * dt;
         pitchFiltered = (1.0f - pitchAccelBlend) * pitchGyroPrediction + pitchAccelBlend * pitchAcc;
 
@@ -1336,13 +1160,13 @@ public:
             if (abs(joyX) > 0.15f) {
                 // 计算有效推力比例：0.15时为0，1.0时为1.0
                 float effectiveX = copysign((abs(joyX) - 0.15f) / 0.85f, joyX);
-                savedYawCont += effectiveX * Tune::realTurretVel * dt;
+                savedYawCont += effectiveX * Config::REAL_TURRET_VEL * dt;
             }
             if (abs(joyY) > 0.15f) {
                 // 使用同样的线性映射：消除 0.15 处的突变跳变
                 float effectiveY = copysign((abs(joyY) - 0.15f) / 0.85f, joyY);
                 // 注意：joyY 通常向上推是负值，向下推是正值，请根据你的操作习惯确认符号
-                savedPitch = constrain(savedPitch - effectiveY * Tune::realTurretVel * dt, Config::GUN_PITCH_MIN, Config::GUN_PITCH_MAX);
+                savedPitch = constrain(savedPitch - effectiveY * Config::REAL_TURRET_VEL * dt, Config::GUN_PITCH_MIN, Config::GUN_PITCH_MAX);
             }
         }
     }
@@ -1361,11 +1185,11 @@ public:
         float protectedPitch = protectPitchForRearDeck(savedPitch, getTurretRelativeYawDegFromSensor());
         float pErr = protectedPitch - pitchFiltered;
         // P 负责回到目标，底盘前馈负责抵消车体点头，炮管自身角速度阻尼负责压过冲和抖动。
-        float pitchRateCmd = (pErr * Tune::pitchStabKp) -
-                             (chassisPitchRateDeg * Tune::pitchChassisFf) -
-                             (t_gx_cal_deg * Tune::pitchStabKd);
+        float pitchRateCmd = (pErr * Config::PITCH_STAB_KP) -
+                             (chassisPitchRateDeg * Config::PITCH_CHASSIS_FF) -
+                             (t_gx_cal_deg * Config::PITCH_STAB_KD);
         pitchRateCmd = constrain(pitchRateCmd, -Config::PITCH_RATE_CMD_MAX, Config::PITCH_RATE_CMD_MAX);
-        if (abs(pitchRateCmd) < Tune::pitchServoRateDeadzoneDps) {
+        if (abs(pitchRateCmd) < Config::PITCH_SERVO_RATE_DEADZONE_DPS) {
             pitchRateCmd = 0.0f;
         }
 
@@ -1385,410 +1209,16 @@ public:
     bool isReady() const { return ready; }
     bool isHealthy() const { return ready && controlSensorsHealthy(); }
 
-    void getTelemetry(TurretTelemetry& out) {
-        bool imuOk, yawOk, stabilizationOn;
-        float yawVoltage;
-
-        portENTER_CRITICAL(&turretStateMux);
-        imuOk = imuHealthy;
-        yawOk = yawSensorHealthy;
-        stabilizationOn = switchState;
-        yawVoltage = pendingYawTarget;
-        portEXIT_CRITICAL(&turretStateMux);
-
-        float relativeYawDeg = 0.0f;
-        float sensorDeg = 0.0f;
-        bool yawFresh = readFreshYawSensorDeg(sensorDeg);
-        if (yawFresh) {
-            relativeYawDeg = wrapAngle180(
-                (sensorDeg - Config::TURRET_FRONT_SENSOR_OFFSET) *
-                Config::TURRET_SENSOR_SIGN
-            );
-        }
-
-        out.turretWorldYawDeg = wrapAngle180(yawContDeg);
-        out.turretRelativeYawDeg = relativeYawDeg;
-        out.chassisYawDeg = wrapAngle180(out.turretWorldYawDeg - relativeYawDeg);
-        out.chassisPitchDeg = chassisPitchFiltered;
-        out.gunPitchDeg = pitchFiltered;
-        out.targetYawDeg = wrapAngle180(savedYawCont);
-        out.targetPitchDeg = yawFresh
-            ? protectPitchForRearDeck(savedPitch, relativeYawDeg)
-            : savedPitch;
-        out.yawVoltage = yawVoltage;
-        out.servoCommandDeg = currentPitchAngle;
-        out.stabilizationEnabled = stabilizationOn;
-        out.imuHealthy = imuOk;
-        out.yawSensorHealthy = yawOk && yawFresh;
-    }
 };
 
-struct DebugControlInput {
+struct ControlInput {
     float triggerL = 0.0f;
     float triggerR = 0.0f;
     float joyLX = 0.0f;
     float joyRX = 0.0f;
     float joyRY = 0.0f;
     bool aPressed = false;
-    bool emergencyStop = false;
-    uint32_t lastPacketMs = 0;
-    bool active = false;
 };
-
-struct DebugTrackTestInput {
-    float leftTargetKmh = 0.0f;
-    float rightTargetKmh = 0.0f;
-    uint32_t untilMs = 0;
-    bool active = false;
-};
-
-class PcDebugBridge {
-private:
-    Preferences prefs;
-    NimBLECharacteristic* txCharacteristic = nullptr;
-    DebugControlInput input;
-    DebugTrackTestInput trackTest;
-    portMUX_TYPE inputMux = portMUX_INITIALIZER_UNLOCKED;
-    SemaphoreHandle_t txMutex = nullptr;
-    QueueHandle_t telemetryQueue = nullptr;
-    TaskHandle_t telemetryTaskHandle = nullptr;
-    volatile bool connected = false;
-    bool emergencyStopLatched = false;
-
-    float readKeyValue(const String& lowerCommand, const char* key, float fallback) {
-        String needle = String(key) + "=";
-        int start = lowerCommand.indexOf(needle);
-        if (start < 0) return fallback;
-        start += needle.length();
-        int end = lowerCommand.indexOf(' ', start);
-        if (end < 0) end = lowerCommand.length();
-        return lowerCommand.substring(start, end).toFloat();
-    }
-
-    void updatePadInput(const String& command) {
-        String lower = command;
-        lower.toLowerCase();
-
-        DebugControlInput next;
-        next.triggerL = constrain(readKeyValue(lower, "tl", 0.0f), 0.0f, 1.0f);
-        next.triggerR = constrain(readKeyValue(lower, "tr", 0.0f), 0.0f, 1.0f);
-        next.joyLX = constrain(readKeyValue(lower, "jlx", 0.0f), -1.0f, 1.0f);
-        next.joyRX = constrain(readKeyValue(lower, "jrx", 0.0f), -1.0f, 1.0f);
-        next.joyRY = constrain(readKeyValue(lower, "jry", 0.0f), -1.0f, 1.0f);
-        next.aPressed = readKeyValue(lower, "a", 0.0f) >= 0.5f;
-        next.emergencyStop = emergencyStopLatched;
-        next.lastPacketMs = millis();
-        next.active = true;
-
-        portENTER_CRITICAL(&inputMux);
-        input = next;
-        portEXIT_CRITICAL(&inputMux);
-    }
-
-    void updateTrackTestInput(const String& command) {
-        String lower = command;
-        lower.toLowerCase();
-
-        DebugTrackTestInput next;
-        next.leftTargetKmh = constrain(readKeyValue(lower, "lt", 0.0f), -12.0f, 12.0f);
-        next.rightTargetKmh = constrain(readKeyValue(lower, "rt", 0.0f), -12.0f, 12.0f);
-        uint32_t durationMs = (uint32_t)constrain(readKeyValue(lower, "ms", 2000.0f), 100.0f, 10000.0f);
-        next.untilMs = millis() + durationMs;
-        next.active = true;
-
-        portENTER_CRITICAL(&inputMux);
-        trackTest = next;
-        input = DebugControlInput();
-        portEXIT_CRITICAL(&inputMux);
-
-        String response = "OK track lt=";
-        response += String(next.leftTargetKmh, 2);
-        response += " rt=";
-        response += String(next.rightTargetKmh, 2);
-        response += " ms=";
-        response += String(durationMs);
-        response += "\n";
-        notifyText(response);
-    }
-
-    void stopTrackTestInput() {
-        portENTER_CRITICAL(&inputMux);
-        trackTest = DebugTrackTestInput();
-        portEXIT_CRITICAL(&inputMux);
-        notifyText("OK track_stop\n");
-    }
-
-    void notifyBleText(const String& text) {
-        if (!txCharacteristic || !connected) return;
-        if (txMutex && xSemaphoreTake(txMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-
-        const size_t chunkSize = 18; // 兼容 BLE 默认 23-byte MTU（通知有效负载通常为 20 bytes）
-        size_t offset = 0;
-        while (offset < text.length()) {
-            size_t end = offset + chunkSize;
-            if (end > text.length()) end = text.length();
-            String chunk = text.substring(offset, end);
-            txCharacteristic->setValue(chunk.c_str());
-            txCharacteristic->notify();
-            offset += chunk.length();
-            delay(8); // Windows/Bleak 对连续 notify 比较敏感，稍微放慢可避免长响应丢包
-        }
-        if (txMutex) xSemaphoreGive(txMutex);
-    }
-
-    void notifyText(const String& text) {
-        Serial.print("[PCDBG] ");
-        Serial.print(text);
-        notifyBleText(text);
-    }
-
-    void notifyTelemetryNow(const TurretTelemetry& telemetry) {
-        String out;
-        out.reserve(260);
-        out += "TEL cy="; out += String(telemetry.chassisYawDeg, 2);
-        out += " cp="; out += String(telemetry.chassisPitchDeg, 2);
-        out += " ty="; out += String(telemetry.turretWorldYawDeg, 2);
-        out += " tr="; out += String(telemetry.turretRelativeYawDeg, 2);
-        out += " gp="; out += String(telemetry.gunPitchDeg, 2);
-        out += " yt="; out += String(telemetry.targetYawDeg, 2);
-        out += " pt="; out += String(telemetry.targetPitchDeg, 2);
-        out += " yv="; out += String(telemetry.yawVoltage, 3);
-        out += " sv="; out += String(telemetry.servoCommandDeg, 2);
-        out += " ltt="; out += String(telemetry.leftTrackTargetKmh, 2);
-        out += " lta="; out += String(telemetry.leftTrackActualKmh, 2);
-        out += " ltp="; out += String(telemetry.leftTrackPwm, 1);
-        out += " rtt="; out += String(telemetry.rightTrackTargetKmh, 2);
-        out += " rta="; out += String(telemetry.rightTrackActualKmh, 2);
-        out += " rtp="; out += String(telemetry.rightTrackPwm, 1);
-        out += " lts="; out += (telemetry.leftTrackStalled ? "1" : "0");
-        out += " rts="; out += (telemetry.rightTrackStalled ? "1" : "0");
-        out += " st="; out += (telemetry.stabilizationEnabled ? "1" : "0");
-        out += " ih="; out += (telemetry.imuHealthy ? "1" : "0");
-        out += " yh="; out += (telemetry.yawSensorHealthy ? "1" : "0");
-        out += "\n";
-        notifyBleText(out);
-    }
-
-    static void telemetryTaskEntry(void* context) {
-        PcDebugBridge* bridge = static_cast<PcDebugBridge*>(context);
-        TurretTelemetry telemetry;
-        for (;;) {
-            if (xQueueReceive(bridge->telemetryQueue, &telemetry, portMAX_DELAY) == pdTRUE) {
-                bridge->notifyTelemetryNow(telemetry);
-            }
-        }
-    }
-
-    void processCommand(String command) {
-        command.trim();
-        if (command.length() == 0) return;
-
-        String lower = command;
-        lower.toLowerCase();
-        if (lower.startsWith("pad ")) {
-            updatePadInput(command);
-            return;
-        }
-        if (lower == "track stop") {
-            stopTrackTestInput();
-            return;
-        }
-        if (lower.startsWith("track ")) {
-            if (emergencyStopLatched) {
-                notifyText("ERR emergency_stop_latched\n");
-                return;
-            }
-            updateTrackTestInput(command);
-            return;
-        }
-        if (lower == "get") {
-            String out = "STATE ESTOP=";
-            out += emergencyStopLatched ? "1\n" : "0\n";
-            out += "PARAMS\n";
-            Tune::appendList(out);
-            out += "END_PARAMS\n";
-            notifyText(out);
-            return;
-        }
-        if (lower == "stop") {
-            emergencyStopLatched = true;
-            portENTER_CRITICAL(&inputMux);
-            input = DebugControlInput();
-            trackTest = DebugTrackTestInput();
-            input.emergencyStop = true;
-            input.active = true;
-            input.lastPacketMs = millis();
-            portEXIT_CRITICAL(&inputMux);
-            notifyText("OK emergency_stop_latched\n");
-            return;
-        }
-        if (lower == "arm") {
-            emergencyStopLatched = false;
-            portENTER_CRITICAL(&inputMux);
-            input = DebugControlInput();
-            input.active = true;
-            input.lastPacketMs = millis();
-            portEXIT_CRITICAL(&inputMux);
-            notifyText("OK emergency_stop_released\n");
-            return;
-        }
-        if (lower == "save") {
-            Tune::save(prefs);
-            notifyText("OK saved\n");
-            return;
-        }
-        if (lower == "load") {
-            Tune::load(prefs);
-            notifyText("OK loaded\n");
-            return;
-        }
-        if (lower == "defaults") {
-            Tune::resetDefaults();
-            notifyText("OK defaults_loaded_not_saved\n");
-            return;
-        }
-        if (lower == "help") {
-            notifyText(
-                "COMMANDS\n"
-                "pad tl=0 tr=0 jlx=0 jrx=0 jry=0 a=0\n"
-                "track lt=0 rt=0 ms=2000\n"
-                "track stop\n"
-                "get\n"
-                "set PARAM VALUE\n"
-                "save\n"
-                "load\n"
-                "defaults\n"
-                "stop\n"
-                "arm\n"
-            );
-            return;
-        }
-        if (lower.startsWith("set ")) {
-            int firstSpace = command.indexOf(' ');
-            int secondSpace = command.indexOf(' ', firstSpace + 1);
-            if (firstSpace < 0 || secondSpace < 0) {
-                notifyText("ERR usage: set PARAM VALUE\n");
-                return;
-            }
-
-            String name = command.substring(firstSpace + 1, secondSpace);
-            float value = command.substring(secondSpace + 1).toFloat();
-            String response;
-            Tune::setParam(name, value, response);
-            notifyText(response);
-            return;
-        }
-
-        notifyText("ERR unknown_command\n");
-    }
-
-public:
-    static PcDebugBridge* instance;
-
-    class ServerCallbacks : public NimBLEServerCallbacks {
-        void onConnect(NimBLEServer* server) {
-            if (PcDebugBridge::instance) {
-                PcDebugBridge::instance->connected = true;
-                PcDebugBridge::instance->notifyText("OK pc_debug_connected\n");
-            }
-        }
-
-        void onDisconnect(NimBLEServer* server) {
-            if (PcDebugBridge::instance) {
-                PcDebugBridge::instance->connected = false;
-            }
-            NimBLEDevice::startAdvertising();
-        }
-    };
-
-    class RxCallbacks : public NimBLECharacteristicCallbacks {
-        void onWrite(NimBLECharacteristic* characteristic) {
-            if (!PcDebugBridge::instance) return;
-            std::string value = characteristic->getValue();
-            String text(value.c_str());
-
-            int start = 0;
-            while (start < text.length()) {
-                int end = text.indexOf('\n', start);
-                if (end < 0) end = text.length();
-                PcDebugBridge::instance->processCommand(text.substring(start, end));
-                start = end + 1;
-            }
-        }
-    };
-
-    void begin() {
-        prefs.begin("tune", false);
-        Tune::load(prefs);
-        if (!Config::PC_DEBUG_MODE) return;
-
-        txMutex = xSemaphoreCreateMutex();
-        telemetryQueue = xQueueCreate(1, sizeof(TurretTelemetry));
-        instance = this;
-        NimBLEDevice::init(Config::DEBUG_BLE_NAME);
-        NimBLEServer* server = NimBLEDevice::createServer();
-        server->setCallbacks(new ServerCallbacks());
-
-        NimBLEService* service = server->createService(Config::DEBUG_SERVICE_UUID);
-        txCharacteristic = service->createCharacteristic(Config::DEBUG_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
-        NimBLECharacteristic* rxCharacteristic = service->createCharacteristic(
-            Config::DEBUG_RX_UUID,
-            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
-        );
-        rxCharacteristic->setCallbacks(new RxCallbacks());
-
-        service->start();
-        NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
-        advertising->addServiceUUID(Config::DEBUG_SERVICE_UUID);
-        advertising->setScanResponse(true);
-        advertising->start();
-        if (telemetryQueue) {
-            xTaskCreatePinnedToCore(
-                telemetryTaskEntry,
-                "PCDBG_Telemetry",
-                4096,
-                this,
-                1,
-                &telemetryTaskHandle,
-                1
-            );
-        }
-        LOG_ALWAYS(">>> PC debug BLE ready: %s\n", Config::DEBUG_BLE_NAME);
-    }
-
-    bool readInput(DebugControlInput& out) {
-        if (!Config::PC_DEBUG_MODE) return false;
-
-        portENTER_CRITICAL(&inputMux);
-        out = input;
-        portEXIT_CRITICAL(&inputMux);
-
-        return out.active &&
-               ((uint32_t)(millis() - out.lastPacketMs) <= Config::DEBUG_INPUT_TIMEOUT_MS);
-    }
-
-    bool readTrackTest(DebugTrackTestInput& out) {
-        if (!Config::PC_DEBUG_MODE) return false;
-
-        portENTER_CRITICAL(&inputMux);
-        out = trackTest;
-        bool expired = out.active && ((int32_t)(millis() - out.untilMs) >= 0);
-        if (expired) {
-            trackTest = DebugTrackTestInput();
-            out = trackTest;
-        }
-        portEXIT_CRITICAL(&inputMux);
-
-        return out.active;
-    }
-
-    void sendTelemetry(const TurretTelemetry& telemetry) {
-        if (!Config::PC_DEBUG_MODE || !connected || !telemetryQueue) return;
-        xQueueOverwrite(telemetryQueue, &telemetry);
-    }
-};
-
-PcDebugBridge* PcDebugBridge::instance = nullptr;
 
 // ==========================================
 // 6. 顶层统筹与任务调度
@@ -1798,12 +1228,10 @@ private:
     XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
     Adafruit_MPU6050 mpuChassis, mpuTurret;
     TankChassis chassis; TankTurret turret;
-    PcDebugBridge pcDebug;
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
     uint32_t lastControllerPacketMs = 0;
     uint32_t lastBatterySampleMs = 0;
     uint32_t lastBatteryCutoffLogMs = 0;
-    uint32_t lastTelemetryMs = 0;
     bool chassisReady = false;
     bool turretReady = false;
     float batteryVoltage = 0.0f;
@@ -1864,11 +1292,7 @@ private:
                ((uint32_t)(millis() - lastControllerPacketMs) <= Config::CONTROLLER_TIMEOUT_MS);
     }
 
-    bool readControlInput(DebugControlInput& out) {
-        if (Config::PC_DEBUG_MODE) {
-            return pcDebug.readInput(out);
-        }
-
+    bool readControlInput(ControlInput& out) {
         if (!xboxControllerHealthy()) return false;
         out.triggerL = xboxController.xboxNotif.trigLT / 1023.0f;
         out.triggerR = xboxController.xboxNotif.trigRT / 1023.0f;
@@ -1876,21 +1300,7 @@ private:
         out.joyRX = (xboxController.xboxNotif.joyRHori - 32767.5f) / 32767.5f;
         out.joyRY = (xboxController.xboxNotif.joyRVert - 32767.5f) / 32767.5f;
         out.aPressed = xboxController.xboxNotif.btnA;
-        out.lastPacketMs = millis();
-        out.active = true;
         return true;
-    }
-
-    void appendChassisTelemetry(TurretTelemetry& telemetry) const {
-        if (!chassisReady) return;
-        chassis.getTrackTelemetry(telemetry.leftTrackTargetKmh,
-                                  telemetry.leftTrackActualKmh,
-                                  telemetry.leftTrackPwm,
-                                  telemetry.leftTrackStalled,
-                                  telemetry.rightTrackTargetKmh,
-                                  telemetry.rightTrackActualKmh,
-                                  telemetry.rightTrackPwm,
-                                  telemetry.rightTrackStalled);
     }
 
 public:
@@ -1918,12 +1328,7 @@ public:
         } else {
             LOG_ALWAYS("!!! Turret unavailable; chassis control remains enabled.\n");
         }
-        pcDebug.begin();
-        if (!Config::PC_DEBUG_MODE) {
-            xboxController.begin();
-        } else {
-            LOG_ALWAYS(">>> Xbox disabled while PC_DEBUG_MODE is true.\n");
-        }
+        xboxController.begin();
         lastControllerPacketMs = 0;
 
         uint32_t now = micros();
@@ -1950,13 +1355,11 @@ public:
         if (nowMicros - lastUI >= 20000) { // 50Hz UI
             float dtUI = (nowMicros - lastUI) * 1e-6f;
             lastUI = nowMicros;
-            if (!Config::PC_DEBUG_MODE) {
-                xboxController.onLoop();
-                updateControllerPacketClock();
-            }
+            xboxController.onLoop();
+            updateControllerPacketClock();
 
-            DebugControlInput input;
-            if (turretReady && readControlInput(input) && !input.emergencyStop) {
+            ControlInput input;
+            if (turretReady && readControlInput(input)) {
                 turret.handleUI(input.aPressed, input.joyRX, input.joyRY, dtUI);
             }
         }
@@ -1971,52 +1374,25 @@ public:
                     LOG_ALWAYS("!!! Battery cutoff active: %.2fV\n", batteryVoltage);
                 }
             } else {
-                DebugTrackTestInput trackTest;
-                bool handledTrackTest = false;
-                if (chassisReady && pcDebug.readTrackTest(trackTest)) {
+                ControlInput input;
+                if (chassisReady && readControlInput(input)) {
+                    // 坡度角用于底盘动力学中的重力分量，pitch/yaw rate 用于生成虚拟旋转惯量。
+                    float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
+                    float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
                     float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
-                    chassis.processDirectTrackTargets(trackTest.leftTargetKmh,
-                                                      trackTest.rightTargetKmh,
-                                                      dtCtrl,
-                                                      pAngle);
+                    chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl, pRate, yRate, pAngle);
                     if (turretReady) turret.updateStabilization(dtCtrl);
-                    handledTrackTest = true;
-                }
 
-                DebugControlInput input;
-                if (!handledTrackTest && chassisReady && readControlInput(input)) {
-                    if (input.emergencyStop) {
-                        chassis.stop();
-                        if (turretReady) turret.enterDisconnectedState();
-                    } else {
-                        // 坡度角用于底盘动力学中的重力分量，pitch/yaw rate 用于生成虚拟旋转惯量。
-                        float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
-                        float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
-                        float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
-                        chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl, pRate, yRate, pAngle);
-                        if (turretReady) turret.updateStabilization(dtCtrl);
-
-                        static uint32_t lastBatteryWarnLogMs = 0;
-                        if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
-                            lastBatteryWarnLogMs = millis();
-                            LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
-                        }
+                    static uint32_t lastBatteryWarnLogMs = 0;
+                    if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
+                        lastBatteryWarnLogMs = millis();
+                        LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
                     }
-                } else if (!handledTrackTest) {
+                } else {
                     if (chassisReady) chassis.stop();
                     if (turretReady) turret.enterDisconnectedState();
                 }
             }
-        }
-
-        uint32_t nowMs = millis();
-        if (Config::PC_DEBUG_MODE && (chassisReady || turretReady) &&
-            (uint32_t)(nowMs - lastTelemetryMs) >= Config::DEBUG_TELEMETRY_INTERVAL_MS) {
-            lastTelemetryMs = nowMs;
-            TurretTelemetry telemetry;
-            if (turretReady) turret.getTelemetry(telemetry);
-            appendChassisTelemetry(telemetry);
-            pcDebug.sendTelemetry(telemetry);
         }
     }
 };
