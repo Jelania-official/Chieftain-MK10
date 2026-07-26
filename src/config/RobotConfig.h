@@ -3,6 +3,22 @@
 #include <Arduino.h>
 
 // ==========================================
+// 0. 固件输入模式
+// ==========================================
+// ESP32 同时编译 Xbox BLE 和 Classic BluetoothSerial 会占用大量 Flash。
+// 这里用编译期开关做“二选一”：
+// - ROBOT_INPUT_MODE_XBOX：正常遥控模式，只启用 Xbox 手柄；
+// - ROBOT_INPUT_MODE_PC_DEBUG：调车模式，只启用 PC 蓝牙串口调试工具。
+// 修改下面这一行后重新烧录即可切换模式。
+#define ROBOT_INPUT_MODE_XBOX 1
+#define ROBOT_INPUT_MODE_PC_DEBUG 2
+#define ROBOT_INPUT_MODE ROBOT_INPUT_MODE_PC_DEBUG
+
+#if ROBOT_INPUT_MODE != ROBOT_INPUT_MODE_XBOX && ROBOT_INPUT_MODE != ROBOT_INPUT_MODE_PC_DEBUG
+  #error "ROBOT_INPUT_MODE must be ROBOT_INPUT_MODE_XBOX or ROBOT_INPUT_MODE_PC_DEBUG"
+#endif
+
+// ==========================================
 // 1. 全局配置参数
 // ==========================================
 // 这个文件只放“参数”和“引脚”，不放控制逻辑。
@@ -10,6 +26,9 @@
 namespace Config {
     // ---------- 通讯 ----------
     const char* const XBOX_MAC = "28:ea:0b:d9:0b:9f"; // Xbox 手柄蓝牙 MAC 地址
+    const char* const DEBUG_BT_NAME = "ChieftainMK10-Debug"; // PC 调试模式下显示的蓝牙串口名称
+    const uint32_t DEBUG_INPUT_TIMEOUT_MS = 300;             // PC 输入超过该时间未刷新就停车
+    const uint32_t DEBUG_TELEMETRY_MS = 50;                  // PC 遥测发送周期，50ms = 20Hz
 
     // ---------- I2C 总线 ----------
     const uint8_t I2C_FOC_SDA = 17, I2C_FOC_SCL = 16; // AS5600/FOC 相关 I2C

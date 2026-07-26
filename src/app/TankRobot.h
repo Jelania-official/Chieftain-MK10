@@ -2,13 +2,18 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include <Adafruit_MPU6050.h>
 #include "config/DebugLog.h"
 #include "config/RobotConfig.h"
 #include "chassis/TankChassis.h"
 #include "turret/TankTurret.h"
 #include "ControlInput.h"
+
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
+  #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
+#elif ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+  #include "DebugLink.h"
+#endif
 
 // ==========================================
 // 6. 应用调度层
@@ -20,10 +25,15 @@
 // 3. 处理断连、电池低压、炮塔不可用等整车级状态。
 class TankRobot {
 private:
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
     XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
+#endif
     Adafruit_MPU6050 mpuChassis, mpuTurret;
     TankChassis chassis;
     TankTurret turret;
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    DebugLink debugLink;
+#endif
 
     // 各任务上一次运行时间，用 micros() 做非阻塞定时调度。
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
@@ -54,12 +64,22 @@ private:
     // 从手柄库取最近数据包时间，更新 lastControllerPacketMs。
     void updateControllerPacketClock();
 
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
     // 手柄库的 isConnected() 不是 const 成员，所以这里不能声明成 const。
     // 除了蓝牙连接状态，还要求最近收到过有效数据包。
     bool xboxControllerHealthy();
 
     // 将 Xbox 原始按键/摇杆数据归一化到 ControlInput。
-    bool readControlInput(ControlInput& out);
+    bool readXboxControlInput(ControlInput& out);
+#endif
+
+    // 按当前固件输入模式读取控制量：Xbox 正常遥控，或 PC 调试工具模拟输入。
+    bool readActiveControlInput(ControlInput& out);
+
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    // 发送整车遥测到 PC 调试工具。
+    void publishDebugTelemetry();
+#endif
 
 public:
     TankRobot();

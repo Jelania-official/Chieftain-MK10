@@ -296,6 +296,58 @@ float TankTurret::getChassisPitchAngle() {
         return chassisPitchFiltered;
     }
 
+float TankTurret::getPitchTargetDeg() const {
+        return savedPitch;
+    }
+
+float TankTurret::getPitchActualDeg() const {
+        return pitchFiltered;
+    }
+
+float TankTurret::getPitchServoDeg() const {
+        return currentPitchAngle;
+    }
+
+float TankTurret::getYawTargetDeg() const {
+        return savedYawCont;
+    }
+
+float TankTurret::getYawActualDeg() const {
+        return yawContDeg;
+    }
+
+float TankTurret::getYawRelativeDeg() {
+        return getTurretRelativeYawDegFromSensor();
+    }
+
+float TankTurret::getYawVoltageTarget() const {
+        float targetVoltage;
+        portENTER_CRITICAL(&turretStateMux);
+        targetVoltage = pendingYawTarget;
+        portEXIT_CRITICAL(&turretStateMux);
+        return targetVoltage;
+    }
+
+bool TankTurret::stabilizationActive() const {
+        return isStabilizationEnabled();
+    }
+
+bool TankTurret::imuIsHealthy() const {
+        bool healthy;
+        portENTER_CRITICAL(&turretStateMux);
+        healthy = imuHealthy;
+        portEXIT_CRITICAL(&turretStateMux);
+        return healthy;
+    }
+
+bool TankTurret::yawSensorIsHealthy() const {
+        bool healthy;
+        portENTER_CRITICAL(&turretStateMux);
+        healthy = yawSensorHealthy;
+        portEXIT_CRITICAL(&turretStateMux);
+        return healthy;
+    }
+
 // Core 0 高频入口：持续运行 SimpleFOC，并把控制线程发布的电压目标送给 yaw 电机。
 void TankTurret::runFOC() {
         if (!ready) return;

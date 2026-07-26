@@ -43,12 +43,15 @@ bool TankRobot::batteryWarning() const {
 }
 
 void TankRobot::updateControllerPacketClock() {
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
     unsigned long receivedAt = xboxController.getReceiveNotificationAt();
     if (receivedAt != 0) {
         lastControllerPacketMs = receivedAt;
     }
+#endif
 }
 
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
 bool TankRobot::xboxControllerHealthy() {
     // 有些情况下蓝牙仍显示 connected，但数据包已经停止刷新；这里同时检查包时间。
     return xboxController.isConnected() &&
@@ -56,7 +59,7 @@ bool TankRobot::xboxControllerHealthy() {
            ((uint32_t)(millis() - lastControllerPacketMs) <= Config::CONTROLLER_TIMEOUT_MS);
 }
 
-bool TankRobot::readControlInput(ControlInput& out) {
+bool TankRobot::readXboxControlInput(ControlInput& out) {
     if (!xboxControllerHealthy()) return false;
     out.triggerL = xboxController.xboxNotif.trigLT / 1023.0f;
     out.triggerR = xboxController.xboxNotif.trigRT / 1023.0f;
@@ -66,8 +69,56 @@ bool TankRobot::readControlInput(ControlInput& out) {
     out.aPressed = xboxController.xboxNotif.btnA;
     return true;
 }
+#endif
 
-TankRobot::TankRobot() : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
+bool TankRobot::readActiveControlInput(ControlInput& out) {
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    return debugLink.readInput(out);
+#elif ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
+    return readXboxControlInput(out);
+#endif
+}
+
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+void TankRobot::publishDebugTelemetry() {
+    DebugTelemetry t;
+    t.timeMs = millis();
+    t.chassisReady = chassisReady;
+    t.turretReady = turretReady;
+    t.batteryVoltage = batteryVoltage;
+    t.batteryValid = batteryValid;
+
+    if (chassisReady) {
+        chassis.getTrackTelemetry(t.leftTarget, t.leftActual, t.leftPwm, t.leftStalled,
+                                  t.rightTarget, t.rightActual, t.rightPwm, t.rightStalled);
+    }
+
+    if (turretReady) {
+        t.pitchTarget = turret.getPitchTargetDeg();
+        t.pitchActual = turret.getPitchActualDeg();
+        t.pitchServo = turret.getPitchServoDeg();
+        t.yawTarget = turret.getYawTargetDeg();
+        t.yawActual = turret.getYawActualDeg();
+        t.yawRelative = turret.getYawRelativeDeg();
+        t.yawVoltage = turret.getYawVoltageTarget();
+        t.chassisPitch = turret.getChassisPitchAngle();
+        t.chassisPitchRate = turret.getLatestChassisPitchRate();
+        t.chassisYawRate = turret.getLatestChassisYawRate();
+        t.stabilizationEnabled = turret.stabilizationActive();
+        t.imuHealthy = turret.imuIsHealthy();
+        t.yawSensorHealthy = turret.yawSensorIsHealthy();
+    }
+
+    debugLink.sendTelemetry(t, Config::DEBUG_TELEMETRY_MS);
+}
+#endif
+
+TankRobot::TankRobot()
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
+    : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
+#else
+    : turret(mpuChassis, mpuTurret) {}
+#endif
 
 void TankRobot::setup() {
     Serial.begin(921600);
@@ -87,6 +138,12 @@ void TankRobot::setup() {
         LOG_ALWAYS(">>> Battery monitor disabled; use external low-voltage alarm.\n");
     }
 
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    if (!debugLink.begin(Config::DEBUG_BT_NAME)) {
+        LOG_ALWAYS("!!! Bluetooth debug link init failed.\n");
+    }
+#endif
+
     chassis.init();
     chassisReady = true;
 
@@ -98,7 +155,9 @@ void TankRobot::setup() {
         LOG_ALWAYS("!!! Turret unavailable; chassis control remains enabled.\n");
     }
 
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
     xboxController.begin();
+#endif
     lastControllerPacketMs = 0;
 
     uint32_t now = micros();
@@ -115,7 +174,19 @@ void TankRobot::runFOC_Only() {
 void TankRobot::loop_without_FOC() {
     // Core 1 主循环使用 micros() 做分频调度，避免 delay 阻塞蓝牙和控制。
     uint32_t nowMicros = micros();
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    debugLink.update();
+#endif
     updateBatteryMonitor();
+
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    if (debugLink.stopRequested()) {
+        if (chassisReady) chassis.stop();
+        if (turretReady) turret.enterDisconnectedState();
+        publishDebugTelemetry();
+        return;
+    }
+#endif
 
     if (turretReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
         float dtIMU = (nowMicros - lastIMU) * 1e-6f;
@@ -126,11 +197,13 @@ void TankRobot::loop_without_FOC() {
     if (nowMicros - lastUI >= 20000) { // 50Hz UI
         float dtUI = (nowMicros - lastUI) * 1e-6f;
         lastUI = nowMicros;
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
         xboxController.onLoop();
         updateControllerPacketClock();
+#endif
 
         ControlInput input;
-        if (turretReady && readControlInput(input)) {
+        if (turretReady && readActiveControlInput(input)) {
             turret.handleUI(input.aPressed, input.joyRX, input.joyRY, dtUI);
         }
     }
@@ -148,7 +221,7 @@ void TankRobot::loop_without_FOC() {
             }
         } else {
             ControlInput input;
-            if (chassisReady && readControlInput(input)) {
+            if (chassisReady && readActiveControlInput(input)) {
                 // 底盘控制复用炮塔模块读取的底盘 IMU：坡度用于重力补偿，角速度用于虚拟惯量补偿。
                 float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
                 float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
@@ -167,4 +240,8 @@ void TankRobot::loop_without_FOC() {
             }
         }
     }
+
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+    publishDebugTelemetry();
+#endif
 }

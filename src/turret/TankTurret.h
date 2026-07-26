@@ -91,6 +91,18 @@ public:
     float getLatestChassisYawRate();
     float getChassisPitchAngle();
 
+    // 给整车调试工具读取的炮塔遥测量。
+    float getPitchTargetDeg() const;
+    float getPitchActualDeg() const;
+    float getPitchServoDeg() const;
+    float getYawTargetDeg() const;
+    float getYawActualDeg() const;
+    float getYawRelativeDeg();
+    float getYawVoltageTarget() const;
+    bool stabilizationActive() const;
+    bool imuIsHealthy() const;
+    bool yawSensorIsHealthy() const;
+
     // 高频 FOC 入口，由 Core 0 任务循环调用。
     void runFOC();
 
