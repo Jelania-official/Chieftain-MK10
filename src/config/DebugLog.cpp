@@ -1,3 +1,4 @@
 #include "DebugLog.h"
 
-DebugChannel currentChannel = CHASSIS_ONLY; // 在此切换调试频道
+// 在这里切换默认调试频道；例如改成 ALL 可查看所有 LOG(...)。
+DebugChannel currentChannel = CHASSIS_ONLY;

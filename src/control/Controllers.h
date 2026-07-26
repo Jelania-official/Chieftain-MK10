@@ -1,55 +1,47 @@
 #pragma once
 
 #include <Arduino.h>
-#include "../config/RobotConfig.h"
+#include "config/RobotConfig.h"
 
 // ==========================================
-// 2. 基础控制算法 (PID)
+// 2. 基础控制算法
 // ==========================================
-// 最底层的通用 PID，给炮塔级联控制使用。
+
+// 通用 PID：输入目标值、实际值和 dt，输出带限幅的控制量。
+// 目前主要给炮塔 yaw 的串级控制使用，也可以复用到其他闭环。
 class CustomPID {
 public:
-    float kp, ki, kd, maxOut, maxI;
-    float integral = 0, prevError = 0;
-    CustomPID(float p, float i, float d, float mi, float mo) 
-        : kp(p), ki(i), kd(d), maxI(mi), maxOut(mo) {}
+    float kp, ki, kd, maxOut, maxI;     // 参数允许运行时被 Config 刷新
+    float integral = 0, prevError = 0;  // 积分和上一次误差是控制器内部状态
 
-    float calculate(float target, float actual, float dt) {
-        if (dt <= 0.0f) dt = 0.001f;
-        float error = target - actual;
-        integral += error * dt;
-        integral = constrain(integral, -maxI, maxI);
-        float derivative = (error - prevError) / dt;
-        prevError = error;
-        return constrain(kp * error + ki * integral + kd * derivative, -maxOut, maxOut);
-    }
-    void reset() { integral = 0; prevError = 0; }
+    // p/i/d：PID 参数；mi：积分限幅；mo：最终输出限幅。
+    CustomPID(float p, float i, float d, float mi, float mo);
+
+    // 计算一次 PID 输出。dt 单位是秒，函数内部会保护 dt<=0 的情况。
+    float calculate(float target, float actual, float dt);
+
+    // 清空积分和历史误差，适合模式切换、断连、进入安全状态时调用。
+    void reset();
 };
 
-// 炮塔 yaw 用的是位置环套速度环的级联结构，外环给目标角速度，内环出最终驱动量。
+// 炮塔 yaw 串级 PID：外环把角度误差变成目标角速度，内环把角速度误差变成电压。
+// chassisVel 是底盘 yaw 角速度前馈，用来抵消车体旋转对炮塔指向的影响。
 class CascadePID {
 public:
-    CustomPID outer; CustomPID inner; float ff_gain;
-    CascadePID(CustomPID out, CustomPID in, float ff = 0.0f) : outer(out), inner(in), ff_gain(ff) {}
-    float calculate(float posRef, float posFdb, float velFdb, float chassisVel, float dt) {
-        outer.kp = Config::YAW_OUTER_KP;
-        outer.kd = Config::YAW_OUTER_KD;
-        outer.maxOut = Config::YAW_OUTER_RATE_MAX;
-        inner.kp = Config::YAW_INNER_KP;
-        inner.ki = Config::YAW_INNER_KI;
-        inner.kd = Config::YAW_INNER_KD;
-        inner.maxOut = Config::YAW_VOLTAGE_MAX;
-        ff_gain = Config::YAW_CHASSIS_FF_GAIN;
-        float targetVel = outer.calculate(posRef, posFdb, dt);
-        float innerOut = inner.calculate(targetVel, velFdb, dt);
-        return constrain(innerOut + (ff_gain * chassisVel),
-                         -Config::YAW_VOLTAGE_MAX,
-                         Config::YAW_VOLTAGE_MAX);
-    }
-    void reset() { outer.reset(); inner.reset(); }
+    CustomPID outer;
+    CustomPID inner;
+    float ff_gain;
+
+    CascadePID(CustomPID out, CustomPID in, float ff = 0.0f);
+
+    // posRef/posFdb 单位是度；velFdb/chassisVel 单位是 deg/s；返回 yaw 电机目标电压。
+    float calculate(float posRef, float posFdb, float velFdb, float chassisVel, float dt);
+
+    void reset();
 };
 
-// 履带速度控制：前馈承担主要 PWM，PI 只修正编码器反馈误差。
+// 单侧履带速度控制器。
+// 前馈负责主要 PWM，PI 只根据编码器反馈做修正；externalPwm 用于底盘虚拟惯量补偿。
 class TrackVelocityController {
 private:
     float integral = 0.0f;
@@ -61,78 +53,10 @@ private:
     float lastDir = 0.0f;
 
 public:
-    float calculate(float target, float actual, float dt, float externalPwm) {
-        if (dt <= 0.0f) dt = 0.001f;
-        if (dt > 0.05f) dt = 0.05f;
-        externalPwm = constrain(externalPwm,
-                                -Config::TRACK_EXTERNAL_PWM_MAX,
-                                Config::TRACK_EXTERNAL_PWM_MAX);
+    // target/actual 单位是 km/h；dt 单位是秒；externalPwm 会被限幅后叠加到输出。
+    // 返回值是 -255~255 的电机 PWM 命令。
+    float calculate(float target, float actual, float dt, float externalPwm);
 
-        if (abs(target) < Config::TRACK_STOP_DEADZONE_KMH &&
-            abs(actual) < Config::TRACK_STOP_DEADZONE_KMH) {
-            reset();
-            return externalPwm;
-        }
-
-        bool targetActive = abs(target) >= Config::TRACK_STOP_DEADZONE_KMH;
-        float dir = (target > 0.0f) ? 1.0f : -1.0f;
-        if (targetActive && (!wasTargetActive || dir != lastDir)) {
-            startBoostActive = true;
-            startBoostSinceMs = millis();
-        }
-        float releaseSpeed = max(Config::TRACK_START_RELEASE_MIN_KMH,
-                                 abs(target) * Config::TRACK_START_RELEASE_RATIO);
-        bool boostTimedOut = startBoostActive &&
-                             ((uint32_t)(millis() - startBoostSinceMs) >= Config::TRACK_START_BOOST_MAX_MS);
-        bool boostSpeedReached = startBoostActive && abs(actual) >= releaseSpeed;
-        if (!targetActive || boostTimedOut || boostSpeedReached) {
-            startBoostActive = false;
-        }
-
-        float targetAccel = 0.0f;
-        if (targetActive && wasTargetActive) {
-            targetAccel = constrain((target - lastTarget) / dt,
-                                    -Config::TRACK_FF_MAX_ACCEL,
-                                    Config::TRACK_FF_MAX_ACCEL);
-        }
-        filteredTargetAccel += Config::TRACK_FF_ACCEL_LPF * (targetAccel - filteredTargetAccel);
-        lastTarget = target;
-        wasTargetActive = targetActive;
-
-        float ff = 0.0f;
-        if (targetActive) {
-            float staticFf = startBoostActive ? Config::TRACK_FF_KS_START : Config::TRACK_FF_KS_RUN;
-            ff = (staticFf * dir) +
-                 (Config::TRACK_FF_KV * target) +
-                 (Config::TRACK_FF_KA * filteredTargetAccel);
-        }
-        lastDir = targetActive ? dir : 0.0f;
-
-        float error = target - actual;
-        if (abs(target) < Config::TRACK_STOP_DEADZONE_KMH) {
-            integral *= 0.9f;
-        } else {
-            integral += error * dt;
-        }
-        integral = constrain(integral, -Config::TRACK_PI_MAX_I, Config::TRACK_PI_MAX_I);
-
-        float correction = constrain((Config::TRACK_PI_KP * error) +
-                                     (Config::TRACK_PI_KI * integral),
-                                     -Config::TRACK_PI_MAX_CORRECTION,
-                                     Config::TRACK_PI_MAX_CORRECTION);
-
-        return constrain(ff + correction + externalPwm, -255.0f, 255.0f);
-    }
-
-    void reset() {
-        integral = 0.0f;
-        lastTarget = 0.0f;
-        filteredTargetAccel = 0.0f;
-        wasTargetActive = false;
-        startBoostActive = false;
-        startBoostSinceMs = 0;
-        lastDir = 0.0f;
-    }
+    // 清空积分、起步补偿和历史目标，适合停车、堵转保护和模式切换。
+    void reset();
 };
-
-

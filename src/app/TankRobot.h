@@ -4,22 +4,34 @@
 #include <Wire.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include <Adafruit_MPU6050.h>
-#include "../config/DebugLog.h"
-#include "../config/RobotConfig.h"
-#include "../chassis/TankChassis.h"
-#include "../turret/TankTurret.h"
+#include "config/DebugLog.h"
+#include "config/RobotConfig.h"
+#include "chassis/TankChassis.h"
+#include "turret/TankTurret.h"
 #include "ControlInput.h"
 
 // ==========================================
-// 6. 顶层统筹与任务调度
+// 6. 应用调度层
 // ==========================================
+// app 文件夹放“把各模块组装起来运行”的代码。
+// TankRobot 不实现底盘/炮塔算法本身，而是负责：
+// 1. 初始化 I2C、串口、手柄、电池检测、底盘和炮塔；
+// 2. 按不同频率调度 IMU、UI、底盘控制和炮塔稳定；
+// 3. 处理断连、电池低压、炮塔不可用等整车级状态。
 class TankRobot {
 private:
     XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
     Adafruit_MPU6050 mpuChassis, mpuTurret;
-    TankChassis chassis; TankTurret turret;
+    TankChassis chassis;
+    TankTurret turret;
+
+    // 各任务上一次运行时间，用 micros() 做非阻塞定时调度。
     uint32_t lastIMU = 0, lastUI = 0, lastCtrl = 0;
+
+    // 手柄最后一次收到数据包的时间，用于判断“连接但不再更新”的假连接。
     uint32_t lastControllerPacketMs = 0;
+
+    // 电池采样和告警节流状态。
     uint32_t lastBatterySampleMs = 0;
     uint32_t lastBatteryCutoffLogMs = 0;
     bool chassisReady = false;
@@ -27,164 +39,38 @@ private:
     float batteryVoltage = 0.0f;
     bool batteryValid = false;
 
-    float readBatteryVoltage() {
-        uint32_t adcMilliVolts = analogReadMilliVolts(Config::VBAT_ADC_PIN);
-        float adcVolts = adcMilliVolts * 0.001f;
-        return adcVolts * ((Config::VBAT_DIVIDER_R1 + Config::VBAT_DIVIDER_R2) / Config::VBAT_DIVIDER_R2);
-    }
+    // 读取 ADC 并按分压电阻换算为电池实际电压。
+    float readBatteryVoltage();
 
-    void updateBatteryMonitor() {
-        if (!Config::ENABLE_BATTERY_MONITOR) {
-            batteryValid = false;
-            batteryVoltage = 0.0f;
-            return;
-        }
+    // 按 Config::VBAT_SAMPLE_MS 采样，并做一阶低通滤波。
+    void updateBatteryMonitor();
 
-        uint32_t nowMs = millis();
-        if ((uint32_t)(nowMs - lastBatterySampleMs) < Config::VBAT_SAMPLE_MS) return;
-        lastBatterySampleMs = nowMs;
+    // 达到硬截止电压时返回 true；上层会立即停止底盘并让炮塔进入安全状态。
+    bool batteryCritical() const;
 
-        float sample = readBatteryVoltage();
-        if (!isfinite(sample) || sample <= 0.0f) {
-            batteryValid = false;
-            return;
-        }
+    // 达到低电压预警阈值时返回 true；只打印警告，不切断动力。
+    bool batteryWarning() const;
 
-        if (!batteryValid) {
-            batteryVoltage = sample;
-            batteryValid = true;
-        } else {
-            batteryVoltage += Config::VBAT_LPF * (sample - batteryVoltage);
-        }
-    }
+    // 从手柄库取最近数据包时间，更新 lastControllerPacketMs。
+    void updateControllerPacketClock();
 
-    bool batteryCritical() const {
-        if (!Config::ENABLE_BATTERY_MONITOR) return false;
-        return batteryValid && batteryVoltage <= Config::VBAT_CUTOFF;
-    }
+    // 手柄库的 isConnected() 不是 const 成员，所以这里不能声明成 const。
+    // 除了蓝牙连接状态，还要求最近收到过有效数据包。
+    bool xboxControllerHealthy();
 
-    bool batteryWarning() const {
-        if (!Config::ENABLE_BATTERY_MONITOR) return false;
-        return batteryValid && batteryVoltage <= Config::VBAT_WARN;
-    }
-
-    void updateControllerPacketClock() {
-        unsigned long receivedAt = xboxController.getReceiveNotificationAt();
-        if (receivedAt != 0) {
-            lastControllerPacketMs = receivedAt;
-        }
-    }
-
-    // 手柄库的 isConnected() 不是 const 成员，所以这里不能把方法声明成 const。
-    bool xboxControllerHealthy() {
-        return xboxController.isConnected() &&
-               lastControllerPacketMs != 0 &&
-               ((uint32_t)(millis() - lastControllerPacketMs) <= Config::CONTROLLER_TIMEOUT_MS);
-    }
-
-    bool readControlInput(ControlInput& out) {
-        if (!xboxControllerHealthy()) return false;
-        out.triggerL = xboxController.xboxNotif.trigLT / 1023.0f;
-        out.triggerR = xboxController.xboxNotif.trigRT / 1023.0f;
-        out.joyLX = (xboxController.xboxNotif.joyLHori - 32767.5f) / 32767.5f;
-        out.joyRX = (xboxController.xboxNotif.joyRHori - 32767.5f) / 32767.5f;
-        out.joyRY = (xboxController.xboxNotif.joyRVert - 32767.5f) / 32767.5f;
-        out.aPressed = xboxController.xboxNotif.btnA;
-        return true;
-    }
+    // 将 Xbox 原始按键/摇杆数据归一化到 ControlInput。
+    bool readControlInput(ControlInput& out);
 
 public:
-    TankRobot() : xboxController(Config::XBOX_MAC), turret(mpuChassis, mpuTurret) {}
+    TankRobot();
 
+    // Arduino setup() 中调用一次：初始化整车硬件和状态。
+    void setup();
 
-    void setup() {
-        Serial.begin(921600);
-        Wire.begin(Config::I2C_FOC_SDA, Config::I2C_FOC_SCL); Wire.setClock(400000); 
-        Wire1.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL); Wire1.setClock(400000); 
-        if (Config::ENABLE_BATTERY_MONITOR) {
-            analogReadResolution(12);
-            analogSetPinAttenuation(Config::VBAT_ADC_PIN, ADC_11db);
-            pinMode(Config::VBAT_ADC_PIN, INPUT);
-            updateBatteryMonitor();
-        } else {
-            LOG_ALWAYS(">>> Battery monitor disabled; use external low-voltage alarm.\n");
-        }
-        chassis.init();
-        chassisReady = true;
-        turretReady = turret.init();
-        if (turretReady) {
-            delay(200);
-            turret.calibrate();
-        } else {
-            LOG_ALWAYS("!!! Turret unavailable; chassis control remains enabled.\n");
-        }
-        xboxController.begin();
-        lastControllerPacketMs = 0;
+    // 只运行炮塔 yaw 电机的 FOC 高频循环；由 Core 0 任务调用。
+    void runFOC_Only();
 
-        uint32_t now = micros();
-        lastIMU = now; lastUI = now; lastCtrl = now;
-    }
-
-    
-    void runFOC_Only() {
-        if (!turretReady) return;
-        turret.runFOC(); // 内部调用 yawMotor.loopFOC() 和 move()
-    }
-
-    // Core 1 主循环：低频 UI、中频控制、高频 IMU，和 Core 0 的 FOC 任务解耦。
-    void loop_without_FOC() {
-        // 蓝牙、IMU、底盘动力学都在 Core 1 执行
-        uint32_t nowMicros = micros();
-        updateBatteryMonitor();
-
-        if (turretReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
-            float dtIMU = (nowMicros - lastIMU) * 1e-6f; 
-            lastIMU = nowMicros;
-            turret.updateIMU(dtIMU);
-        }
-        if (nowMicros - lastUI >= 20000) { // 50Hz UI
-            float dtUI = (nowMicros - lastUI) * 1e-6f;
-            lastUI = nowMicros;
-            xboxController.onLoop();
-            updateControllerPacketClock();
-
-            ControlInput input;
-            if (turretReady && readControlInput(input)) {
-                turret.handleUI(input.aPressed, input.joyRX, input.joyRY, dtUI);
-            }
-        }
-        if (nowMicros - lastCtrl >= 5000) { // 200Hz 控制
-            float dtCtrl = (nowMicros - lastCtrl) * 1e-6f;
-            lastCtrl = nowMicros;
-            if (batteryCritical()) {
-                if (chassisReady) chassis.stop();
-                if (turretReady) turret.enterSafeState();
-                if (millis() - lastBatteryCutoffLogMs >= 1000) {
-                    lastBatteryCutoffLogMs = millis();
-                    LOG_ALWAYS("!!! Battery cutoff active: %.2fV\n", batteryVoltage);
-                }
-            } else {
-                ControlInput input;
-                if (chassisReady && readControlInput(input)) {
-                    // 坡度角用于底盘动力学中的重力分量，pitch/yaw rate 用于生成虚拟旋转惯量。
-                    float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
-                    float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
-                    float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
-                    chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl, pRate, yRate, pAngle);
-                    if (turretReady) turret.updateStabilization(dtCtrl);
-
-                    static uint32_t lastBatteryWarnLogMs = 0;
-                    if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
-                        lastBatteryWarnLogMs = millis();
-                        LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
-                    }
-                } else {
-                    if (chassisReady) chassis.stop();
-                    if (turretReady) turret.enterDisconnectedState();
-                }
-            }
-        }
-    }
+    // 运行除 FOC 以外的主循环；由 Arduino loop() 在 Core 1 调用。
+    // 内部分别以 500Hz/50Hz/200Hz 调度 IMU、手柄 UI、底盘和稳定控制。
+    void loop_without_FOC();
 };
-
-
