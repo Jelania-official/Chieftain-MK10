@@ -40,8 +40,10 @@ void DebugLink::handleLine(char* line) {
     if (strncmp(line, "IN,", 3) != 0) return;
 
     char* token = strtok(line + 3, ",");
-    float values[6] = {};
-    for (int i = 0; i < 6; ++i) {
+    // PC 端协议依次发送 5 个模拟量，再发送 A 键和急停标志：
+    // IN,triggerL,triggerR,joyLX,joyRX,joyRY,aPressed,stop
+    float values[5] = {};
+    for (int i = 0; i < 5; ++i) {
         if (token == nullptr) return;
         values[i] = atof(token);
         token = strtok(nullptr, ",");

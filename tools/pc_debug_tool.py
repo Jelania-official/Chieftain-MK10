@@ -122,7 +122,7 @@ class MousePad(QtWidgets.QFrame):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Chieftain MK10 Debug Tool")
+        self.setWindowTitle("Chieftain MK10 整车调试工具")
         self.resize(1280, 840)
         self.serial_port: serial.Serial | None = None
         self.input_state = InputState()
@@ -155,10 +155,10 @@ class MainWindow(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout()
         root.addLayout(top)
         self.port_combo = QtWidgets.QComboBox()
-        refresh_btn = QtWidgets.QPushButton("Refresh")
-        self.connect_btn = QtWidgets.QPushButton("Connect")
-        self.status_label = QtWidgets.QLabel("Disconnected")
-        top.addWidget(QtWidgets.QLabel("Port"))
+        refresh_btn = QtWidgets.QPushButton("刷新端口")
+        self.connect_btn = QtWidgets.QPushButton("连接")
+        self.status_label = QtWidgets.QLabel("未连接")
+        top.addWidget(QtWidgets.QLabel("串口"))
         top.addWidget(self.port_combo, 1)
         top.addWidget(refresh_btn)
         top.addWidget(self.connect_btn)
@@ -171,8 +171,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         controls = QtWidgets.QVBoxLayout()
         body.addLayout(controls)
-        controls.addWidget(QtWidgets.QLabel("W/S: throttle    A/D: steer    Space: stabilizer toggle"))
-        controls.addWidget(QtWidgets.QLabel("Drag inside pad: turret yaw/pitch, release to center"))
+        controls.addWidget(QtWidgets.QLabel("W/S：前进/倒车    A/D：转向    空格：切换稳定器"))
+        controls.addWidget(QtWidgets.QLabel("在控制区拖动：控制炮塔方位/俯仰；松开后自动回中"))
 
         self.mouse_pad = MousePad()
         self.mouse_pad.changed.connect(self._mouse_changed)
@@ -181,9 +181,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.input_label = QtWidgets.QLabel()
         controls.addWidget(self.input_label)
 
-        zero_btn = QtWidgets.QPushButton("Zero Input")
-        stop_btn = QtWidgets.QPushButton("Emergency Stop")
-        clear_stop_btn = QtWidgets.QPushButton("Clear Stop")
+        zero_btn = QtWidgets.QPushButton("输入归零")
+        stop_btn = QtWidgets.QPushButton("紧急停止")
+        clear_stop_btn = QtWidgets.QPushButton("解除急停")
         controls.addWidget(zero_btn)
         controls.addWidget(stop_btn)
         controls.addWidget(clear_stop_btn)
@@ -191,8 +191,8 @@ class MainWindow(QtWidgets.QMainWindow):
         stop_btn.clicked.connect(self._emergency_stop)
         clear_stop_btn.clicked.connect(self._clear_stop)
 
-        self.telemetry_label = QtWidgets.QLabel("No telemetry")
-        self.telemetry_label.setMinimumWidth(280)
+        self.telemetry_label = QtWidgets.QLabel("尚未收到遥测数据")
+        self.telemetry_label.setMinimumWidth(330)
         controls.addWidget(self.telemetry_label)
         controls.addStretch(1)
 
@@ -200,33 +200,33 @@ class MainWindow(QtWidgets.QMainWindow):
         body.addLayout(plots, 1)
         pg.setConfigOptions(antialias=True)
         self.curves = {}
-        self._add_plot(plots, 0, 0, "Left track speed", [
-            ("left_target", "target", "#f5a623"),
-            ("left_actual", "actual", "#2d7ff9"),
+        self._add_plot(plots, 0, 0, "左履带速度（km/h）", [
+            ("left_target", "目标速度", "#f5a623"),
+            ("left_actual", "实际速度", "#2d7ff9"),
         ])
-        self._add_plot(plots, 0, 1, "Right track speed", [
-            ("right_target", "target", "#f5a623"),
-            ("right_actual", "actual", "#2d7ff9"),
+        self._add_plot(plots, 0, 1, "右履带速度（km/h）", [
+            ("right_target", "目标速度", "#f5a623"),
+            ("right_actual", "实际速度", "#2d7ff9"),
         ])
-        self._add_plot(plots, 1, 0, "Turret yaw", [
-            ("yaw_target", "target", "#f5a623"),
-            ("yaw_actual", "actual", "#2d7ff9"),
-            ("yaw_relative", "relative", "#42b883"),
+        self._add_plot(plots, 1, 0, "炮塔方位角（°）", [
+            ("yaw_target", "目标角度", "#f5a623"),
+            ("yaw_actual", "实际角度", "#2d7ff9"),
+            ("yaw_relative", "车体相对角", "#42b883"),
         ])
-        self._add_plot(plots, 1, 1, "Gun pitch", [
-            ("pitch_target", "target", "#f5a623"),
-            ("pitch_actual", "actual", "#2d7ff9"),
-            ("pitch_servo", "servo", "#42b883"),
+        self._add_plot(plots, 1, 1, "炮管俯仰角（°）", [
+            ("pitch_target", "目标角度", "#f5a623"),
+            ("pitch_actual", "实际角度", "#2d7ff9"),
+            ("pitch_servo", "舵机指令", "#42b883"),
         ])
-        self._add_plot(plots, 2, 0, "PWM / yaw voltage", [
-            ("left_pwm", "left pwm", "#2d7ff9"),
-            ("right_pwm", "right pwm", "#f5a623"),
-            ("yaw_voltage", "yaw V", "#d0021b"),
+        self._add_plot(plots, 2, 0, "履带 PWM / 炮塔方位电压", [
+            ("left_pwm", "左履带 PWM", "#2d7ff9"),
+            ("right_pwm", "右履带 PWM", "#f5a623"),
+            ("yaw_voltage", "方位电压（V）", "#d0021b"),
         ])
-        self._add_plot(plots, 2, 1, "Chassis IMU", [
-            ("chassis_pitch", "pitch", "#42b883"),
-            ("chassis_pitch_rate", "pitch rate", "#2d7ff9"),
-            ("chassis_yaw_rate", "yaw rate", "#f5a623"),
+        self._add_plot(plots, 2, 1, "车体 IMU", [
+            ("chassis_pitch", "俯仰角", "#42b883"),
+            ("chassis_pitch_rate", "俯仰角速度", "#2d7ff9"),
+            ("chassis_yaw_rate", "方位角速度", "#f5a623"),
         ])
 
     def _add_plot(self, layout: QtWidgets.QGridLayout, row: int, col: int, title: str, items: list[tuple[str, str, str]]) -> None:
@@ -246,8 +246,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
             self.serial_port = None
-            self.connect_btn.setText("Connect")
-            self.status_label.setText("Disconnected")
+            self.connect_btn.setText("连接")
+            self.status_label.setText("未连接")
             return
 
         port = self.port_combo.currentData()
@@ -255,10 +255,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self.serial_port = serial.Serial(port, 115200, timeout=0)
-            self.connect_btn.setText("Disconnect")
-            self.status_label.setText(f"Connected: {port}")
+            self.connect_btn.setText("断开连接")
+            self.status_label.setText(f"已连接：{port}")
         except serial.SerialException as exc:
-            QtWidgets.QMessageBox.warning(self, "Connection failed", str(exc))
+            QtWidgets.QMessageBox.warning(self, "连接失败", str(exc))
 
     def _poll_serial(self) -> None:
         if not self.serial_port or not self.serial_port.is_open:
@@ -269,10 +269,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 if raw:
                     self._handle_line(raw)
         except serial.SerialException as exc:
-            self.status_label.setText(f"Serial error: {exc}")
+            self.status_label.setText(f"串口错误：{exc}")
             self.serial_port.close()
             self.serial_port = None
-            self.connect_btn.setText("Connect")
+            self.connect_btn.setText("连接")
 
     def _handle_line(self, line: str) -> None:
         if not line.startswith("TEL,"):
@@ -297,21 +297,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_status_text(self, values: dict[str, float]) -> None:
         self.telemetry_label.setText(
-            "Telemetry\n"
-            f"chassisReady={int(values['chassis_ready'])}  turretReady={int(values['turret_ready'])}\n"
-            f"stab={int(values['stabilization'])}  imu={int(values['imu_healthy'])}  yawSensor={int(values['yaw_sensor_healthy'])}\n"
-            f"stall L/R={int(values['left_stalled'])}/{int(values['right_stalled'])}\n"
-            f"battery={values['battery_voltage']:.2f}V valid={int(values['battery_valid'])}\n"
-            f"last rx={time.monotonic() - self.last_rx_time:.2f}s"
+            "遥测状态\n"
+            f"底盘就绪={int(values['chassis_ready'])}  炮塔就绪={int(values['turret_ready'])}\n"
+            f"稳定器={int(values['stabilization'])}  IMU={int(values['imu_healthy'])}  方位传感器={int(values['yaw_sensor_healthy'])}\n"
+            f"左右履带堵转={int(values['left_stalled'])}/{int(values['right_stalled'])}\n"
+            f"电池={values['battery_voltage']:.2f}V  有效={int(values['battery_valid'])}\n"
+            f"最近接收={time.monotonic() - self.last_rx_time:.2f}s"
         )
 
     def _send_input(self) -> None:
         self.input_state.update_from_keys()
         self.input_label.setText(
-            f"LT {self.input_state.trigger_l:.1f}  RT {self.input_state.trigger_r:.1f}\n"
-            f"LX {self.input_state.joy_lx:.2f}\n"
-            f"RX {self.input_state.joy_rx:.2f}  RY {self.input_state.joy_ry:.2f}\n"
-            f"A {int(self.input_state.a_pressed)}  STOP {int(self.input_state.stop)}"
+            f"倒车 LT={self.input_state.trigger_l:.1f}  前进 RT={self.input_state.trigger_r:.1f}\n"
+            f"转向 LX={self.input_state.joy_lx:.2f}\n"
+            f"炮塔 RX={self.input_state.joy_rx:.2f}  RY={self.input_state.joy_ry:.2f}\n"
+            f"稳定器 A={int(self.input_state.a_pressed)}  急停={int(self.input_state.stop)}"
         )
         if not self.serial_port or not self.serial_port.is_open:
             return
@@ -323,7 +323,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except serial.SerialException:
             self.serial_port.close()
             self.serial_port = None
-            self.connect_btn.setText("Connect")
+            self.connect_btn.setText("连接")
 
     def _update_plots(self) -> None:
         x = list(self.data["t"])
@@ -374,6 +374,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
+    app.setFont(QtGui.QFont("Microsoft YaHei UI", 9))
     window = MainWindow()
     window.show()
     return app.exec()

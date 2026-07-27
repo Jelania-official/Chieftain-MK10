@@ -54,7 +54,7 @@ namespace Config {
 
     // ---------- 履带速度控制 ----------
     const float TRACK_STOP_DEADZONE_KMH = 0.10f;
-    const float TRACK_FF_KS_START = 90.0f;
+    const float TRACK_FF_KS_START = 110.0f;
     const float TRACK_FF_KS_RUN = 45.0f;
     const uint32_t TRACK_START_BOOST_MAX_MS = 220;
     const float TRACK_START_RELEASE_RATIO = 0.55f;

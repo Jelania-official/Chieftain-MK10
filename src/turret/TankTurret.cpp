@@ -180,7 +180,18 @@ bool TankTurret::init() {
             ready = false;
             return false;
         }
-        mpuC.setGyroRange(MPU6050_RANGE_500_DEG); mpuT.setGyroRange(MPU6050_RANGE_500_DEG);
+        // 两颗 IMU 使用同一套量程/滤波配置，避免底盘和炮塔姿态数据尺度不一致。
+        // 陀螺仪保持 ±500deg/s：覆盖炮塔/车体快速转动，同时比 ±1000/2000 保留更好分辨率。
+        mpuC.setGyroRange(MPU6050_RANGE_500_DEG);
+        mpuT.setGyroRange(MPU6050_RANGE_500_DEG);
+
+        // 加速度计用 ±4g：比默认 ±2g 更能承受履带震动和碰撞冲击，不容易饱和。
+        mpuC.setAccelerometerRange(MPU6050_RANGE_4_G);
+        mpuT.setAccelerometerRange(MPU6050_RANGE_4_G);
+
+        // DLPF 44Hz：先把电机/履带的高频噪声滤掉，再交给互补滤波和后续姿态算法。
+        mpuC.setFilterBandwidth(MPU6050_BAND_44_HZ);
+        mpuT.setFilterBandwidth(MPU6050_BAND_44_HZ);
 
         yawSensor.init();
         float initialSensorDeg = 0.0f;
