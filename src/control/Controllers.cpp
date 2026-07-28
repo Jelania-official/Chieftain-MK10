@@ -23,7 +23,8 @@ void CustomPID::reset() {
 
 CascadePID::CascadePID(CustomPID out, CustomPID in, float ff) : outer(out), inner(in), ff_gain(ff) {}
 
-float CascadePID::calculate(float posRef, float posFdb, float velFdb, float chassisVel, float dt) {
+float CascadePID::calculate(float posRef, float posFdb, float posRateRef,
+                            float velFdb, float chassisVel, float dt) {
     // yaw 参数放在 Config 里，允许调参时只改配置，不用追到构造函数。
     outer.kp = Config::YAW_OUTER_KP;
     outer.kd = Config::YAW_OUTER_KD;
@@ -34,7 +35,16 @@ float CascadePID::calculate(float posRef, float posFdb, float velFdb, float chas
     inner.maxOut = Config::YAW_VOLTAGE_MAX;
     ff_gain = Config::YAW_CHASSIS_FF_GAIN;
 
-    float targetVel = outer.calculate(posRef, posFdb, dt);
+    // 两自由度外环：
+    // 1. 手柄角速度直接前馈，持续转动不需要靠累积很大的位置误差来“推着走”；
+    // 2. P 项消除位置偏差；
+    // 3. D 项直接比较目标/实际角速度，不再对 50Hz 阶梯位置目标求导，避免周期性微分冲击。
+    float positionError = posRef - posFdb;
+    float rateError = posRateRef - velFdb;
+    float targetVel = posRateRef +
+                      (outer.kp * positionError) +
+                      (outer.kd * rateError);
+    targetVel = constrain(targetVel, -outer.maxOut, outer.maxOut);
     float innerOut = inner.calculate(targetVel, velFdb, dt);
     return constrain(innerOut + (ff_gain * chassisVel),
                      -Config::YAW_VOLTAGE_MAX,
@@ -46,7 +56,32 @@ void CascadePID::reset() {
     inner.reset();
 }
 
-float TrackVelocityController::calculate(float target, float actual, float dt, float externalPwm) {
+float TrackVelocityController::runtimeKp = Config::TRACK_PID_KP;
+float TrackVelocityController::runtimeKi = Config::TRACK_PID_KI;
+float TrackVelocityController::runtimeKd = Config::TRACK_PID_KD;
+
+TrackVelocityController::TrackVelocityController(bool leftTrack) : isLeft(leftTrack) {}
+
+void TrackVelocityController::setRuntimePidGains(float kp, float ki, float kd) {
+    runtimeKp = kp;
+    runtimeKi = ki;
+    runtimeKd = kd;
+}
+
+void TrackVelocityController::resetRuntimePidGains() {
+    setRuntimePidGains(Config::TRACK_PID_KP,
+                       Config::TRACK_PID_KI,
+                       Config::TRACK_PID_KD);
+}
+
+void TrackVelocityController::getRuntimePidGains(float& kp, float& ki, float& kd) {
+    kp = runtimeKp;
+    ki = runtimeKi;
+    kd = runtimeKd;
+}
+
+float TrackVelocityController::calculate(float target, float actual, float dt, float externalPwm,
+                                         bool newSpeedSample, float speedSampleDt) {
     if (dt <= 0.0f) dt = 0.001f;
     if (dt > 0.05f) dt = 0.05f;
     externalPwm = constrain(externalPwm,
@@ -63,61 +98,119 @@ float TrackVelocityController::calculate(float target, float actual, float dt, f
     float dir = (target > 0.0f) ? 1.0f : -1.0f;
     if (targetActive && (!wasTargetActive || dir != lastDir)) {
         startBoostActive = true;
-        startBoostSinceMs = millis();
+        startReleaseCandidateSinceMs = 0;
+        startReenterCandidateSinceMs = 0;
+        startBoostBlend = 1.0f;
     }
 
-    // 起步静摩擦补偿只短时间生效；一旦速度起来或超时，就切回运行前馈。
-    float releaseSpeed = max(Config::TRACK_START_RELEASE_MIN_KMH,
-                             abs(target) * Config::TRACK_START_RELEASE_RATIO);
-    bool boostTimedOut = startBoostActive &&
-                         ((uint32_t)(millis() - startBoostSinceMs) >= Config::TRACK_START_BOOST_MAX_MS);
-    bool boostSpeedReached = startBoostActive && abs(actual) >= releaseSpeed;
-    if (!targetActive || boostTimedOut || boostSpeedReached) {
-        startBoostActive = false;
+    // 静止时使用 KS_START；同方向速度稳定超过固定门限后切换到 KS_RUN。
+    // 运行中如果持续接近零速则重新进入起步状态。两个门限形成迟滞，避免来回切换。
+    uint32_t nowMs = millis();
+    if (!targetActive) {
+        startReleaseCandidateSinceMs = 0;
+        startReenterCandidateSinceMs = 0;
+    } else if (startBoostActive) {
+        if (actual * dir >= Config::TRACK_START_RELEASE_SPEED_KMH) {
+            if (startReleaseCandidateSinceMs == 0) startReleaseCandidateSinceMs = nowMs;
+            if ((uint32_t)(nowMs - startReleaseCandidateSinceMs) >=
+                Config::TRACK_START_RELEASE_CONFIRM_MS) {
+                startBoostActive = false;
+                startReleaseCandidateSinceMs = 0;
+            }
+        } else {
+            startReleaseCandidateSinceMs = 0;
+        }
+    } else {
+        if (actual * dir <= Config::TRACK_START_REENTER_SPEED_KMH) {
+            if (startReenterCandidateSinceMs == 0) startReenterCandidateSinceMs = nowMs;
+            if ((uint32_t)(nowMs - startReenterCandidateSinceMs) >=
+                Config::TRACK_START_REENTER_CONFIRM_MS) {
+                startBoostActive = true;
+                startBoostBlend = 1.0f;
+                startReenterCandidateSinceMs = 0;
+            }
+        } else {
+            startReenterCandidateSinceMs = 0;
+        }
     }
 
-    float targetAccel = 0.0f;
-    if (targetActive && wasTargetActive) {
-        targetAccel = constrain((target - lastTarget) / dt,
-                                -Config::TRACK_FF_MAX_ACCEL,
-                                Config::TRACK_FF_MAX_ACCEL);
+    // 起步补偿退出后短时间平滑降到滑动摩擦补偿，避免 PWM 台阶。
+    if (!targetActive) {
+        startBoostBlend = 0.0f;
+    } else if (startBoostActive) {
+        startBoostBlend = 1.0f;
+    } else if (Config::TRACK_START_BLEND_DOWN_MS > 0) {
+        float blendStep = dt * 1000.0f / Config::TRACK_START_BLEND_DOWN_MS;
+        startBoostBlend = max(0.0f, startBoostBlend - blendStep);
+    } else {
+        startBoostBlend = 0.0f;
     }
-    filteredTargetAccel += Config::TRACK_FF_ACCEL_LPF * (targetAccel - filteredTargetAccel);
-    lastTarget = target;
-    wasTargetActive = targetActive;
 
-    float ff = 0.0f;
+    float frictionFf = 0.0f;
     if (targetActive) {
-        float staticFf = startBoostActive ? Config::TRACK_FF_KS_START : Config::TRACK_FF_KS_RUN;
-        ff = (staticFf * dir) +
-             (Config::TRACK_FF_KV * target) +
-             (Config::TRACK_FF_KA * filteredTargetAccel);
+        float ksStart = isLeft ? Config::TRACK_FF_KS_START_LEFT : Config::TRACK_FF_KS_START_RIGHT;
+        float ksRun = isLeft ? Config::TRACK_FF_KS_RUN_LEFT : Config::TRACK_FF_KS_RUN_RIGHT;
+        float staticFf = ksRun + startBoostBlend * (ksStart - ksRun);
+        frictionFf = staticFf * dir;
     }
+
+    // D 对实际速度求导，且只在编码器给出新样本时更新，避免用 5ms 控制周期
+    // 对 20~100ms 的阶梯测速差分而产生虚假尖峰。KD=0 时代码保留但不输出。
+    if (newSpeedSample) {
+        if (derivativeReady && speedSampleDt > 0.0f) {
+            float rawActualDerivative = (actual - lastActual) / speedSampleDt;
+            float derivativeAlpha = speedSampleDt /
+                (Config::TRACK_PID_D_FILTER_TAU_S + speedSampleDt);
+            filteredActualDerivative += derivativeAlpha *
+                (rawActualDerivative - filteredActualDerivative);
+        } else {
+            derivativeReady = true;
+            filteredActualDerivative = 0.0f;
+        }
+        lastActual = actual;
+    }
+    float dPwm = constrain(-runtimeKd * filteredActualDerivative,
+                           -Config::TRACK_PID_D_MAX_PWM,
+                           Config::TRACK_PID_D_MAX_PWM);
+
+    wasTargetActive = targetActive;
     lastDir = targetActive ? dir : 0.0f;
 
     float error = target - actual;
     if (abs(target) < Config::TRACK_STOP_DEADZONE_KMH) {
-        integral *= 0.9f;
+        integralPwm *= 0.9f;
     } else {
-        integral += error * dt;
+        // integralPwm 直接以 PWM 为单位，便于理解其权限。只有最终电机输出饱和且
+        // 误差仍把输出推向同一方向时才暂停积分，反向误差始终可以帮助退出饱和。
+        float candidateIntegralPwm = constrain(
+            integralPwm + runtimeKi * error * dt,
+            -Config::TRACK_PID_I_MAX_PWM,
+            Config::TRACK_PID_I_MAX_PWM);
+        float pPwm = runtimeKp * error;
+        float candidateOutput = frictionFf + pPwm + candidateIntegralPwm + dPwm + externalPwm;
+        bool pushingHighSaturation = error > 0.0f && candidateOutput > 255.0f;
+        bool pushingLowSaturation = error < 0.0f && candidateOutput < -255.0f;
+        if (!pushingHighSaturation && !pushingLowSaturation) {
+            integralPwm = candidateIntegralPwm;
+        }
     }
-    integral = constrain(integral, -Config::TRACK_PI_MAX_I, Config::TRACK_PI_MAX_I);
+    integralPwm = constrain(integralPwm,
+                            -Config::TRACK_PID_I_MAX_PWM,
+                            Config::TRACK_PID_I_MAX_PWM);
 
-    // PI 只做小范围纠偏，避免编码器噪声把 PWM 拉得太猛。
-    float correction = constrain((Config::TRACK_PI_KP * error) +
-                                 (Config::TRACK_PI_KI * integral),
-                                 -Config::TRACK_PI_MAX_CORRECTION,
-                                 Config::TRACK_PI_MAX_CORRECTION);
-
-    return constrain(ff + correction + externalPwm, -255.0f, 255.0f);
+    float pidPwm = (runtimeKp * error) + integralPwm + dPwm;
+    return constrain(frictionFf + pidPwm + externalPwm, -255.0f, 255.0f);
 }
 
 void TrackVelocityController::reset() {
-    integral = 0.0f;
-    lastTarget = 0.0f;
-    filteredTargetAccel = 0.0f;
+    integralPwm = 0.0f;
+    lastActual = 0.0f;
+    filteredActualDerivative = 0.0f;
+    derivativeReady = false;
     wasTargetActive = false;
     startBoostActive = false;
-    startBoostSinceMs = 0;
+    startReleaseCandidateSinceMs = 0;
+    startReenterCandidateSinceMs = 0;
+    startBoostBlend = 0.0f;
     lastDir = 0.0f;
 }

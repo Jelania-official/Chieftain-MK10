@@ -34,16 +34,33 @@ class CustomEncoder {
 private:
     uint8_t pinA, pinB;
     pcnt_unit_t unit;
+    int8_t directionSign;
     uint32_t lastSampleUs = 0;
+    uint32_t lastPulseUs = 0;
+    uint32_t lastDisplayUs = 0;
+    float displayRawSpeedSamples[3] = {};
+    uint8_t displayRawSpeedSampleIndex = 0;
+    float displayMeasuredSpeed = 0.0f;
     float lastSpeed = 0.0f;
+    float displaySpeed = 0.0f;
+    uint32_t controlSampleId = 0;
+    float controlSampleDt = 0.0f;
+    bool stopTimeoutPublished = false;
 
 public:
     // p_unit 指定使用哪个 PCNT 单元；左右履带需要不同单元。
-    CustomEncoder(uint8_t pinA, uint8_t pinB, pcnt_unit_t p_unit);
+    CustomEncoder(uint8_t pinA, uint8_t pinB, pcnt_unit_t p_unit, int8_t directionSign = 1);
 
     // 配置 PCNT 计数模式、滤波和初始采样时间。
     void init();
 
-    // 按 Config::ENCODER_SAMPLE_US 周期刷新速度；周期未到时返回上一次滤波结果。
+    // 使用自适应脉冲累计窗口刷新控制用速度；窗口未完成时返回上一次结果。
     float getRealSpeedKMH();
+
+    // 返回额外平滑的遥测速度，不参与 PI 和堵转判断。
+    float getDisplaySpeedKMH() const;
+
+    // 每产生一个新的有效控制测速（含首次超时归零）就递增，用于同步 PID 的 D 项。
+    uint32_t getControlSampleId() const;
+    float getControlSampleDt() const;
 };
