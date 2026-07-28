@@ -22,6 +22,8 @@ C:\Users\zj\.platformio\penv\Scripts\pio.exe run -e imu_visualizer -t upload
 C:\Users\zj\.platformio\penv\Scripts\pio.exe run -e esp32dev -t upload
 ```
 
+项目默认环境已经锁定为 `esp32dev`，所以 VS Code/PlatformIO 的普通“上传”按钮只会烧录整车固件。只有显式选择 `imu_visualizer` 环境或执行上面的 IMU 烧录命令，才会用测试固件覆盖整车固件。
+
 `platformio.ini` 里已经做了 `build_src_filter`，所以两个入口不会互相冲突。
 
 注意：PlatformIO 默认只从 `src` 目录找 Arduino 入口文件，所以项目里保留了一个很薄的 `src/imu_visualizer_main.cpp`。它只负责 `#include` 这个工具文件夹里的真实固件代码，不写实际逻辑。

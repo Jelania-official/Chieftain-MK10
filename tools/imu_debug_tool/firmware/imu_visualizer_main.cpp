@@ -11,8 +11,13 @@ constexpr uint32_t kFusionPeriodUs = 5000;      // 200Hz 姿态融合
 constexpr uint32_t kTelemetryPeriodMs = 20;     // 50Hz USB 串口输出
 constexpr int kGyroCalibSamples = 1200;
 constexpr float kRadToDeg = 57.2957795131f;
+constexpr uint8_t kAccelOutRegister = 0x3B;
+constexpr size_t kFrameBytes = 14;
+constexpr float kAccelLsbPerG4G = 8192.0f;
+constexpr float kGyroLsbPerDps500 = 65.5f;
 
 Adafruit_MPU6050 mpu;
+uint8_t activeMpuAddress = kChassisImuAddress;
 
 float gyroBiasX = 0.0f;
 float gyroBiasY = 0.0f;
@@ -150,16 +155,31 @@ MahonyImuFusion fusion;
 ImuFrame latest;
 
 bool readImu(ImuFrame& out) {
-    sensors_event_t accel, gyro, temp;
-    mpu.getEvent(&accel, &gyro, &temp);
+    Wire.beginTransmission(activeMpuAddress);
+    Wire.write(kAccelOutRegister);
+    if (Wire.endTransmission(false) != 0) return false;
 
-    out.ax = accel.acceleration.x;
-    out.ay = accel.acceleration.y;
-    out.az = accel.acceleration.z;
-    out.gx = gyro.gyro.x - gyroBiasX;
-    out.gy = gyro.gyro.y - gyroBiasY;
-    out.gz = gyro.gyro.z - gyroBiasZ;
-    out.temp = temp.temperature;
+    size_t received = Wire.requestFrom(activeMpuAddress, (uint8_t)kFrameBytes, (uint8_t)true);
+    if (received != kFrameBytes || Wire.available() < (int)kFrameBytes) {
+        while (Wire.available() > 0) Wire.read();
+        return false;
+    }
+
+    uint8_t frame[kFrameBytes] = {};
+    for (size_t i = 0; i < kFrameBytes; ++i) frame[i] = (uint8_t)Wire.read();
+    auto decode = [&](size_t index) -> int16_t {
+        return (int16_t)(((uint16_t)frame[index] << 8) | frame[index + 1]);
+    };
+
+    float accelScale = SENSORS_GRAVITY_STANDARD / kAccelLsbPerG4G;
+    float gyroScale = DEG_TO_RAD / kGyroLsbPerDps500;
+    out.ax = decode(0) * accelScale;
+    out.ay = decode(2) * accelScale;
+    out.az = decode(4) * accelScale;
+    out.temp = (decode(6) / 340.0f) + 36.53f;
+    out.gx = decode(8) * gyroScale - gyroBiasX;
+    out.gy = decode(10) * gyroScale - gyroBiasY;
+    out.gz = decode(12) * gyroScale - gyroBiasZ;
 
     return isfinite(out.ax) && isfinite(out.ay) && isfinite(out.az) &&
            isfinite(out.gx) && isfinite(out.gy) && isfinite(out.gz);
@@ -170,27 +190,43 @@ void calibrateGyro() {
 
     double sx = 0.0, sy = 0.0, sz = 0.0;
     
-    // 临时清零零偏，直接读取原始陀螺仪值
+    // 临时清零零偏，直接读取原始陀螺仪值；失败样本不进入标定均值。
     float savedBiasX = gyroBiasX;
     float savedBiasY = gyroBiasY;
     float savedBiasZ = gyroBiasZ;
     gyroBiasX = gyroBiasY = gyroBiasZ = 0.0f;
     
     ImuFrame sample;
-    for (int i = 0; i < kGyroCalibSamples; ++i) {
-        readImu(sample);
+    int validSamples = 0;
+    for (int attempt = 0;
+         attempt < kGyroCalibSamples * 2 && validSamples < kGyroCalibSamples;
+         ++attempt) {
+        if (!readImu(sample)) {
+            delay(2);
+            continue;
+        }
         sx += sample.gx;
         sy += sample.gy;
         sz += sample.gz;
+        ++validSamples;
         delay(2);
     }
 
-    gyroBiasX = sx / kGyroCalibSamples;
-    gyroBiasY = sy / kGyroCalibSamples;
-    gyroBiasZ = sz / kGyroCalibSamples;
+    if (validSamples != kGyroCalibSamples) {
+        gyroBiasX = savedBiasX;
+        gyroBiasY = savedBiasY;
+        gyroBiasZ = savedBiasZ;
+        Serial.printf("ERR,gyro_calibration_failed,%d,%d\n", validSamples, kGyroCalibSamples);
+        return;
+    }
 
-    readImu(latest);
-    fusion.resetFromAccel(latest.ax, latest.ay, latest.az);
+    gyroBiasX = sx / validSamples;
+    gyroBiasY = sy / validSamples;
+    gyroBiasZ = sz / validSamples;
+
+    if (readImu(latest)) {
+        fusion.resetFromAccel(latest.ax, latest.ay, latest.az);
+    }
 
     Serial.printf("INFO,gyro_bias,%.7f,%.7f,%.7f\n", gyroBiasX, gyroBiasY, gyroBiasZ);
 }
@@ -254,7 +290,8 @@ void setup() {
     // 改用 Wire (I2C0)，GPIO21/22 是 I2C0 的默认引脚
     Serial.println("INFO,init_i2c");
     Wire.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL);
-    Wire.setClock(100000);
+    Wire.setClock(400000);
+    Wire.setTimeOut(Config::IMU_I2C_TIMEOUT_MS);
     
     // 扫描 I2C 总线
     Serial.println("INFO,scanning_i2c_bus");
@@ -281,12 +318,14 @@ void setup() {
     bool mpu_ok = false;
     if (mpu.begin(kChassisImuAddress, &Wire)) {
         Serial.printf("INFO,mpu6050_found_at_0x%02X\n", kChassisImuAddress);
+        activeMpuAddress = kChassisImuAddress;
         mpu_ok = true;
     } else {
         uint8_t alt_addr = (kChassisImuAddress == 0x68) ? 0x69 : 0x68;
         Serial.printf("INFO,trying_alt_addr_0x%02X\n", alt_addr);
         if (mpu.begin(alt_addr, &Wire)) {
             Serial.printf("INFO,mpu6050_found_at_0x%02X\n", alt_addr);
+            activeMpuAddress = alt_addr;
             mpu_ok = true;
         }
     }
