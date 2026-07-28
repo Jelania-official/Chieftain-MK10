@@ -91,6 +91,6 @@ public:
     void runFOC_Only();
 
     // 运行除 FOC 以外的主循环；由 Arduino loop() 在 Core 1 调用。
-    // 内部分别以 500Hz/50Hz/200Hz 调度 IMU、手柄 UI、底盘和稳定控制。
+    // 内部分别以 200Hz/50Hz/200Hz 调度 IMU、手柄 UI、底盘和稳定控制。
     void loop_without_FOC();
 };

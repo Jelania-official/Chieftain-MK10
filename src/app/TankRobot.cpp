@@ -89,8 +89,10 @@ void TankRobot::publishDebugTelemetry() {
     t.batteryValid = batteryValid;
 
     if (chassisReady) {
-        chassis.getTrackTelemetry(t.leftTarget, t.leftActual, t.leftPwm, t.leftStalled,
-                                  t.rightTarget, t.rightActual, t.rightPwm, t.rightStalled);
+        chassis.getTrackTelemetry(t.leftTarget, t.leftControlActual, t.leftDisplayActual,
+                                  t.leftPwm, t.leftStalled,
+                                  t.rightTarget, t.rightControlActual, t.rightDisplayActual,
+                                  t.rightPwm, t.rightStalled);
     }
 
     if (turretReady) {
@@ -101,11 +103,14 @@ void TankRobot::publishDebugTelemetry() {
         t.yawActual = turret.getYawActualDeg();
         t.yawRelative = turret.getYawRelativeDeg();
         t.yawVoltage = turret.getYawVoltageTarget();
+        t.yawStalled = turret.yawStallIsLatched();
         t.chassisPitch = turret.getChassisPitchAngle();
         t.chassisPitchRate = turret.getLatestChassisPitchRate();
         t.chassisYawRate = turret.getLatestChassisYawRate();
         t.stabilizationEnabled = turret.stabilizationActive();
         t.imuHealthy = turret.imuIsHealthy();
+        t.chassisImuHealthy = turret.chassisImuIsHealthy();
+        t.turretImuHealthy = turret.turretImuIsHealthy();
         t.yawSensorHealthy = turret.yawSensorIsHealthy();
     }
 
@@ -121,13 +126,20 @@ TankRobot::TankRobot()
 #endif
 
 void TankRobot::setup() {
-    Serial.begin(921600);
+    Serial.begin(Config::USB_SERIAL_BAUD);
+
+    // 电机安全状态必须早于蓝牙、I2C 和传感器初始化。
+    // 这些外设初始化可能耗时或失败，不能让 TB6612 输入在此期间保持浮空。
+    chassis.init();
+    chassis.stop();
+    chassisReady = true;
 
     // Wire 给 FOC/AS5600 用，Wire1 给两颗 MPU6050 用；分总线可以减少 I2C 争用。
     Wire.begin(Config::I2C_FOC_SDA, Config::I2C_FOC_SCL);
     Wire.setClock(400000);
     Wire1.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL);
     Wire1.setClock(400000);
+    Wire1.setTimeOut(Config::IMU_I2C_TIMEOUT_MS);
 
     if (Config::ENABLE_BATTERY_MONITOR) {
         analogReadResolution(12);
@@ -141,11 +153,10 @@ void TankRobot::setup() {
 #if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
     if (!debugLink.begin(Config::DEBUG_BT_NAME)) {
         LOG_ALWAYS("!!! Bluetooth debug link init failed.\n");
+    } else {
+        LOG_ALWAYS(">>> Bluetooth debug ready: %s\n", Config::DEBUG_BT_NAME);
     }
 #endif
-
-    chassis.init();
-    chassisReady = true;
 
     turretReady = turret.init();
     if (turretReady) {
@@ -176,6 +187,19 @@ void TankRobot::loop_without_FOC() {
     uint32_t nowMicros = micros();
 #if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
     debugLink.update();
+
+    DebugPidCommand pidCommand;
+    if (debugLink.readPidCommand(pidCommand)) {
+        if (pidCommand.type == DebugPidCommandType::Set) {
+            chassis.setTrackPidGains(pidCommand.kp, pidCommand.ki, pidCommand.kd);
+        } else if (pidCommand.type == DebugPidCommandType::RestoreDefaults) {
+            chassis.resetTrackPidGains();
+        }
+
+        float kp = 0.0f, ki = 0.0f, kd = 0.0f;
+        chassis.getTrackPidGains(kp, ki, kd);
+        debugLink.sendPidValues(kp, ki, kd);
+    }
 #endif
     updateBatteryMonitor();
 
@@ -188,14 +212,13 @@ void TankRobot::loop_without_FOC() {
     }
 #endif
 
-    if (turretReady && nowMicros - lastIMU >= 2000) { // 500Hz IMU
+    if (turretReady && nowMicros - lastIMU >= Config::IMU_UPDATE_US) { // 200Hz IMU
         float dtIMU = (nowMicros - lastIMU) * 1e-6f;
         lastIMU = nowMicros;
         turret.updateIMU(dtIMU);
     }
 
     if (nowMicros - lastUI >= 20000) { // 50Hz UI
-        float dtUI = (nowMicros - lastUI) * 1e-6f;
         lastUI = nowMicros;
 #if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_XBOX
         xboxController.onLoop();
@@ -204,7 +227,7 @@ void TankRobot::loop_without_FOC() {
 
         ControlInput input;
         if (turretReady && readActiveControlInput(input)) {
-            turret.handleUI(input.aPressed, input.joyRX, input.joyRY, dtUI);
+            turret.handleUI(input.aPressed, input.joyRX, input.joyRY);
         }
     }
 
@@ -221,11 +244,25 @@ void TankRobot::loop_without_FOC() {
             }
         } else {
             ControlInput input;
-            if (chassisReady && readActiveControlInput(input)) {
+            float directLeftPwm = 0.0f;
+            float directRightPwm = 0.0f;
+#if ROBOT_INPUT_MODE == ROBOT_INPUT_MODE_PC_DEBUG
+            bool directPwmRequested = chassisReady &&
+                                      debugLink.readDirectPwm(directLeftPwm, directRightPwm);
+#else
+            bool directPwmRequested = false;
+#endif
+            if (directPwmRequested) {
+                chassis.processDirectTrackPwm(directLeftPwm, directRightPwm);
+                if (turretReady) turret.enterDisconnectedState();
+            } else if (chassisReady && readActiveControlInput(input)) {
                 // 底盘控制复用炮塔模块读取的底盘 IMU：坡度用于重力补偿，角速度用于虚拟惯量补偿。
-                float pRate = turretReady ? turret.getLatestChassisPitchRate() : 0.0f;
-                float yRate = turretReady ? turret.getLatestChassisYawRate() : 0.0f;
-                float pAngle = turretReady ? turret.getChassisPitchAngle() : 0.0f;
+                // IMU 不健康时立即退化为无姿态补偿的普通履带闭环，不让旧值或异常值进入底盘。
+                bool chassisImuHealthy = turretReady && turret.chassisImuIsHealthy();
+                if (!chassisImuHealthy) chassis.resetImuCompensation();
+                float pRate = chassisImuHealthy ? turret.getLatestChassisPitchRate() : 0.0f;
+                float yRate = chassisImuHealthy ? turret.getLatestChassisYawRate() : 0.0f;
+                float pAngle = chassisImuHealthy ? turret.getChassisPitchAngle() : 0.0f;
                 chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl, pRate, yRate, pAngle);
                 if (turretReady) turret.updateStabilization(dtCtrl);
 

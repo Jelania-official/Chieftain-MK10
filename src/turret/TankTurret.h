@@ -33,6 +33,8 @@ private:
     float currentPitchAngle = 90.0f;
     float savedPitch = 0, savedYawCont = 0;
     float yawContDeg = 0;
+    float yawManualRateCmdDps = 0.0f;
+    float pitchManualRateCmdDps = 0.0f;
     volatile bool switchState = false;
     float pitchFiltered = 0;
     float t_gyroZ_offset = 0, t_gyroX_offset = 0; // 炮塔 IMU 零偏
@@ -42,24 +44,54 @@ private:
     float c_gx_cal_deg = 0.0f; // 底盘 pitch 角速度，deg/s
     float c_gz_cal_deg = 0.0f; // 底盘 yaw 角速度，deg/s
     float chassisPitchFiltered = 0.0f; // 底盘坡度角，deg
+    bool chassisImuCalibrated = false;
+    bool turretImuCalibrated = false;
     bool ready = false;
 
+    struct ImuHealthState {
+        bool healthy = false;
+        uint8_t consecutiveFailures = 0;
+        uint8_t consecutiveSuccesses = 0;
+        uint32_t lastValidSampleUs = 0;
+    };
+
+    ImuHealthState chassisImuState;
+    ImuHealthState turretImuState;
+
     // 以下变量会被 FOC 任务和主控制任务共享，因此读写时要进临界区。
-    volatile bool imuHealthy = false;
+    volatile bool chassisImuHealthy = false;
+    volatile bool turretImuHealthy = false;
     volatile bool yawSensorHealthy = false;
     volatile float cachedTurretMechYawDeg = 0.0f;
     volatile uint32_t lastYawSensorUpdateUs = 0;
     volatile float pendingYawTarget = 0.0f;
+    volatile bool yawStallLatched = false;
     uint32_t lastYawSensorCheckUs = 0;
 
-    float wrapAngle180(float angleDeg);
+    // 堵转候选状态只在 Core 1 的控制任务中更新。
+    bool yawStallCandidateActive = false;
+    uint32_t yawStallCandidateSinceMs = 0;
+    float yawStallCandidateStartDeg = 0.0f;
+
+    float wrapAngle180(float angleDeg) const;
     float getRearDeckMinPitch(float yawDeg);
     float protectPitchForRearDeck(float pitchDeg, float yawDeg);
 
     // 直接从 AS5600 读取 0~360 度机械角。失败时返回 false。
     bool readAS5600MechanicalDeg(float& angleDeg);
 
-    void setImuHealthy(bool healthy);
+    // 绕过 Adafruit getEvent() 的无条件 true，直接校验一次 14-byte 寄存器突发读取。
+    bool readMpu6050Event(uint8_t address, sensors_event_t& accel,
+                          sensors_event_t& gyro, sensors_event_t& temp);
+    bool validateImuSample(const sensors_event_t& accel, float gxDeg, float gzDeg,
+                           float& accelNorm, float& accelPitchDeg) const;
+    float calculateAccelTrust(float accelNorm, float accelPitchDeg,
+                              float gyroPredictionDeg) const;
+    void setImuSensorHealthy(bool chassisSensor, bool healthy);
+    void updateImuHealth(ImuHealthState& state, bool chassisSensor,
+                         bool sampleValid, uint32_t nowUs);
+    void initializeImuHealth(ImuHealthState& state, bool chassisSensor,
+                             bool healthy, uint32_t nowUs);
     void setStabilizationEnabled(bool enabled);
     bool isStabilizationEnabled() const;
     void updateYawSensorCache(bool healthy, float sensorDeg = 0.0f);
@@ -68,11 +100,15 @@ private:
     void publishYawTarget(float targetVoltage);
     bool readFocCommand(float& targetVoltage) const;
     bool isYawSensorFresh() const;
+    void resetYawStallCandidate();
+    bool updateYawStallProtection(float targetVoltage, float positionErrorDeg);
+    void latchYawStall(float targetVoltage, float positionErrorDeg);
+    void clearManualRateCommands();
 
     // 返回相对车体正前方的炮塔 yaw 角，范围约为 -180~180 度。
     float getTurretRelativeYawDegFromSensor();
 
-    bool validateImuEvent(float valueDegPerSec);
+    bool validateImuEvent(float valueDegPerSec) const;
 
 public:
     TankTurret(Adafruit_MPU6050& c, Adafruit_MPU6050& t);
@@ -83,7 +119,7 @@ public:
     // 上电静态标定：估计 IMU 陀螺仪零偏，标定期间必须保持车体静止。
     void calibrate();
 
-    // 读取并滤波 IMU 数据。dt 单位秒，通常由 TankRobot 以 500Hz 调用。
+    // 读取并滤波 IMU 数据。dt 单位秒，通常由 TankRobot 以 200Hz 调用。
     void updateIMU(float dt);
 
     // 给底盘模块读取的底盘姿态量。
@@ -100,8 +136,12 @@ public:
     float getYawRelativeDeg();
     float getYawVoltageTarget() const;
     bool stabilizationActive() const;
+    bool chassisImuIsHealthy() const;
+    bool turretImuIsHealthy() const;
+    // 兼容现有遥测：只有两颗 IMU 都健康时才返回 true。
     bool imuIsHealthy() const;
     bool yawSensorIsHealthy() const;
+    bool yawStallIsLatched() const;
 
     // 高频 FOC 入口，由 Core 0 任务循环调用。
     void runFOC();
@@ -113,7 +153,7 @@ public:
     void enterDisconnectedState();
 
     // 处理 A 键开关和右摇杆手动瞄准输入。
-    void handleUI(bool aPressed, float joyX, float joyY, float dt);
+    void handleUI(bool aPressed, float joyX, float joyY);
 
     // 稳定模式控制入口：根据保存的目标角和 IMU/编码器反馈更新舵机和 yaw 电压。
     void updateStabilization(float dt);

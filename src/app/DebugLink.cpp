@@ -23,16 +23,115 @@ bool DebugLink::readInput(ControlInput& out) {
     return true;
 }
 
+bool DebugLink::readDirectPwm(float& leftPwm, float& rightPwm) {
+    if (!hasFreshInput(Config::DEBUG_INPUT_TIMEOUT_MS) || !directPwmActive) return false;
+    leftPwm = directLeftPwm;
+    rightPwm = directRightPwm;
+    return true;
+}
+
 bool DebugLink::stopRequested() {
     return emergencyStop ||
            (connected() && inputFresh && ((uint32_t)(millis() - lastInputMs) > Config::DEBUG_INPUT_TIMEOUT_MS));
 }
 
+bool DebugLink::readPidCommand(DebugPidCommand& out) {
+    if (pendingPidCommand.type == DebugPidCommandType::None) return false;
+    out = pendingPidCommand;
+    pendingPidCommand = DebugPidCommand{};
+    return true;
+}
+
+void DebugLink::sendPidValues(float kp, float ki, float kd) {
+    if (!connected()) return;
+    serial.printf("PID,VALUE,%.4f,%.4f,%.4f\n", kp, ki, kd);
+}
+
+void DebugLink::sendPidError(const char* reason) {
+    if (!connected()) return;
+    serial.printf("PID,ERROR,%s\n", reason != nullptr ? reason : "unknown");
+}
+
 void DebugLink::handleLine(char* line) {
+    if (strcmp(line, "HELLO,2") == 0) {
+        serial.println("HELLO,ChieftainMK10,2");
+        return;
+    }
+
     if (strcmp(line, "STOP") == 0) {
         latestInput = ControlInput{};
         inputFresh = true;
         emergencyStop = true;
+        directPwmActive = false;
+        directLeftPwm = 0.0f;
+        directRightPwm = 0.0f;
+        lastInputMs = millis();
+        return;
+    }
+
+    if (strcmp(line, "PID,GET") == 0) {
+        pendingPidCommand = DebugPidCommand{};
+        pendingPidCommand.type = DebugPidCommandType::Get;
+        return;
+    }
+
+    if (strcmp(line, "PID,DEFAULT") == 0) {
+        pendingPidCommand = DebugPidCommand{};
+        pendingPidCommand.type = DebugPidCommandType::RestoreDefaults;
+        return;
+    }
+
+    if (strncmp(line, "PID,SET,", 8) == 0) {
+        char* token = strtok(line + 8, ",");
+        if (token == nullptr) {
+            sendPidError("format");
+            return;
+        }
+        float kp = atof(token);
+        token = strtok(nullptr, ",");
+        if (token == nullptr) {
+            sendPidError("format");
+            return;
+        }
+        float ki = atof(token);
+        token = strtok(nullptr, ",");
+        if (token == nullptr) {
+            sendPidError("format");
+            return;
+        }
+        float kd = atof(token);
+
+        // 手调范围只用于防止误输入，不改变正常控制输出的最终 ±255 安全限幅。
+        if (!isfinite(kp) || !isfinite(ki) || !isfinite(kd) ||
+            kp < 0.0f || kp > 50.0f ||
+            ki < 0.0f || ki > 50.0f ||
+            kd < 0.0f || kd > 10.0f) {
+            sendPidError("range");
+            return;
+        }
+        pendingPidCommand = DebugPidCommand{};
+        pendingPidCommand.type = DebugPidCommandType::Set;
+        pendingPidCommand.kp = kp;
+        pendingPidCommand.ki = ki;
+        pendingPidCommand.kd = kd;
+        return;
+    }
+
+    if (strncmp(line, "PWM,", 4) == 0) {
+        // 固定 PWM 指令不能自行解除急停；必须先收到一次明确的零输入解锁。
+        if (emergencyStop) return;
+        char* token = strtok(line + 4, ",");
+        if (token == nullptr) return;
+        float leftPwm = atof(token);
+        token = strtok(nullptr, ",");
+        if (token == nullptr) return;
+        float rightPwm = atof(token);
+
+        latestInput = ControlInput{};
+        directLeftPwm = constrain(leftPwm, -Config::DEBUG_DIRECT_PWM_MAX, Config::DEBUG_DIRECT_PWM_MAX);
+        directRightPwm = constrain(rightPwm, -Config::DEBUG_DIRECT_PWM_MAX, Config::DEBUG_DIRECT_PWM_MAX);
+        directPwmActive = true;
+        inputFresh = true;
         lastInputMs = millis();
         return;
     }
@@ -65,6 +164,9 @@ void DebugLink::handleLine(char* line) {
     latestInput.joyRX = constrain(values[3], -1.0f, 1.0f);
     latestInput.joyRY = constrain(values[4], -1.0f, 1.0f);
     latestInput.aPressed = (aPressed != 0);
+    directPwmActive = false;
+    directLeftPwm = 0.0f;
+    directRightPwm = 0.0f;
     inputFresh = true;
     emergencyStop = (stop != 0);
     lastInputMs = millis();
@@ -90,6 +192,10 @@ void DebugLink::update() {
     if (!connected()) {
         inputFresh = false;
         emergencyStop = false;
+        directPwmActive = false;
+        directLeftPwm = 0.0f;
+        directRightPwm = 0.0f;
+        pendingPidCommand = DebugPidCommand{};
         rxLen = 0;
     }
 }
@@ -101,17 +207,19 @@ void DebugLink::sendTelemetry(const DebugTelemetry& t, uint32_t intervalMs) {
     lastTelemetryMs = nowMs;
 
     serial.printf(
-        "TEL,%lu,%.3f,%.3f,%.1f,%d,%.3f,%.3f,%.1f,%d,"
-        "%.3f,%.3f,%.1f,%.3f,%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%.3f,%d\n",
+        "TEL,%lu,%.3f,%.3f,%.3f,%.1f,%d,%.3f,%.3f,%.3f,%.1f,%d,"
+        "%.3f,%.3f,%.1f,%.3f,%.3f,%.3f,%.3f,%d,"
+        "%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.3f,%d\n",
         (unsigned long)t.timeMs,
-        t.leftTarget, t.leftActual, t.leftPwm, t.leftStalled ? 1 : 0,
-        t.rightTarget, t.rightActual, t.rightPwm, t.rightStalled ? 1 : 0,
+        t.leftTarget, t.leftControlActual, t.leftDisplayActual, t.leftPwm, t.leftStalled ? 1 : 0,
+        t.rightTarget, t.rightControlActual, t.rightDisplayActual, t.rightPwm, t.rightStalled ? 1 : 0,
         t.pitchTarget, t.pitchActual, t.pitchServo,
-        t.yawTarget, t.yawActual, t.yawRelative, t.yawVoltage,
+        t.yawTarget, t.yawActual, t.yawRelative, t.yawVoltage, t.yawStalled ? 1 : 0,
         t.chassisPitch, t.chassisPitchRate, t.chassisYawRate,
         t.stabilizationEnabled ? 1 : 0,
         t.imuHealthy ? 1 : 0,
+        t.chassisImuHealthy ? 1 : 0,
+        t.turretImuHealthy ? 1 : 0,
         t.yawSensorHealthy ? 1 : 0,
         t.chassisReady ? 1 : 0,
         t.turretReady ? 1 : 0,
