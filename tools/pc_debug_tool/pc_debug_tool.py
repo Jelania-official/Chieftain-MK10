@@ -189,7 +189,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_port: serial.Serial | None = None
         self.auto_connect_worker: AutoConnectWorker | None = None
         self.input_state = InputState()
-        self.direct_pwm_held = False
+        self.direct_pwm_active = False
         self.last_rx_time = 0.0
         self.data: dict[str, deque[float]] = {
             name: deque(maxlen=800) for name in TELEMETRY_FIELDS
@@ -265,30 +265,28 @@ class MainWindow(QtWidgets.QMainWindow):
         stop_btn.clicked.connect(self._emergency_stop)
         clear_stop_btn.clicked.connect(self._clear_stop)
 
-        diagnostic_group = QtWidgets.QGroupBox("固定 PWM 硬件诊断")
+        diagnostic_group = QtWidgets.QGroupBox("固定 PWM 标定 / 硬件诊断")
         diagnostic_layout = QtWidgets.QGridLayout(diagnostic_group)
-        self.direct_pwm_check = QtWidgets.QCheckBox("履带已架空，启用诊断模式")
+        self.direct_pwm_check = QtWidgets.QCheckBox("确认周围安全，启用固定 PWM 模式")
         self.left_pwm_spin = QtWidgets.QSpinBox()
         self.right_pwm_spin = QtWidgets.QSpinBox()
         for spin in (self.left_pwm_spin, self.right_pwm_spin):
             spin.setRange(-180, 180)
-            spin.setSingleStep(10)
+            spin.setSingleStep(1)
             spin.setValue(0)
             spin.setEnabled(False)
-        self.direct_pwm_hold_btn = QtWidgets.QPushButton("按住此按钮才输出 PWM")
-        self.direct_pwm_hold_btn.setEnabled(False)
-        self.direct_pwm_hold_btn.setStyleSheet("QPushButton:pressed { background-color: #f5a623; }")
+        self.direct_pwm_output_btn = QtWidgets.QPushButton("开始输出 PWM")
+        self.direct_pwm_output_btn.setEnabled(False)
         diagnostic_layout.addWidget(self.direct_pwm_check, 0, 0, 1, 2)
         diagnostic_layout.addWidget(QtWidgets.QLabel("左履带 PWM"), 1, 0)
         diagnostic_layout.addWidget(self.left_pwm_spin, 1, 1)
         diagnostic_layout.addWidget(QtWidgets.QLabel("右履带 PWM"), 2, 0)
         diagnostic_layout.addWidget(self.right_pwm_spin, 2, 1)
-        diagnostic_layout.addWidget(self.direct_pwm_hold_btn, 3, 0, 1, 2)
-        diagnostic_layout.addWidget(QtWidgets.QLabel("范围 ±180；松手、失焦、断连或急停立即归零"), 4, 0, 1, 2)
+        diagnostic_layout.addWidget(self.direct_pwm_output_btn, 3, 0, 1, 2)
+        diagnostic_layout.addWidget(QtWidgets.QLabel("范围 ±180；再次点击停止；失焦、断连或急停立即归零"), 4, 0, 1, 2)
         controls.addWidget(diagnostic_group)
         self.direct_pwm_check.toggled.connect(self._toggle_direct_pwm)
-        self.direct_pwm_hold_btn.pressed.connect(self._start_direct_pwm)
-        self.direct_pwm_hold_btn.released.connect(self._stop_direct_pwm)
+        self.direct_pwm_output_btn.clicked.connect(self._toggle_direct_pwm_output)
 
         pid_group = QtWidgets.QGroupBox("履带 PID 手动调参（左右共用）")
         pid_layout = QtWidgets.QGridLayout(pid_group)
@@ -419,6 +417,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
         self.serial_port = port
+        self._set_direct_pwm_active(False)
         self.input_state.zero_motion()
         self.input_state.stop = True
         self.connect_btn.setText("断开连接")
@@ -471,6 +470,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText(f"串口错误：{exc}")
             self.serial_port.close()
             self.serial_port = None
+            self._set_direct_pwm_active(False)
             self.connect_btn.setText("连接")
             self.input_state.zero_motion()
             self.input_state.stop = True
@@ -543,8 +543,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.input_state.zero_motion()
         else:
             self.input_state.update_from_keys()
-        direct_left = self.left_pwm_spin.value() if self.direct_pwm_held else 0
-        direct_right = self.right_pwm_spin.value() if self.direct_pwm_held else 0
+        direct_left = self.left_pwm_spin.value() if self.direct_pwm_active else 0
+        direct_right = self.right_pwm_spin.value() if self.direct_pwm_active else 0
         self.input_label.setText(
             f"倒车 LT={self.input_state.trigger_l:.1f}  前进 RT={self.input_state.trigger_r:.1f}\n"
             f"转向 LX={self.input_state.joy_lx:.2f}\n"
@@ -564,6 +564,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except serial.SerialException:
             self.serial_port.close()
             self.serial_port = None
+            self._set_direct_pwm_active(False)
             self.connect_btn.setText("连接")
             self.input_state.zero_motion()
             self.input_state.stop = True
@@ -587,7 +588,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _zero_input(self) -> None:
         self.input_state.zero_motion()
-        self.direct_pwm_held = False
+        self._set_direct_pwm_active(False, send_zero=True)
         self.left_pwm_spin.setValue(0)
         self.right_pwm_spin.setValue(0)
         self.mouse_pad._pos = QtCore.QPointF(0.0, 0.0)
@@ -595,12 +596,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _emergency_stop(self) -> None:
         self.input_state.zero_motion()
-        self.direct_pwm_held = False
+        self._set_direct_pwm_active(False, send_zero=True)
         self.input_state.stop = True
 
     def _clear_stop(self) -> None:
         self.input_state.zero_motion()
-        self.direct_pwm_held = False
+        self._set_direct_pwm_active(False, send_zero=True)
         self.input_state.stop = False
         if self.serial_port and self.serial_port.is_open:
             try:
@@ -610,13 +611,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     def _toggle_direct_pwm(self, enabled: bool) -> None:
-        self.direct_pwm_held = False
+        self._set_direct_pwm_active(False, send_zero=True)
         if enabled:
             answer = QtWidgets.QMessageBox.warning(
                 self,
                 "固定 PWM 诊断",
                 "该模式会绕过速度 PI 和堵转保护。\n\n"
-                "确认左右履带已经完全架空，并且可以立即按下急停。",
+                "首次测试应架空履带；落地标定时车辆可能突然移动。\n"
+                "请清空周围区域，并确保可以立即按下急停。",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No,
             )
@@ -627,17 +629,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 enabled = False
         self.left_pwm_spin.setEnabled(enabled)
         self.right_pwm_spin.setEnabled(enabled)
-        self.direct_pwm_hold_btn.setEnabled(enabled)
+        self.direct_pwm_output_btn.setEnabled(enabled)
         self.input_state.zero_motion()
         self._send_direct_pwm_zero()
 
-    def _start_direct_pwm(self) -> None:
+    def _toggle_direct_pwm_output(self) -> None:
+        if self.direct_pwm_active:
+            self._set_direct_pwm_active(False, send_zero=True)
+            return
         if self.direct_pwm_check.isChecked() and not self.input_state.stop:
-            self.direct_pwm_held = True
+            self._set_direct_pwm_active(True)
 
-    def _stop_direct_pwm(self) -> None:
-        self.direct_pwm_held = False
-        self._send_direct_pwm_zero()
+    def _set_direct_pwm_active(self, active: bool, send_zero: bool = False) -> None:
+        self.direct_pwm_active = active
+        if hasattr(self, "direct_pwm_output_btn"):
+            self.direct_pwm_output_btn.setText("停止输出 PWM" if active else "开始输出 PWM")
+            self.direct_pwm_output_btn.setStyleSheet(
+                "QPushButton { background-color: #f5a623; font-weight: bold; }" if active else ""
+            )
+        if not active and send_zero:
+            self._send_direct_pwm_zero()
 
     def _send_direct_pwm_zero(self) -> None:
         if not self.serial_port or not self.serial_port.is_open:
@@ -676,9 +687,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.WindowDeactivate and hasattr(self, "input_state"):
             self.input_state.zero_motion()
-            self.direct_pwm_held = False
-            if hasattr(self, "serial_port"):
-                self._send_direct_pwm_zero()
+            self._set_direct_pwm_active(False, send_zero=True)
         return super().event(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:

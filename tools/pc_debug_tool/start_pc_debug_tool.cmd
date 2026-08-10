@@ -29,12 +29,12 @@ exit /b 1
 %PY_CMD% -c "import serial; import PySide6; import pyqtgraph" >nul 2>nul
 if errorlevel 1 (
     echo Installing Python dependencies...
-    %PY_CMD% -m pip install -r pc_debug_tool_requirements.txt
+    %PY_CMD% -m pip install -r requirements.txt
     if errorlevel 1 (
         echo.
         echo Failed to install Python dependencies.
         echo Try this command manually:
-        echo %PY_CMD% -m pip install -r pc_debug_tool_requirements.txt
+        echo %PY_CMD% -m pip install -r requirements.txt
         echo.
         pause
         exit /b 1
