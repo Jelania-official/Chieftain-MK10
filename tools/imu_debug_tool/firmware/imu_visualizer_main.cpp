@@ -1,22 +1,23 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include "config/RobotConfig.h"
+#include "sensors/Mpu6x00Compat.h"
 
 namespace {
 constexpr uint8_t kChassisImuAddress = 0x68;
 constexpr uint32_t kSerialBaud = 115200;
 constexpr uint32_t kFusionPeriodUs = 5000;      // 200Hz 姿态融合
 constexpr uint32_t kTelemetryPeriodMs = 20;     // 50Hz USB 串口输出
+constexpr uint32_t kStartupI2cTimeoutMs = 20;   // 启动诊断时允许总线恢复
 constexpr int kGyroCalibSamples = 1200;
+constexpr int kStressTestSamples = 1000;
 constexpr float kRadToDeg = 57.2957795131f;
 constexpr uint8_t kAccelOutRegister = 0x3B;
 constexpr size_t kFrameBytes = 14;
 constexpr float kAccelLsbPerG4G = 8192.0f;
 constexpr float kGyroLsbPerDps500 = 65.5f;
 
-Adafruit_MPU6050 mpu;
 uint8_t activeMpuAddress = kChassisImuAddress;
 
 float gyroBiasX = 0.0f;
@@ -25,6 +26,8 @@ float gyroBiasZ = 0.0f;
 
 uint32_t lastFusionUs = 0;
 uint32_t lastTelemetryMs = 0;
+uint32_t runtimeReadFailuresTotal = 0;
+uint32_t runtimeConsecutiveFailures = 0;
 
 struct ImuFrame {
     float ax = 0.0f, ay = 0.0f, az = 0.0f;       // m/s^2
@@ -154,19 +157,62 @@ private:
 MahonyImuFusion fusion;
 ImuFrame latest;
 
-bool readImu(ImuFrame& out) {
-    Wire.beginTransmission(activeMpuAddress);
-    Wire.write(kAccelOutRegister);
-    if (Wire.endTransmission(false) != 0) return false;
+bool readRegister(uint8_t address, uint8_t reg, uint8_t& value, bool repeatedStart = false) {
+    return Mpu6x00Compat::readRegister(Wire, address, reg, value, repeatedStart);
+}
 
-    size_t received = Wire.requestFrom(activeMpuAddress, (uint8_t)kFrameBytes, (uint8_t)true);
-    if (received != kFrameBytes || Wire.available() < (int)kFrameBytes) {
-        while (Wire.available() > 0) Wire.read();
-        return false;
+bool diagnoseWhoAmI(uint32_t clockHz, bool repeatedStart = false) {
+    Wire.setClock(clockHz);
+    int validReads = 0;
+    int supportedReads = 0;
+    uint8_t firstSupportedId = 0;
+    bool consistentId = true;
+    const char* mode = repeatedStart ? "restart" : "stop";
+
+    for (int attempt = 1; attempt <= 5; ++attempt) {
+        uint8_t value = 0;
+        bool ok = readRegister(kChassisImuAddress, Mpu6x00Compat::WHO_AM_I_REG,
+                               value, repeatedStart);
+        if (ok) {
+            ++validReads;
+            if (Mpu6x00Compat::isSupportedId(value)) {
+                ++supportedReads;
+                if (firstSupportedId == 0) firstSupportedId = value;
+                if (value != firstSupportedId) consistentId = false;
+            }
+            Serial.printf("INFO,who_am_i,%lu,%s,attempt_%d,0x%02X\n",
+                          (unsigned long)clockHz, mode, attempt, value);
+        } else {
+            Serial.printf("ERR,who_am_i_read_failed,%lu,%s,attempt_%d\n",
+                          (unsigned long)clockHz, mode, attempt);
+        }
+        delay(5);
     }
 
+    Serial.printf("INFO,who_am_i_summary,%lu,%s,valid_%d,supported_%d,id_0x%02X\n",
+                  (unsigned long)clockHz, mode, validReads, supportedReads,
+                  firstSupportedId);
+    // 切换时钟后的第一次交易可能因总线恢复而超时。
+    // 4/5 次均为同一个支持的 ID 已足以确认身份；后续压力测试
+    // 仍会严格统计每一次传输错误。
+    return validReads >= 4 && supportedReads == validReads && consistentId;
+}
+
+void restartI2c(uint32_t clockHz) {
+    Wire.end();
+    delay(10);
+    Wire.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL);
+    Wire.setClock(clockHz);
+    Wire.setTimeOut(kStartupI2cTimeoutMs);
+    delay(10);
+}
+
+bool readImu(ImuFrame& out) {
     uint8_t frame[kFrameBytes] = {};
-    for (size_t i = 0; i < kFrameBytes; ++i) frame[i] = (uint8_t)Wire.read();
+    if (!Mpu6x00Compat::readRegisters(
+            Wire, activeMpuAddress, kAccelOutRegister, frame, kFrameBytes)) {
+        return false;
+    }
     auto decode = [&](size_t index) -> int16_t {
         return (int16_t)(((uint16_t)frame[index] << 8) | frame[index + 1]);
     };
@@ -183,6 +229,46 @@ bool readImu(ImuFrame& out) {
 
     return isfinite(out.ax) && isfinite(out.ay) && isfinite(out.az) &&
            isfinite(out.gx) && isfinite(out.gy) && isfinite(out.gz);
+}
+
+struct StressResult {
+    int transportFailures = 0;
+    int invalidSamples = 0;
+    int maxConsecutiveFailures = 0;
+};
+
+StressResult runI2cStressTest(uint32_t clockHz) {
+    Wire.setClock(clockHz);
+    delay(20);
+
+    StressResult result;
+    int consecutiveFailures = 0;
+    ImuFrame sample;
+    for (int i = 0; i < kStressTestSamples; ++i) {
+        if (!readImu(sample)) {
+            ++result.transportFailures;
+            ++consecutiveFailures;
+            result.maxConsecutiveFailures = max(
+                result.maxConsecutiveFailures, consecutiveFailures);
+            continue;
+        }
+
+        float accelNorm = sqrtf(
+            sample.ax * sample.ax + sample.ay * sample.ay + sample.az * sample.az);
+        bool plausible = isfinite(accelNorm) && accelNorm >= 1.0f && accelNorm <= 50.0f &&
+                         fabsf(sample.gx * kRadToDeg) <= Config::IMU_GYRO_SANITY_DPS &&
+                         fabsf(sample.gy * kRadToDeg) <= Config::IMU_GYRO_SANITY_DPS &&
+                         fabsf(sample.gz * kRadToDeg) <= Config::IMU_GYRO_SANITY_DPS &&
+                         sample.temp >= -40.0f && sample.temp <= 125.0f;
+        if (!plausible) ++result.invalidSamples;
+        consecutiveFailures = 0;
+    }
+
+    Serial.printf(
+        "INFO,i2c_stress,%lu,total_%d,transport_fail_%d,invalid_%d,max_consecutive_%d\n",
+        (unsigned long)clockHz, kStressTestSamples, result.transportFailures,
+        result.invalidSamples, result.maxConsecutiveFailures);
+    return result;
 }
 
 void calibrateGyro() {
@@ -291,7 +377,7 @@ void setup() {
     Serial.println("INFO,init_i2c");
     Wire.begin(Config::I2C_IMU_SDA, Config::I2C_IMU_SCL);
     Wire.setClock(400000);
-    Wire.setTimeOut(Config::IMU_I2C_TIMEOUT_MS);
+    Wire.setTimeOut(kStartupI2cTimeoutMs);
     
     // 扫描 I2C 总线
     Serial.println("INFO,scanning_i2c_bus");
@@ -314,23 +400,36 @@ void setup() {
     
     // 尝试连接 MPU6050
     Serial.println("INFO,trying_mpu6050");
-    
-    bool mpu_ok = false;
-    if (mpu.begin(kChassisImuAddress, &Wire)) {
-        Serial.printf("INFO,mpu6050_found_at_0x%02X\n", kChassisImuAddress);
-        activeMpuAddress = kChassisImuAddress;
-        mpu_ok = true;
-    } else {
-        uint8_t alt_addr = (kChassisImuAddress == 0x68) ? 0x69 : 0x68;
-        Serial.printf("INFO,trying_alt_addr_0x%02X\n", alt_addr);
-        if (mpu.begin(alt_addr, &Wire)) {
-            Serial.printf("INFO,mpu6050_found_at_0x%02X\n", alt_addr);
-            activeMpuAddress = alt_addr;
-            mpu_ok = true;
-        }
+
+    // 地址 ACK 只证明总线上存在从机；经典版 ID=0x68，商家新版兼容 ID=0x70。
+    // 先在整车使用的 400kHz 下验证，再用 100kHz 区分信号完整性问题。
+    bool whoAmIStable = diagnoseWhoAmI(400000);
+    if (!whoAmIStable) {
+        Serial.println("INFO,retrying_who_am_i_at_100khz");
+        whoAmIStable = diagnoseWhoAmI(100000);
     }
-    
-    if (!mpu_ok) {
+    if (!whoAmIStable) {
+        Serial.println("ERR,who_am_i_not_stable_supported_id");
+    }
+
+    // 诊断期间出现过超时时，ESP32 I2C 控制器可能保留错误状态。
+    // 正式配置传感器前重建驱动，避免诊断本身导致后续全部读取失败。
+    restartI2c(100000);
+    Mpu6x00Compat::InitResult initResult =
+        Mpu6x00Compat::initialize(Wire, kChassisImuAddress);
+    if (!initResult.ok) {
+        uint8_t altAddress = (kChassisImuAddress == 0x68) ? 0x69 : 0x68;
+        Serial.printf("INFO,trying_alt_addr_0x%02X\n", altAddress);
+        initResult = Mpu6x00Compat::initialize(Wire, altAddress);
+        if (initResult.ok) activeMpuAddress = altAddress;
+    } else {
+        activeMpuAddress = kChassisImuAddress;
+    }
+
+    if (!initResult.ok) {
+        Serial.printf("ERR,mpu_init_failed,stage_%s,last_id_0x%02X\n",
+                      Mpu6x00Compat::stageName(initResult.failedStage),
+                      initResult.whoAmI);
         Serial.println("ERR,mpu6050_not_found");
         Serial.println("ERR,check_connections");
         while (true) {
@@ -339,14 +438,24 @@ void setup() {
         }
     }
 
-    // 配置 MPU6050
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-    mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
-    
-    Serial.println("INFO,mpu6050_configured");
+    Serial.printf("INFO,mpu_compatible_found,address_0x%02X,id_0x%02X\n",
+                  activeMpuAddress, initResult.whoAmI);
+    Serial.println("INFO,mpu_configured,rate_200hz,accel_4g,gyro_500dps,dlpf_44hz");
+
+    StressResult stress100 = runI2cStressTest(100000);
+    StressResult stress400 = runI2cStressTest(400000);
+    int errors100 = stress100.transportFailures + stress100.invalidSamples;
+    int errors400 = stress400.transportFailures + stress400.invalidSamples;
+    uint32_t selectedClock = errors400 <= errors100 ? 400000 : 100000;
+    Wire.setClock(selectedClock);
+    Serial.printf("INFO,i2c_selected_clock,%lu\n", (unsigned long)selectedClock);
+    if (min(errors100, errors400) > 0) {
+        Serial.println("WARN,i2c_stress_not_clean");
+    }
 
     calibrateGyro();
+    runtimeReadFailuresTotal = 0;
+    runtimeConsecutiveFailures = 0;
     lastFusionUs = micros();
     lastTelemetryMs = millis();
     Serial.println("INFO,ready");
@@ -361,9 +470,27 @@ void loop() {
     float dt = (nowUs - lastFusionUs) * 1e-6f;
     lastFusionUs = nowUs;
 
-    if (readImu(latest)) {
-        fusion.update(latest.gx, latest.gy, latest.gz, latest.ax, latest.ay, latest.az, dt);
+    if (!readImu(latest)) {
+        ++runtimeReadFailuresTotal;
+        ++runtimeConsecutiveFailures;
+        if (runtimeConsecutiveFailures == 1) {
+            Serial.printf("WARN,imu_runtime_read_failed,consecutive_1,total_%lu\n",
+                          (unsigned long)runtimeReadFailuresTotal);
+        } else if (runtimeConsecutiveFailures == 3) {
+            Serial.printf("ERR,imu_runtime_unhealthy,consecutive_3,total_%lu\n",
+                          (unsigned long)runtimeReadFailuresTotal);
+        }
+        // 不再把上一帧缓存冒充为新数据发给上位机。
+        return;
     }
+
+    if (runtimeConsecutiveFailures > 0) {
+        Serial.printf("INFO,imu_runtime_recovered,previous_consecutive_%lu,total_%lu\n",
+                      (unsigned long)runtimeConsecutiveFailures,
+                      (unsigned long)runtimeReadFailuresTotal);
+        runtimeConsecutiveFailures = 0;
+    }
+    fusion.update(latest.gx, latest.gy, latest.gz, latest.ax, latest.ay, latest.az, dt);
 
     uint32_t nowMs = millis();
     if ((uint32_t)(nowMs - lastTelemetryMs) >= kTelemetryPeriodMs) {

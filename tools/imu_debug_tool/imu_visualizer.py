@@ -17,6 +17,7 @@ except Exception:
 
 BAUD_RATE = 115200
 MAX_POINTS = 1000
+VIEW_REFRESH_MS = 50
 
 
 class AttitudeWidget(QtWidgets.QWidget):
@@ -175,6 +176,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Chieftain MK10 - USB IMU Visualizer")
         self.serial_port = None
         self.rx_buffer = ""
+        self.diagnostic_lines = deque(maxlen=200)
+        self.view_dirty = False
 
         self.samples = deque(maxlen=MAX_POINTS)
         self.start_ms = None
@@ -187,6 +190,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.poll_serial)
         self.timer.start(10)
 
+        # 串口数据持续接收，界面独立限制为 20Hz 刷新。
+        # 避免每收到一帧就重绘 3D 模型和全部曲线，拖死 Qt 主线程。
+        self.view_timer = QtCore.QTimer(self)
+        self.view_timer.timeout.connect(self.refresh_view_if_needed)
+        self.view_timer.start(VIEW_REFRESH_MS)
+
     def _build_ui(self):
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -197,6 +206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_button = QtWidgets.QPushButton("连接")
         self.zero_button = QtWidgets.QPushButton("姿态归零")
         self.cal_button = QtWidgets.QPushButton("重新校准")
+        self.copy_diag_button = QtWidgets.QPushButton("复制诊断")
         self.status_label = QtWidgets.QLabel("未连接")
 
         controls.addWidget(QtWidgets.QLabel("串口"))
@@ -205,6 +215,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.connect_button)
         controls.addWidget(self.zero_button)
         controls.addWidget(self.cal_button)
+        controls.addWidget(self.copy_diag_button)
         controls.addWidget(self.status_label)
         layout.addLayout(controls)
 
@@ -253,6 +264,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_button.clicked.connect(self.toggle_connection)
         self.zero_button.clicked.connect(lambda: self.send_command("ZERO"))
         self.cal_button.clicked.connect(lambda: self.send_command("CAL"))
+        self.copy_diag_button.clicked.connect(self.copy_diagnostics)
 
         self.setCentralWidget(central)
         self.resize(1280, 820)
@@ -300,21 +312,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.serial_port.rts = False
             
             self.samples.clear()
+            self.diagnostic_lines.clear()
             self.start_ms = None
             self.rx_buffer = ""
+            self.view_dirty = False
             self.update_connection_state(True)
             self.status_label.setText(f"已连接 {port}")
-            
-            # 添加短暂的延迟让ESP32稳定
-            import time
-            time.sleep(0.5)
-            
+
         except serial.SerialException as exc:
             QtWidgets.QMessageBox.critical(self, "连接失败", str(exc))
 
     def send_command(self, command):
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.write((command + "\n").encode("ascii"))
+
+    def copy_diagnostics(self):
+        text = "\n".join(self.diagnostic_lines)
+        if not text:
+            text = "暂无 INFO/ERR 诊断信息"
+        QtWidgets.QApplication.clipboard().setText(text)
+        self.status_label.setText("诊断信息已复制到剪贴板")
 
     def poll_serial(self):
         if not self.serial_port or not self.serial_port.is_open:
@@ -329,43 +346,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.update_connection_state(False)
             return
 
-        if chunk:
-            # 添加调试输出
-            print(f"收到原始数据 ({len(chunk)} 字节): {chunk[:200]}")  # 只打印前200字节
-            
         if not chunk:
             return
 
         self.rx_buffer += chunk.decode("utf-8", errors="ignore")
         while "\n" in self.rx_buffer:
             line, self.rx_buffer = self.rx_buffer.split("\n", 1)
-            # 添加调试输出
-            print(f"解析行: {line[:100]}")  # 只打印前100字符
             self.handle_line(line.strip())
 
     def handle_line(self, line):
-        # 打印所有接收到的行
-        print(f"处理行: '{line}'")
-        
         if not line:
             return
         if line.startswith("INFO,"):
-            print(f"INFO行: {line}")
+            self.diagnostic_lines.append(line)
+            print(line, flush=True)
             self.status_label.setText(line)
             return
-        if line.startswith("ERR,"):
-            print(f"ERR行: {line}")
+        if line.startswith(("ERR,", "WARN,")):
+            self.diagnostic_lines.append(line)
+            print(line, flush=True)
             self.status_label.setText(line)
             return
         if not line.startswith("IMU,"):
-            print(f"忽略非IMU行: {line[:50]}")
             return
 
         parts = line.split(",")
-        print(f"IMU数据字段数: {len(parts)}, 期望: 17")
         if len(parts) != 17:
-            print(f"字段数量不匹配: {len(parts)} != 17")
-            print(f"字段内容: {parts}")
             return
 
         try:
@@ -376,14 +382,11 @@ class MainWindow(QtWidgets.QMainWindow):
             qw, qx, qy, qz = map(float, parts[9:13])
             roll, pitch, yaw = map(float, parts[13:16])
             temp = float(parts[16])
-            print(f"解析成功: roll={roll:.2f}, pitch={pitch:.2f}, yaw={yaw:.2f}")
-        except ValueError as e:
-            print(f"数值解析错误: {e}")
+        except ValueError:
             return
 
         if self.start_ms is None:
             self.start_ms = t_ms
-            print(f"设置起始时间: {t_ms}")
         t = (t_ms - self.start_ms) / 1000.0
 
         self.samples.append({
@@ -394,6 +397,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "roll": roll, "pitch": pitch, "yaw": yaw,
             "temp": temp,
         })
+        self.view_dirty = True
+
+    def refresh_view_if_needed(self):
+        if not self.view_dirty:
+            return
+        self.view_dirty = False
         self.update_view()
 
     def update_view(self):

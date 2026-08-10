@@ -1,4 +1,5 @@
 #include "TankTurret.h"
+#include "sensors/Mpu6x00Compat.h"
 
 portMUX_TYPE turretStateMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -62,19 +63,11 @@ bool TankTurret::readAS5600MechanicalDeg(float& angleDeg) {
 
 bool TankTurret::readMpu6050Event(uint8_t address, sensors_event_t& accel,
                                  sensors_event_t& gyro, sensors_event_t& temp) {
-        Wire1.beginTransmission(address);
-        Wire1.write(MPU6050_ACCEL_OUT_REG);
-        if (Wire1.endTransmission(false) != 0) return false;
-
-        size_t received = Wire1.requestFrom(address, (uint8_t)MPU6050_FRAME_BYTES, (uint8_t)true);
-        if (received != MPU6050_FRAME_BYTES || Wire1.available() < (int)MPU6050_FRAME_BYTES) {
-            while (Wire1.available() > 0) Wire1.read();
-            return false;
-        }
-
         uint8_t frame[MPU6050_FRAME_BYTES] = {};
-        for (size_t i = 0; i < MPU6050_FRAME_BYTES; ++i) {
-            frame[i] = (uint8_t)Wire1.read();
+        if (!Mpu6x00Compat::readRegisters(
+                Wire1, address, MPU6050_ACCEL_OUT_REG,
+                frame, MPU6050_FRAME_BYTES)) {
+            return false;
         }
 
         int16_t rawAx = decodeInt16(&frame[0]);
@@ -377,25 +370,29 @@ bool TankTurret::init() {
         pitchServo.attach(Config::SERVO_PIN, 500, 2500);
         pitchServo.write(90);
 
-        bool chassisOk = mpuC.begin(MPU6050_CHASSIS_ADDR, &Wire1);
-        bool turretOk = mpuT.begin(MPU6050_TURRET_ADDR, &Wire1);
-        if (!chassisOk || !turretOk) {
-            LOG_ALWAYS("!!! MPU6050 init failed: chassis=%d turret=%d\n", chassisOk, turretOk);
+        // 不使用 Adafruit_MPU6050::begin()：它把 WHO_AM_I 硬编码为 0x68，
+        // 会拒绝商家新版、寄存器兼容但返回 0x70 的模块。
+        // 项目内兼容层会校验 0x68/0x70、复位、配置并逐项回读关键寄存器。
+        Mpu6x00Compat::InitResult chassisInit =
+            Mpu6x00Compat::initialize(Wire1, MPU6050_CHASSIS_ADDR);
+        Mpu6x00Compat::InitResult turretInit =
+            Mpu6x00Compat::initialize(Wire1, MPU6050_TURRET_ADDR);
+        if (!chassisInit.ok || !turretInit.ok) {
+            LOG_ALWAYS(
+                "!!! IMU init failed: chassis=%d stage=%s id=0x%02X "
+                "turret=%d stage=%s id=0x%02X\n",
+                chassisInit.ok, Mpu6x00Compat::stageName(chassisInit.failedStage),
+                chassisInit.whoAmI,
+                turretInit.ok, Mpu6x00Compat::stageName(turretInit.failedStage),
+                turretInit.whoAmI);
             ready = false;
             return false;
         }
-        // 两颗 IMU 使用同一套量程/滤波配置，避免底盘和炮塔姿态数据尺度不一致。
-        // 陀螺仪保持 ±500deg/s：覆盖炮塔/车体快速转动，同时比 ±1000/2000 保留更好分辨率。
-        mpuC.setGyroRange(MPU6050_RANGE_500_DEG);
-        mpuT.setGyroRange(MPU6050_RANGE_500_DEG);
-
-        // 加速度计用 ±4g：比默认 ±2g 更能承受履带震动和碰撞冲击，不容易饱和。
-        mpuC.setAccelerometerRange(MPU6050_RANGE_4_G);
-        mpuT.setAccelerometerRange(MPU6050_RANGE_4_G);
-
-        // DLPF 44Hz：先把电机/履带的高频噪声滤掉，再交给互补滤波和后续姿态算法。
-        mpuC.setFilterBandwidth(MPU6050_BAND_44_HZ);
-        mpuT.setFilterBandwidth(MPU6050_BAND_44_HZ);
+        LOG_ALWAYS(
+            ">>> IMU init OK: chassis addr=0x%02X id=0x%02X, "
+            "turret addr=0x%02X id=0x%02X (200Hz, +/-4g, +/-500dps, DLPF44Hz)\n",
+            MPU6050_CHASSIS_ADDR, chassisInit.whoAmI,
+            MPU6050_TURRET_ADDR, turretInit.whoAmI);
 
         yawSensor.init();
         float initialSensorDeg = 0.0f;
