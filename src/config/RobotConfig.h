@@ -41,10 +41,13 @@ namespace Config {
     const uint8_t VBAT_ADC_PIN = 39;
     const float VBAT_DIVIDER_R1 = 100000.0f;
     const float VBAT_DIVIDER_R2 = 33000.0f;
+    // 同时实测：ESP32=12.24V、万用表电池端=12.05V、VN=2.97V。
+    // 对完整 ADC + 分压链路做整体增益校准：12.05 / 12.24 = 0.9845。
+    const float VBAT_CALIBRATION_GAIN = 0.9845f;
     const float VBAT_LPF = 0.1f;
     const float VBAT_WARN = 10.8f;             // 3S 低压预警
     const float VBAT_CUTOFF = 10.2f;           // 3S 低压截止
-    const bool ENABLE_BATTERY_MONITOR = false; // false 时使用外置低压报警器
+    const bool ENABLE_BATTERY_MONITOR = true;  // 已按实测分压确认；同时启用遥测、预警和低压截止
 
     // ---------- 底盘电机和 PWM ----------
     const uint8_t R_IN1 = 25, R_IN2 = 33, R_PWM = 32;
@@ -57,10 +60,12 @@ namespace Config {
     // ---------- 履带速度控制 ----------
     const float TRACK_STOP_DEADZONE_KMH = 0.10f;
     // 两级摩擦补偿只跨过电机/履带死区，剩余输出全部交给 PID。
-    // 1.5V 空载启动电压在约 11.35V 母线下对应约 34 PWM；整车装配后需分别实测。
-    const float TRACK_FF_KS_START_LEFT = 45.0f;
+    // 12.11V、整车落地实测：前进可靠启动 31，倒车可靠启动 34；
+    // 前进最低维持 28，倒车最低维持 29。前后共用一套补偿时按较吃力方向取值，
+    // 维持值额外保留 1 PWM 余量，避免刚好停在临界点。
+    const float TRACK_FF_KS_START_LEFT = 34.0f;
     const float TRACK_FF_KS_RUN_LEFT = 30.0f;
-    const float TRACK_FF_KS_START_RIGHT = 45.0f;
+    const float TRACK_FF_KS_START_RIGHT = 34.0f;
     const float TRACK_FF_KS_RUN_RIGHT = 30.0f;
     const float TRACK_START_RELEASE_SPEED_KMH = 0.25f;
     const float TRACK_START_REENTER_SPEED_KMH = 0.08f;

@@ -3,7 +3,9 @@
 float TankRobot::readBatteryVoltage() {
     uint32_t adcMilliVolts = analogReadMilliVolts(Config::VBAT_ADC_PIN);
     float adcVolts = adcMilliVolts * 0.001f;
-    return adcVolts * ((Config::VBAT_DIVIDER_R1 + Config::VBAT_DIVIDER_R2) / Config::VBAT_DIVIDER_R2);
+    return adcVolts *
+           ((Config::VBAT_DIVIDER_R1 + Config::VBAT_DIVIDER_R2) / Config::VBAT_DIVIDER_R2) *
+           Config::VBAT_CALIBRATION_GAIN;
 }
 
 void TankRobot::updateBatteryMonitor() {
