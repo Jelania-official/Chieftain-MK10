@@ -46,6 +46,10 @@ private:
     float chassisPitchFiltered = 0.0f; // 底盘坡度角，deg
     bool chassisImuCalibrated = false;
     bool turretImuCalibrated = false;
+    bool chassisImuInitialized = false;
+    bool turretImuInitialized = false;
+    bool yawSensorInitialized = false;
+    bool yawFocInitialized = false;
     bool ready = false;
 
     struct ImuHealthState {
@@ -136,6 +140,10 @@ public:
     float getYawRelativeDeg();
     float getYawVoltageTarget() const;
     bool stabilizationActive() const;
+    bool chassisImuIsInitialized() const;
+    bool turretImuIsInitialized() const;
+    bool yawSensorIsInitialized() const;
+    bool yawFocIsInitialized() const;
     bool chassisImuIsHealthy() const;
     bool turretImuIsHealthy() const;
     // 兼容现有遥测：只有两颗 IMU 都健康时才返回 true。

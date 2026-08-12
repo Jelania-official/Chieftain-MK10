@@ -19,11 +19,12 @@ TELEMETRY_FIELDS = [
     "yaw_target", "yaw_actual", "yaw_relative", "yaw_voltage", "yaw_stalled",
     "chassis_pitch", "chassis_pitch_rate", "chassis_yaw_rate",
     "stabilization", "imu_healthy", "chassis_imu_healthy", "turret_imu_healthy", "yaw_sensor_healthy",
+    "chassis_imu_initialized", "turret_imu_initialized", "yaw_sensor_initialized", "yaw_foc_initialized",
     "chassis_ready", "turret_ready", "battery_voltage", "battery_valid",
 ]
 
-HANDSHAKE_REQUEST = b"HELLO,2\n"
-HANDSHAKE_RESPONSE = "HELLO,ChieftainMK10,2"
+HANDSHAKE_REQUEST = b"HELLO,3\n"
+HANDSHAKE_RESPONSE = "HELLO,ChieftainMK10,3"
 
 
 class AutoConnectWorker(QtCore.QThread):
@@ -100,8 +101,10 @@ class InputState:
     def update_from_keys(self) -> None:
         self.trigger_r = 1.0 if QtCore.Qt.Key_W in self.keys else 0.0
         self.trigger_l = 1.0 if QtCore.Qt.Key_S in self.keys else 0.0
-        left = -1.0 if QtCore.Qt.Key_A in self.keys else 0.0
-        right = 1.0 if QtCore.Qt.Key_D in self.keys else 0.0
+        # 键盘没有模拟量行程；使用40%摇杆量更接近正常行进转向，
+        # 避免A/D每次都等同于打满方向。固件仍保留完整的±1输入范围。
+        left = -0.4 if QtCore.Qt.Key_A in self.keys else 0.0
+        right = 0.4 if QtCore.Qt.Key_D in self.keys else 0.0
         self.joy_lx = left + right
         self.a_pressed = QtCore.Qt.Key_Space in self.keys
 
@@ -527,9 +530,10 @@ class MainWindow(QtWidgets.QMainWindow):
         right_actual = values[f"right_{actual_mode}_actual"]
         self.telemetry_label.setText(
             "遥测状态\n"
-            f"底盘就绪={int(values['chassis_ready'])}  炮塔就绪={int(values['turret_ready'])}\n"
-            f"稳定器={int(values['stabilization'])}  方位堵转={int(values['yaw_stalled'])}  双IMU={int(values['imu_healthy'])}  方位传感器={int(values['yaw_sensor_healthy'])}\n"
-            f"底盘IMU={int(values['chassis_imu_healthy'])}  炮塔IMU={int(values['turret_imu_healthy'])}\n"
+            f"底盘就绪={int(values['chassis_ready'])}  炮塔整体就绪={int(values['turret_ready'])}\n"
+            f"初始化：底盘IMU={int(values['chassis_imu_initialized'])}  炮塔IMU={int(values['turret_imu_initialized'])}  AS5600={int(values['yaw_sensor_initialized'])}  FOC={int(values['yaw_foc_initialized'])}\n"
+            f"运行健康：底盘IMU={int(values['chassis_imu_healthy'])}  炮塔IMU={int(values['turret_imu_healthy'])}  AS5600={int(values['yaw_sensor_healthy'])}  双IMU={int(values['imu_healthy'])}\n"
+            f"稳定器={int(values['stabilization'])}  方位堵转={int(values['yaw_stalled'])}\n"
             f"左履带 目标/{actual_label}/PWM={values['left_target']:.2f}/{left_actual:.2f}/{values['left_pwm']:.1f}\n"
             f"右履带 目标/{actual_label}/PWM={values['right_target']:.2f}/{right_actual:.2f}/{values['right_pwm']:.1f}\n"
             f"左右履带堵转={int(values['left_stalled'])}/{int(values['right_stalled'])}\n"

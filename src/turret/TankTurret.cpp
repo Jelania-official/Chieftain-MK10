@@ -377,7 +377,9 @@ bool TankTurret::init() {
             Mpu6x00Compat::initialize(Wire1, MPU6050_CHASSIS_ADDR);
         Mpu6x00Compat::InitResult turretInit =
             Mpu6x00Compat::initialize(Wire1, MPU6050_TURRET_ADDR);
-        if (!chassisInit.ok || !turretInit.ok) {
+        chassisImuInitialized = chassisInit.ok;
+        turretImuInitialized = turretInit.ok;
+        if (!chassisImuInitialized || !turretImuInitialized) {
             LOG_ALWAYS(
                 "!!! IMU init failed: chassis=%d stage=%s id=0x%02X "
                 "turret=%d stage=%s id=0x%02X\n",
@@ -385,30 +387,38 @@ bool TankTurret::init() {
                 chassisInit.whoAmI,
                 turretInit.ok, Mpu6x00Compat::stageName(turretInit.failedStage),
                 turretInit.whoAmI);
-            ready = false;
-            return false;
+        } else {
+            LOG_ALWAYS(
+                ">>> IMU init OK: chassis addr=0x%02X id=0x%02X, "
+                "turret addr=0x%02X id=0x%02X (200Hz, +/-4g, +/-500dps, DLPF44Hz)\n",
+                MPU6050_CHASSIS_ADDR, chassisInit.whoAmI,
+                MPU6050_TURRET_ADDR, turretInit.whoAmI);
         }
-        LOG_ALWAYS(
-            ">>> IMU init OK: chassis addr=0x%02X id=0x%02X, "
-            "turret addr=0x%02X id=0x%02X (200Hz, +/-4g, +/-500dps, DLPF44Hz)\n",
-            MPU6050_CHASSIS_ADDR, chassisInit.whoAmI,
-            MPU6050_TURRET_ADDR, turretInit.whoAmI);
 
+        // Probe AS5600 independently so diagnostics identify the failed device.
         yawSensor.init();
         float initialSensorDeg = 0.0f;
-        if (readAS5600MechanicalDeg(initialSensorDeg)) {
+        yawSensorInitialized = readAS5600MechanicalDeg(initialSensorDeg);
+        if (yawSensorInitialized) {
             updateYawSensorCache(true, initialSensorDeg);
         } else {
             updateYawSensorCache(false);
-            ready = false;
             LOG_ALWAYS("!!! AS5600 init check failed.\n");
+        }
+
+        // Do not energize or align the yaw motor unless every required sensor is present.
+        if (!chassisImuInitialized || !turretImuInitialized || !yawSensorInitialized) {
+            yawFocInitialized = false;
+            ready = false;
             return false;
         }
+
         yawDriver.voltage_power_supply = 12.0; yawDriver.init();
         yawMotor.linkSensor(&yawSensor); yawMotor.linkDriver(&yawDriver);
         yawMotor.controller = MotionControlType::torque;
         yawMotor.init();
-        ready = (yawMotor.initFOC() == 1);
+        yawFocInitialized = (yawMotor.initFOC() == 1);
+        ready = yawFocInitialized;
         if (!ready) {
             LOG_ALWAYS("!!! Yaw motor FOC init failed.\n");
         }
@@ -632,6 +642,11 @@ bool TankTurret::imuIsHealthy() const {
         portEXIT_CRITICAL(&turretStateMux);
         return chassisHealthy && turretHealthy;
     }
+
+bool TankTurret::chassisImuIsInitialized() const { return chassisImuInitialized; }
+bool TankTurret::turretImuIsInitialized() const { return turretImuInitialized; }
+bool TankTurret::yawSensorIsInitialized() const { return yawSensorInitialized; }
+bool TankTurret::yawFocIsInitialized() const { return yawFocInitialized; }
 
 bool TankTurret::yawSensorIsHealthy() const {
         bool healthy;

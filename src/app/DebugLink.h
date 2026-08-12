@@ -42,6 +42,10 @@ struct DebugTelemetry {
     bool chassisImuHealthy = false;
     bool turretImuHealthy = false;
     bool yawSensorHealthy = false;
+    bool chassisImuInitialized = false;
+    bool turretImuInitialized = false;
+    bool yawSensorInitialized = false;
+    bool yawFocInitialized = false;
     bool chassisReady = false;
     bool turretReady = false;
 

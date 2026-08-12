@@ -43,9 +43,21 @@ public:
 };
 
 // 单侧履带速度控制器。
-// 两级摩擦补偿只负责跨过静摩擦/滑动摩擦死区，PID 根据编码器反馈决定其余 PWM。
+// 速度-PWM查表提供正常运行所需的基础动力，低增益 PID 只修正负载和路面误差。
 class TrackVelocityController {
 private:
+    enum class LowSpeedState : uint8_t {
+        Stopped,
+        Launching,
+        ClosedLoop
+    };
+
+    struct NotchState {
+        float x1 = 0.0f, x2 = 0.0f;
+        float y1 = 0.0f, y2 = 0.0f;
+        bool ready = false;
+    };
+
     static float runtimeKp;
     static float runtimeKi;
     static float runtimeKd;
@@ -53,14 +65,35 @@ private:
     bool isLeft;
     float integralPwm = 0.0f;
     float lastActual = 0.0f;
+    float heldPidPwm = 0.0f;
     float filteredActualDerivative = 0.0f;
     bool derivativeReady = false;
-    bool wasTargetActive = false;
-    bool startBoostActive = false;
-    uint32_t startReleaseCandidateSinceMs = 0;
-    uint32_t startReenterCandidateSinceMs = 0;
-    float startBoostBlend = 0.0f;
+    LowSpeedState lowSpeedState = LowSpeedState::Stopped;
+    uint32_t launchStartedMs = 0;
+    float launchStableEvidenceMs = 0.0f;
+    uint32_t launchDropSinceMs = 0;
+    bool launchMotionSeen = false;
+    bool launchPivotMode = false;
+    bool launchLockout = false;
+    float lowSpeedPwm = 0.0f;
+    float lastOutputPwm = 0.0f;
+    float effectiveTarget = 0.0f;
     float lastDir = 0.0f;
+    float feedbackActual = 0.0f;
+    float notchMix = 0.0f;
+    float notchFrequencySpeed = 0.0f;
+    float lastNotchTarget = 0.0f;
+    bool notchTargetReady = false;
+    NotchState notch;
+    float medianSamples[3] = {};
+    uint8_t medianSampleCount = 0;
+    uint8_t medianSampleIndex = 0;
+
+    float updateNotch(NotchState& state, float input, float frequencyHz,
+                      float sampleRateHz);
+    float updateFeedbackMedian(float input);
+    void resetNotches(float seed = 0.0f);
+    void clearFeedbackState(float seed = 0.0f);
 
 public:
     explicit TrackVelocityController(bool leftTrack = false);
@@ -73,8 +106,14 @@ public:
     // target/actual 单位是 km/h；dt 单位是秒；newSpeedSample 表示编码器刚产生新测速。
     // speedSampleDt 是该测速样本的真实累计窗口，D 项只在此时更新。
     // 返回值是 -255~255 的电机 PWM 命令。
-    float calculate(float target, float actual, float dt, float externalPwm,
+    float calculate(float target, float actual, float dt, float externalPwm, float batteryVoltage,
+                    bool brakingActive, bool motionDemandActive, bool pivotLaunch,
                     bool newSpeedSample, float speedSampleDt);
+
+    // 返回PI真正使用的反馈速度；安全判断仍使用未陷波的40ms快速速度。
+    float getFeedbackActual() const { return feedbackActual; }
+    float getEffectiveTarget() const { return effectiveTarget; }
+    bool isClosedLoop() const { return lowSpeedState == LowSpeedState::ClosedLoop; }
 
     // 清空积分、起步补偿和历史目标，适合停车、堵转保护和模式切换。
     void reset();

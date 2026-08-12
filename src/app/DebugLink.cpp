@@ -53,8 +53,8 @@ void DebugLink::sendPidError(const char* reason) {
 }
 
 void DebugLink::handleLine(char* line) {
-    if (strcmp(line, "HELLO,2") == 0) {
-        serial.println("HELLO,ChieftainMK10,2");
+    if (strcmp(line, "HELLO,3") == 0) {
+        serial.println("HELLO,ChieftainMK10,3");
         return;
     }
 
@@ -209,7 +209,7 @@ void DebugLink::sendTelemetry(const DebugTelemetry& t, uint32_t intervalMs) {
     serial.printf(
         "TEL,%lu,%.3f,%.3f,%.3f,%.1f,%d,%.3f,%.3f,%.3f,%.1f,%d,"
         "%.3f,%.3f,%.1f,%.3f,%.3f,%.3f,%.3f,%d,"
-        "%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.3f,%d\n",
+        "%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%d\n",
         (unsigned long)t.timeMs,
         t.leftTarget, t.leftControlActual, t.leftDisplayActual, t.leftPwm, t.leftStalled ? 1 : 0,
         t.rightTarget, t.rightControlActual, t.rightDisplayActual, t.rightPwm, t.rightStalled ? 1 : 0,
@@ -221,6 +221,10 @@ void DebugLink::sendTelemetry(const DebugTelemetry& t, uint32_t intervalMs) {
         t.chassisImuHealthy ? 1 : 0,
         t.turretImuHealthy ? 1 : 0,
         t.yawSensorHealthy ? 1 : 0,
+        t.chassisImuInitialized ? 1 : 0,
+        t.turretImuInitialized ? 1 : 0,
+        t.yawSensorInitialized ? 1 : 0,
+        t.yawFocInitialized ? 1 : 0,
         t.chassisReady ? 1 : 0,
         t.turretReady ? 1 : 0,
         t.batteryVoltage,

@@ -11,11 +11,11 @@ void TankTrack::clearStallIfReleased() {
 // 目标速度足够高、PWM 足够大、实际速度仍然很低，并且持续超过 grace 时间。
 // 这样可以避开正常起步瞬间“速度还没起来”的误判。
 bool TankTrack::updateStallProtection() {
-        float targetDirection = targetSpeed >= 0.0f ? 1.0f : -1.0f;
-        float speedInTargetDirection = currentSpeed * targetDirection;
-        if (abs(targetSpeed) < Config::TRACK_STALL_TARGET_MIN_KMH ||
-            abs(lastPwm) < Config::TRACK_STALL_PWM_MIN ||
-            speedInTargetDirection > Config::TRACK_STALL_ACTUAL_MAX_KMH) {
+        float targetDirection = controlTargetSpeed >= 0.0f ? 1.0f : -1.0f;
+        float pwmInTargetDirection = lastPwm * targetDirection;
+        if (abs(controlTargetSpeed) < Config::TRACK_STALL_TARGET_MIN_KMH ||
+            pwmInTargetDirection < Config::TRACK_STALL_PWM_MIN ||
+            abs(fastSpeed) > Config::TRACK_STALL_ACTUAL_MAX_KMH) {
             stallCandidateSinceMs = 0;
             return false;
         }
@@ -34,7 +34,7 @@ bool TankTrack::updateStallProtection() {
         stallCandidateSinceMs = 0;
         controller.reset();
         LOG_ALWAYS("!!! Track stall latched: %s target=%.2f actual=%.2f pwm=%.1f\n",
-                   label, targetSpeed, currentSpeed, lastPwm);
+                   label, controlTargetSpeed, fastSpeed, lastPwm);
         return true;
     }
 
@@ -43,7 +43,8 @@ TankTrack::TankTrack(DCMotor m, CustomEncoder e, const char* trackLabel, bool le
 
 void TankTrack::init() { motor.init(); encoder.init(); }
 
-void TankTrack::update(float target, float dt, float externalPwm) {
+void TankTrack::update(float target, float dt, float externalPwm, float batteryVoltage,
+                       bool brakingActive, bool motionDemandActive, bool pivotLaunch) {
         if (!isfinite(target) || !isfinite(dt) || dt <= 0.0f || !isfinite(externalPwm)) {
             targetSpeed = 0.0f;
             currentSpeed = 0.0f;
@@ -54,9 +55,9 @@ void TankTrack::update(float target, float dt, float externalPwm) {
             return;
         }
         targetSpeed = target;
-        currentSpeed = encoder.getRealSpeedKMH();
+        fastSpeed = encoder.getRealSpeedKMH();
         telemetrySpeed = encoder.getDisplaySpeedKMH();
-        if (!isfinite(currentSpeed) || !isfinite(telemetrySpeed)) {
+        if (!isfinite(fastSpeed) || !isfinite(telemetrySpeed)) {
             targetSpeed = 0.0f;
             currentSpeed = 0.0f;
             telemetrySpeed = 0.0f;
@@ -77,8 +78,12 @@ void TankTrack::update(float target, float dt, float externalPwm) {
             return;
         }
 
-        lastPwm = controller.calculate(targetSpeed, currentSpeed, dt, externalPwm,
-                                       newSpeedSample, encoder.getControlSampleDt());
+        lastPwm = controller.calculate(targetSpeed, fastSpeed, dt, externalPwm, batteryVoltage,
+                                       brakingActive, motionDemandActive, pivotLaunch, newSpeedSample,
+                                       encoder.getControlSampleDt());
+        // 遥测保留底盘动力学给出的原始目标；最低可执行速度只存在于控制器内部。
+        controlTargetSpeed = controller.getEffectiveTarget();
+        currentSpeed = controller.getFeedbackActual();
         if (updateStallProtection()) {
             lastPwm = 0;
             motor.drive(0);
@@ -89,7 +94,9 @@ void TankTrack::update(float target, float dt, float externalPwm) {
 
 void TankTrack::driveDirect(float pwm) {
         targetSpeed = 0.0f;
-        currentSpeed = encoder.getRealSpeedKMH();
+        controlTargetSpeed = 0.0f;
+        fastSpeed = encoder.getRealSpeedKMH();
+        currentSpeed = fastSpeed;
         telemetrySpeed = encoder.getDisplaySpeedKMH();
         lastEncoderControlSampleId = encoder.getControlSampleId();
         stallLatched = false;
@@ -101,6 +108,7 @@ void TankTrack::driveDirect(float pwm) {
 
 void TankTrack::stop() {
         targetSpeed = 0;
+        controlTargetSpeed = 0;
         lastPwm = 0;
         stallLatched = false;
         stallCandidateSinceMs = 0;
@@ -238,7 +246,9 @@ void TankChassis::resetImuCompensation() {
 
 // 主底盘动力学：先算纵向速度，再算转向差速，最后分配成左右履带目标。
 // 这里的速度单位统一用“真车等效 km/h”，这样比例映射和参数调校更直观。
-void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, float dt, float currentPitchRate, float currentYawRate, float pitchAngle) {
+void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, float dt,
+                                    float currentPitchRate, float currentYawRate, float pitchAngle,
+                                    float batteryVoltage) {
         if (!isfinite(triggerL) || !isfinite(triggerR) || !isfinite(joyX) ||
             !isfinite(dt) || dt <= 0.0f) {
             stop();
@@ -260,24 +270,54 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         float forwardInput = (triggerR > Config::TRIGGER_DEADZONE) ? (triggerR * triggerR) : 0.0f;
         float reverseInput = (triggerL > Config::TRIGGER_DEADZONE) ? (triggerL * triggerL) : 0.0f;
         float driveInput = forwardInput - reverseInput;
-        float desiredDir = (driveInput > 0.001f) ? 1.0f : ((driveInput < -0.001f) ? -1.0f : 0.0f);
+        int8_t requestedDir = (driveInput > 0.001f) ? 1 : ((driveInput < -0.001f) ? -1 : 0);
+
+        if (driveDirection == 0) {
+            if (v_real > Config::DIRECTION_CHANGE_STOP_SPEED_KMH) driveDirection = 1;
+            else if (v_real < -Config::DIRECTION_CHANGE_STOP_SPEED_KMH) driveDirection = -1;
+            else if (requestedDir != 0) driveDirection = requestedDir;
+        }
 
         float raw_throttle = abs(driveInput);
         float raw_brake = 0.0f;
 
-        // 当请求方向与当前运动方向相反时，先把该输入当成刹车；接近停稳后再自动换向。
-        bool brakingToReverse = (v_real > 0.3f && desiredDir < 0.0f) || (v_real < -0.3f && desiredDir > 0.0f);
-        if (brakingToReverse) {
+        // 相反扳机先只充当刹车。必须连续保持2秒且车辆接近停稳，才授权新方向。
+        bool directionChangeBraking = requestedDir != 0 && driveDirection != 0 &&
+                                      requestedDir != driveDirection;
+        if (directionChangeBraking) {
+            uint32_t nowMs = millis();
+            if (pendingDriveDirection != requestedDir) {
+                pendingDriveDirection = requestedDir;
+                directionChangeSinceMs = nowMs;
+            }
             raw_brake = raw_throttle;
             raw_throttle = 0.0f;
             engineSmoother.reset();
+            bool heldLongEnough = (uint32_t)(nowMs - directionChangeSinceMs) >=
+                                  Config::DIRECTION_CHANGE_HOLD_MS;
+            bool nearlyStopped = abs(v_real) <= Config::DIRECTION_CHANGE_STOP_SPEED_KMH;
+            if (heldLongEnough && nearlyStopped) {
+                driveDirection = requestedDir;
+                pendingDriveDirection = 0;
+                directionChangeSinceMs = 0;
+                directionChangeBraking = false;
+                raw_brake = 0.0f;
+                raw_throttle = abs(driveInput);
+                brakeSmoother.reset();
+            }
+        } else {
+            pendingDriveDirection = 0;
+            directionChangeSinceMs = 0;
         }
+
+        float commandedDriveInput = directionChangeBraking ? 0.0f
+            : raw_throttle * (float)driveDirection;
 
         float eff_throttle = engineSmoother.update(raw_throttle, dt);
         float eff_brake    = brakeSmoother.update(raw_brake, dt);
 
         // 2. 计算各独立作用力（换算为加速度，单位 km/h/s）
-        float force_engine = eff_throttle * Config::REAL_ACCEL * desiredDir;
+        float force_engine = eff_throttle * Config::REAL_ACCEL * driveDirection;
 
         float force_brake = eff_brake * Config::REAL_BRAKE;
 
@@ -327,7 +367,7 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         // 5. jerk 限制后的实际纵向加速度。明确刹车时必须始终使用较快的制动 jerk；
         // 否则减速度一旦与目标净加速度同号，就会被误判成普通加速建立并切回慢 jerk。
         bool accelerationBuilds = (a_net * longitudinalAccel >= 0.0f) && (abs(a_net) > abs(longitudinalAccel));
-        bool serviceBrakeActive = brakingToReverse || eff_brake > 0.01f;
+        bool serviceBrakeActive = directionChangeBraking || eff_brake > 0.01f;
         float jerkLimit = serviceBrakeActive
             ? Config::LINEAR_JERK_BRAKE
             : (accelerationBuilds ? Config::LINEAR_JERK_ACCEL : Config::LINEAR_JERK_BRAKE);
@@ -348,8 +388,14 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         // 横向动力学：摇杆直接给目标差速，真实车体的转动惯量由 yaw IMU 反馈补偿。
         // ==========================================
         
-        float joyX_adj = (abs(joyX) < 0.12f) ? 0 : joyX; // 死区
-        float joyX_squared = copysign(joyX_adj * joyX_adj, joyX_adj); 
+        constexpr float turnDeadzone = 0.12f;
+        float turnMagnitude = (abs(joyX) <= turnDeadzone) ? 0.0f
+            : (abs(joyX) - turnDeadzone) / (1.0f - turnDeadzone);
+        float turnShapedMagnitude = Config::TURN_INPUT_LINEAR_BLEND * turnMagnitude +
+            (1.0f - Config::TURN_INPUT_LINEAR_BLEND) * turnMagnitude * turnMagnitude;
+        // 手柄/PC 正X应当对应车辆向右转。履带混合为 L=v+spin、R=v-spin，
+        // 因此这里翻转输入符号，修正此前左右方向相反的问题。
+        float joyX_squared = copysign(turnShapedMagnitude, -joyX);
         
         // 随速感应灵敏度
         float dynamic_sens = Config::YAW_SENSITIVITY / (1.0f + abs(v_real) * Config::SPEED_SENS_K);
@@ -362,7 +408,7 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         // 行进中则更接近双流传动的速度分配，允许更快跟随目标差速。
         float movingBlend = constrain(abs(v_real) / Config::TURN_MOVING_BLEND_KMH, 0.0f, 1.0f);
         float pivotBlend = 1.0f - movingBlend;
-        bool turnInputActive = abs(joyX_adj) >= 0.12f;
+        bool turnInputActive = turnMagnitude > 0.0f;
         bool pivotReverseBrake = turnInputActive &&
                                  (pivotCommandSpin * spinV < 0.0f) &&
                                  (abs(spinV) > Config::TRACK_STOP_DEADZONE_KMH);
@@ -385,6 +431,20 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         // ==========================================
         float Lv_tgt = v_real + spinV;
         float Rv_tgt = v_real - spinV;
+
+        // 重车动力学可以让目标速度缓慢建立，但电机克服静摩擦的扭矩不应因此延迟数秒。
+        // 用原始驾驶意图只提供方向性的小种子目标，低速状态机会立即开始120ms起步PWM斜坡；
+        // 真正闭环目标和后续加速仍由 v_real/spinV 的重车动力学决定。
+        float leftDriveIntent = commandedDriveInput + joyX_squared;
+        float rightDriveIntent = commandedDriveInput - joyX_squared;
+        if (abs(Lv_tgt) < Config::TRACK_STOP_DEADZONE_KMH &&
+            abs(leftDriveIntent) > 0.01f) {
+            Lv_tgt = copysign(Config::TRACK_STOP_DEADZONE_KMH, leftDriveIntent);
+        }
+        if (abs(Rv_tgt) < Config::TRACK_STOP_DEADZONE_KMH &&
+            abs(rightDriveIntent) > 0.01f) {
+            Rv_tgt = copysign(Config::TRACK_STOP_DEADZONE_KMH, rightDriveIntent);
+        }
 
         // 虚拟惯量补偿最后叠到履带 PWM 上，不改变目标速度本身。
         float pitchInertiaPwm = calculateVirtualInertiaPwm(currentPitchRate, dt);
@@ -411,8 +471,26 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
             ? pitchInertiaPwm - yawInertiaPwm
             : 0.0f;
 
-        leftTrack.update(Lv_tgt, dt, leftInertiaPwm);
-        rightTrack.update(Rv_tgt, dt, rightInertiaPwm);
+        bool leftMotionDemand = abs(leftDriveIntent) > 0.01f;
+        bool rightMotionDemand = abs(rightDriveIntent) > 0.01f;
+        bool pivotLaunch = turnInputActive && abs(commandedDriveInput) <= 0.01f &&
+                           abs(v_real) < 1.0f;
+        leftTrack.update(Lv_tgt, dt, leftInertiaPwm, batteryVoltage, serviceBrakeActive,
+                         leftMotionDemand, pivotLaunch);
+        rightTrack.update(Rv_tgt, dt, rightInertiaPwm, batteryVoltage, serviceBrakeActive,
+                          rightMotionDemand, pivotLaunch);
+
+        bool bothTracksClosedLoop = leftTrack.isVelocityClosedLoop() &&
+                                    rightTrack.isVelocityClosedLoop();
+        bool activeLaunchDemand = leftMotionDemand || rightMotionDemand;
+        if (bothTracksClosedLoop && !bothTracksWereClosedLoop && activeLaunchDemand) {
+            // 两侧均稳定起步后，把虚拟动力学状态同步到编码器真实速度。
+            // 例如实际为2.1km/h就同步到2.1，而不是人为抬到最低闭环速度2.8。
+            v_real = 0.5f * (leftTrack.fastSpeed + rightTrack.fastSpeed);
+            spinV = 0.5f * (leftTrack.fastSpeed - rightTrack.fastSpeed);
+            longitudinalAccel = 0.0f;
+        }
+        bothTracksWereClosedLoop = bothTracksClosedLoop;
     }
 
 // 直接履带目标主要给测试/调试使用：绕过手柄油门、刹车、转向动力学。
@@ -421,8 +499,13 @@ void TankChassis::processDirectTrackTargets(float leftTarget, float rightTarget,
         v_real = (leftTarget + rightTarget) * 0.5f;
         spinV = (leftTarget - rightTarget) * 0.5f;
         longitudinalAccel = 0.0f;
-        leftTrack.update(leftTarget, dt, 0.0f);
-        rightTrack.update(rightTarget, dt, 0.0f);
+        driveDirection = 0;
+        pendingDriveDirection = 0;
+        directionChangeSinceMs = 0;
+        leftTrack.update(leftTarget, dt, 0.0f, Config::TRACK_FF_REFERENCE_VOLTAGE,
+                         false, abs(leftTarget) >= Config::TRACK_STOP_DEADZONE_KMH, false);
+        rightTrack.update(rightTarget, dt, 0.0f, Config::TRACK_FF_REFERENCE_VOLTAGE,
+                          false, abs(rightTarget) >= Config::TRACK_STOP_DEADZONE_KMH, false);
 }
 
 void TankChassis::setTrackPidGains(float kp, float ki, float kd) {
@@ -441,6 +524,7 @@ void TankChassis::processDirectTrackPwm(float leftPwm, float rightPwm) {
         v_real = 0.0f;
         spinV = 0.0f;
         longitudinalAccel = 0.0f;
+        bothTracksWereClosedLoop = false;
         leftTrack.driveDirect(leftPwm);
         rightTrack.driveDirect(rightPwm);
     }
@@ -467,6 +551,10 @@ void TankChassis::getTrackTelemetry(float& leftTarget, float& leftControlActual,
 void TankChassis::stop() { 
         v_real = 0; spinV = 0; 
         longitudinalAccel = 0.0f;
+        driveDirection = 0;
+        pendingDriveDirection = 0;
+        directionChangeSinceMs = 0;
+        bothTracksWereClosedLoop = false;
         resetImuCompensation();
         engineSmoother.reset(); brakeSmoother.reset();
         leftTrack.stop(); rightTrack.stop(); 

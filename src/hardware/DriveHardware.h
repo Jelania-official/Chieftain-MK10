@@ -32,12 +32,21 @@ public:
 // 使用 ESP32 PCNT 外设对 AB 相计数，再换算成真车等效速度 km/h。
 class CustomEncoder {
 private:
+    struct SpeedWindow {
+        int16_t count = 0;
+        uint32_t dtUs = 0;
+    };
+
     uint8_t pinA, pinB;
     pcnt_unit_t unit;
     int8_t directionSign;
     uint32_t lastSampleUs = 0;
     uint32_t lastPulseUs = 0;
     uint32_t lastDisplayUs = 0;
+    int16_t rollingCounts[Config::ENCODER_ROLLING_BINS] = {};
+    uint32_t rollingDtUs[Config::ENCODER_ROLLING_BINS] = {};
+    uint8_t rollingHead = 0;
+    uint8_t rollingCount = 0;
     float displayRawSpeedSamples[3] = {};
     uint8_t displayRawSpeedSampleIndex = 0;
     float displayMeasuredSpeed = 0.0f;
@@ -46,6 +55,15 @@ private:
     uint32_t controlSampleId = 0;
     float controlSampleDt = 0.0f;
     bool stopTimeoutPublished = false;
+    SpeedWindow speedHistory[Config::ENCODER_REV_HISTORY_SIZE] = {};
+    uint8_t speedHistoryHead = 0;
+    uint8_t speedHistoryCount = 0;
+    int8_t historyDirection = 0;
+
+    void clearSpeedHistory();
+    void clearRollingWindow();
+    void pushSpeedWindow(int16_t count, uint32_t dtUs);
+    bool getOneRevolutionAverage(float& count, float& dtSeconds) const;
 
 public:
     // p_unit 指定使用哪个 PCNT 单元；左右履带需要不同单元。
@@ -54,7 +72,7 @@ public:
     // 配置 PCNT 计数模式、滤波和初始采样时间。
     void init();
 
-    // 使用自适应脉冲累计窗口刷新控制用速度；窗口未完成时返回上一次结果。
+    // 每20ms发布一次最近40ms的重叠窗口速度；最近一圈平均仅用于平滑显示。
     float getRealSpeedKMH();
 
     // 返回额外平滑的遥测速度，不参与 PI 和堵转判断。

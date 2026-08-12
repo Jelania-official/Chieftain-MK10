@@ -20,9 +20,11 @@ public:
     TrackVelocityController controller;
 
     // 这几个量用于调试和上层读取 telemetry，单位见各字段注释。
-    float currentSpeed = 0; // 控制和堵转判断使用的编码器速度，km/h
+    float currentSpeed = 0; // PI实际使用的陷波/混合反馈速度，km/h
+    float fastSpeed = 0; // 40ms快速速度，供停车和堵转安全判断，km/h
     float telemetrySpeed = 0; // 仅供上位机绘图的平滑速度，km/h
     float targetSpeed = 0;  // 当前目标速度，km/h
+    float controlTargetSpeed = 0; // 低速状态机/PI实际执行的目标，仅供保护逻辑使用
     float lastPwm = 0;      // 上一次输出给电机的 PWM，-255~255
     bool stallLatched = false; // 堵转锁存；松开目标速度后自动解除
 
@@ -44,13 +46,17 @@ public:
     void init();
 
     // 更新单侧履带速度闭环。target 单位 km/h，dt 单位秒，externalPwm 是外部补偿 PWM。
-    void update(float target, float dt, float externalPwm);
+    void update(float target, float dt, float externalPwm, float batteryVoltage,
+                bool brakingActive = false, bool motionDemandActive = true,
+                bool pivotLaunch = false);
 
     // 硬件诊断入口：绕过速度控制器和堵转判断，直接输出受限 PWM，同时保留测速。
     void driveDirect(float pwm);
 
     // 停止电机、清空控制器和堵转状态。
     void stop();
+
+    bool isVelocityClosedLoop() const { return controller.isClosedLoop(); }
 };
 
 // 油门/刹车平滑器。
@@ -83,6 +89,9 @@ private:
 
     // 底盘动力学内部状态，用于纵向加速度、坡度滤波和虚拟惯量补偿。
     float longitudinalAccel = 0.0f;
+    int8_t driveDirection = 0;
+    int8_t pendingDriveDirection = 0;
+    uint32_t directionChangeSinceMs = 0;
     float gradePitchDeg = 0.0f;
     bool gradePitchReady = false;
     float lastPitchRateDeg = 0.0f;
@@ -91,6 +100,7 @@ private:
     float lastYawRateDeg = 0.0f;
     float filteredYawAlpha = 0.0f;
     bool yawRateReady = false;
+    bool bothTracksWereClosedLoop = false;
 
     float moveToward(float current, float target, float maxDelta);
 
@@ -116,7 +126,8 @@ public:
     // triggerL/triggerR：0~1 的倒车/前进输入；joyX：-1~1 的转向输入。
     // currentPitchRate/currentYawRate/pitchAngle 来自炮塔模块里的底盘 IMU，用于惯量和坡度补偿。
     void processKinematics(float triggerL, float triggerR, float joyX, float dt,
-                           float currentPitchRate, float currentYawRate, float pitchAngle);
+                           float currentPitchRate, float currentYawRate, float pitchAngle,
+                           float batteryVoltage);
 
     // 调试/测试入口：绕过手柄动力学，直接指定左右履带目标速度，单位 km/h。
     void processDirectTrackTargets(float leftTarget, float rightTarget, float dt, float pitchAngle);

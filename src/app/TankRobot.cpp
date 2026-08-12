@@ -90,6 +90,16 @@ void TankRobot::publishDebugTelemetry() {
     t.batteryVoltage = batteryVoltage;
     t.batteryValid = batteryValid;
 
+    // Sensor initialization and runtime health remain visible even when the complete turret is unavailable.
+    t.chassisImuInitialized = turret.chassisImuIsInitialized();
+    t.turretImuInitialized = turret.turretImuIsInitialized();
+    t.yawSensorInitialized = turret.yawSensorIsInitialized();
+    t.yawFocInitialized = turret.yawFocIsInitialized();
+    t.imuHealthy = turret.imuIsHealthy();
+    t.chassisImuHealthy = turret.chassisImuIsHealthy();
+    t.turretImuHealthy = turret.turretImuIsHealthy();
+    t.yawSensorHealthy = turret.yawSensorIsHealthy();
+
     if (chassisReady) {
         chassis.getTrackTelemetry(t.leftTarget, t.leftControlActual, t.leftDisplayActual,
                                   t.leftPwm, t.leftStalled,
@@ -110,10 +120,6 @@ void TankRobot::publishDebugTelemetry() {
         t.chassisPitchRate = turret.getLatestChassisPitchRate();
         t.chassisYawRate = turret.getLatestChassisYawRate();
         t.stabilizationEnabled = turret.stabilizationActive();
-        t.imuHealthy = turret.imuIsHealthy();
-        t.chassisImuHealthy = turret.chassisImuIsHealthy();
-        t.turretImuHealthy = turret.turretImuIsHealthy();
-        t.yawSensorHealthy = turret.yawSensorIsHealthy();
     }
 
     debugLink.sendTelemetry(t, Config::DEBUG_TELEMETRY_MS);
@@ -265,7 +271,8 @@ void TankRobot::loop_without_FOC() {
                 float pRate = chassisImuHealthy ? turret.getLatestChassisPitchRate() : 0.0f;
                 float yRate = chassisImuHealthy ? turret.getLatestChassisYawRate() : 0.0f;
                 float pAngle = chassisImuHealthy ? turret.getChassisPitchAngle() : 0.0f;
-                chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl, pRate, yRate, pAngle);
+                chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl,
+                                          pRate, yRate, pAngle, batteryVoltage);
                 if (turretReady) turret.updateStabilization(dtCtrl);
 
                 static uint32_t lastBatteryWarnLogMs = 0;
