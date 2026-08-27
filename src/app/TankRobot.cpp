@@ -69,6 +69,8 @@ bool TankRobot::readXboxControlInput(ControlInput& out) {
     out.joyRX = (xboxController.xboxNotif.joyRHori - 32767.5f) / 32767.5f;
     out.joyRY = (xboxController.xboxNotif.joyRVert - 32767.5f) / 32767.5f;
     out.aPressed = xboxController.xboxNotif.btnA;
+    out.bPressed = xboxController.xboxNotif.btnB;
+    out.yPressed = xboxController.xboxNotif.btnY;
     return true;
 }
 #endif
@@ -264,21 +266,30 @@ void TankRobot::loop_without_FOC() {
                 chassis.processDirectTrackPwm(directLeftPwm, directRightPwm);
                 if (turretReady) turret.enterDisconnectedState();
             } else if (chassisReady && readActiveControlInput(input)) {
-                // 底盘控制复用炮塔模块读取的底盘 IMU：坡度用于重力补偿，角速度用于虚拟惯量补偿。
-                // IMU 不健康时立即退化为无姿态补偿的普通履带闭环，不让旧值或异常值进入底盘。
-                bool chassisImuHealthy = turretReady && turret.chassisImuIsHealthy();
-                if (!chassisImuHealthy) chassis.resetImuCompensation();
-                float pRate = chassisImuHealthy ? turret.getLatestChassisPitchRate() : 0.0f;
-                float yRate = chassisImuHealthy ? turret.getLatestChassisYawRate() : 0.0f;
-                float pAngle = chassisImuHealthy ? turret.getChassisPitchAngle() : 0.0f;
-                chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl,
-                                          pRate, yRate, pAngle, batteryVoltage);
-                if (turretReady) turret.updateStabilization(dtCtrl);
+                // B优先并锁存急停；松开B后按Y才能恢复。PC工具已把同样的
+                // B/Y动作转换成调试链路的stop位，原生Xbox模式则在此处理。
+                if (input.bPressed) controllerEmergencyStop = true;
+                else if (input.yPressed) controllerEmergencyStop = false;
+                if (controllerEmergencyStop) {
+                    chassis.stop();
+                    if (turretReady) turret.enterDisconnectedState();
+                } else {
+                    // 底盘控制复用炮塔模块读取的底盘 IMU：坡度用于重力补偿，角速度用于虚拟惯量补偿。
+                    // IMU不健康时退化为无姿态补偿的履带闭环，不让旧值或异常值进入控制器。
+                    bool chassisImuHealthy = turretReady && turret.chassisImuIsHealthy();
+                    if (!chassisImuHealthy) chassis.resetImuCompensation();
+                    float pRate = chassisImuHealthy ? turret.getLatestChassisPitchRate() : 0.0f;
+                    float yRate = chassisImuHealthy ? turret.getLatestChassisYawRate() : 0.0f;
+                    float pAngle = chassisImuHealthy ? turret.getChassisPitchAngle() : 0.0f;
+                    chassis.processKinematics(input.triggerL, input.triggerR, input.joyLX, dtCtrl,
+                                              pRate, yRate, pAngle, batteryVoltage);
+                    if (turretReady) turret.updateStabilization(dtCtrl);
 
-                static uint32_t lastBatteryWarnLogMs = 0;
-                if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
-                    lastBatteryWarnLogMs = millis();
-                    LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
+                    static uint32_t lastBatteryWarnLogMs = 0;
+                    if (batteryWarning() && (millis() - lastBatteryWarnLogMs >= 1000)) {
+                        lastBatteryWarnLogMs = millis();
+                        LOG_ALWAYS("*** Battery low warning: %.2fV\n", batteryVoltage);
+                    }
                 }
             } else {
                 if (chassisReady) chassis.stop();

@@ -59,39 +59,25 @@ public:
     bool isVelocityClosedLoop() const { return controller.isClosedLoop(); }
 };
 
-// 油门/刹车平滑器。
-// rise 控制输入增大时的爬升速度，fall 控制松开或减小时的下降速度。
-class ThrottleSmoother {
-private:
-    float current_val = 0.0f;
-    float rise_rate;
-    float fall_rate;
-
-public:
-    ThrottleSmoother(float rise, float fall);
-
-    // 让 current_val 以给定速率靠近 target，返回平滑后的值。
-    float update(float target, float dt);
-
-    // 立即清零，适合刹停、断连、换向时调用。
-    void reset();
-};
-
 class TankChassis {
 private:
     TankTrack rightTrack, leftTrack;
 
-    // v_real 是整车纵向速度，spinV 是左右履带差速形成的自转速度分量，单位 km/h。
+    // v_real 是整车纵向速度；spinV 只保存当前差速/中心转向分量，单位 km/h。
     float v_real = 0, spinV = 0;
-
-    ThrottleSmoother engineSmoother;
-    ThrottleSmoother brakeSmoother;
+    float engineCmd = 0.0f;
+    float steerState = 0.0f;
+    bool pivotMode = false;
 
     // 底盘动力学内部状态，用于纵向加速度、坡度滤波和虚拟惯量补偿。
     float longitudinalAccel = 0.0f;
     int8_t driveDirection = 0;
     int8_t pendingDriveDirection = 0;
     uint32_t directionChangeSinceMs = 0;
+    int8_t startIntentDirection = 0;
+    uint32_t startIntentSinceMs = 0;
+    bool startIntentTiming = false;
+    bool startIntentConfirmed = false;
     float gradePitchDeg = 0.0f;
     bool gradePitchReady = false;
     float lastPitchRateDeg = 0.0f;

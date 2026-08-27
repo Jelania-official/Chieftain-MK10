@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import sys
 import time
 from collections import deque
@@ -25,6 +26,185 @@ TELEMETRY_FIELDS = [
 
 HANDSHAKE_REQUEST = b"HELLO,3\n"
 HANDSHAKE_RESPONSE = "HELLO,ChieftainMK10,3"
+
+
+class XInputGamepad:
+    """无额外依赖的 Windows XInput 读取器。"""
+
+    class _Gamepad(ctypes.Structure):
+        _fields_ = [
+            ("buttons", ctypes.c_ushort),
+            ("left_trigger", ctypes.c_ubyte),
+            ("right_trigger", ctypes.c_ubyte),
+            ("thumb_lx", ctypes.c_short),
+            ("thumb_ly", ctypes.c_short),
+            ("thumb_rx", ctypes.c_short),
+            ("thumb_ry", ctypes.c_short),
+        ]
+
+    class _State(ctypes.Structure):
+        pass
+
+    _State._fields_ = [("packet_number", ctypes.c_ulong), ("gamepad", _Gamepad)]
+
+    BUTTON_DPAD_UP = 0x0001
+    BUTTON_DPAD_DOWN = 0x0002
+    BUTTON_DPAD_LEFT = 0x0004
+    BUTTON_DPAD_RIGHT = 0x0008
+    BUTTON_START = 0x0010
+    BUTTON_BACK = 0x0020
+    BUTTON_LEFT_THUMB = 0x0040
+    BUTTON_RIGHT_THUMB = 0x0080
+    BUTTON_LEFT_SHOULDER = 0x0100
+    BUTTON_RIGHT_SHOULDER = 0x0200
+    BUTTON_A = 0x1000
+    BUTTON_B = 0x2000
+    BUTTON_X = 0x4000
+    BUTTON_Y = 0x8000
+
+    def __init__(self) -> None:
+        self._get_state = None
+        self.index: int | None = None
+        if sys.platform != "win32":
+            return
+        for name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+            try:
+                dll = ctypes.WinDLL(name)
+                fn = dll.XInputGetState
+                fn.argtypes = [ctypes.c_ulong, ctypes.POINTER(self._State)]
+                fn.restype = ctypes.c_ulong
+                self._get_state = fn
+                break
+            except (OSError, AttributeError):
+                continue
+
+    @staticmethod
+    def _axis(value: int, deadzone: float = 0.12) -> float:
+        normalized = max(-1.0, min(1.0, value / (32767.0 if value >= 0 else 32768.0)))
+        magnitude = abs(normalized)
+        if magnitude <= deadzone:
+            return 0.0
+        return (1.0 if normalized >= 0 else -1.0) * (magnitude - deadzone) / (1.0 - deadzone)
+
+    def poll(self) -> dict[str, float | int] | None:
+        if self._get_state is None:
+            self.index = None
+            return None
+        indices = [self.index] if self.index is not None else list(range(4))
+        for index in indices:
+            if index is None:
+                continue
+            state = self._State()
+            if self._get_state(index, ctypes.byref(state)) == 0:
+                self.index = index
+                pad = state.gamepad
+                return {
+                    "lx": self._axis(pad.thumb_lx),
+                    "ly": self._axis(pad.thumb_ly),
+                    "rx": self._axis(pad.thumb_rx),
+                    "ry": self._axis(pad.thumb_ry),
+                    "lt": pad.left_trigger / 255.0,
+                    "rt": pad.right_trigger / 255.0,
+                    "buttons": int(pad.buttons),
+                }
+        self.index = None
+        return None
+
+
+class GamepadDisplay(QtWidgets.QWidget):
+    """参考 virtual-gamepad-lib 扁平外观的原生 Qt 手柄状态图。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(300, 190)
+        self.state: dict[str, float | int] | None = None
+        self.controller_index: int | None = None
+
+    def set_state(self, state: dict[str, float | int] | None, controller_index: int | None = None) -> None:
+        self.state = state
+        self.controller_index = controller_index
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.scale(self.width() / 320.0, self.height() / 200.0)
+        active = self.state is not None
+        shell = QtGui.QColor("#303640" if active else "#555a62")
+        edge = QtGui.QColor("#6e7785")
+        accent = QtGui.QColor("#2d8cff")
+        painter.setPen(QtGui.QPen(edge, 2))
+        painter.setBrush(shell)
+        body = QtGui.QPainterPath()
+        body.moveTo(85, 42)
+        body.cubicTo(55, 40, 39, 68, 29, 111)
+        body.cubicTo(19, 155, 35, 184, 56, 177)
+        body.cubicTo(73, 171, 82, 145, 103, 143)
+        body.lineTo(217, 143)
+        body.cubicTo(238, 145, 247, 171, 264, 177)
+        body.cubicTo(285, 184, 301, 155, 291, 111)
+        body.cubicTo(281, 68, 265, 40, 235, 42)
+        body.cubicTo(209, 44, 197, 55, 160, 55)
+        body.cubicTo(123, 55, 111, 44, 85, 42)
+        body.closeSubpath()
+        painter.drawPath(body)
+
+        state = self.state or {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0, "lt": 0.0, "rt": 0.0, "buttons": 0}
+        buttons = int(state["buttons"])
+
+        def stick(cx: float, cy: float, x_key: str, y_key: str) -> None:
+            painter.setPen(QtGui.QPen(QtGui.QColor("#11151b"), 2))
+            painter.setBrush(QtGui.QColor("#171c23"))
+            painter.drawEllipse(QtCore.QPointF(cx, cy), 21, 21)
+            x = float(state[x_key])
+            y = float(state[y_key])
+            painter.setBrush(accent if abs(x) + abs(y) > 0.02 else QtGui.QColor("#8993a1"))
+            painter.drawEllipse(QtCore.QPointF(cx + x * 10, cy - y * 10), 12, 12)
+
+        stick(102, 82, "lx", "ly")
+        stick(199, 124, "rx", "ry")
+
+        # D-pad
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor("#11151b"))
+        painter.drawRoundedRect(QtCore.QRectF(70, 111, 48, 16), 4, 4)
+        painter.drawRoundedRect(QtCore.QRectF(86, 95, 16, 48), 4, 4)
+        for mask, rect in (
+            (XInputGamepad.BUTTON_DPAD_LEFT, QtCore.QRectF(70, 111, 16, 16)),
+            (XInputGamepad.BUTTON_DPAD_RIGHT, QtCore.QRectF(102, 111, 16, 16)),
+            (XInputGamepad.BUTTON_DPAD_UP, QtCore.QRectF(86, 95, 16, 16)),
+            (XInputGamepad.BUTTON_DPAD_DOWN, QtCore.QRectF(86, 127, 16, 16)),
+        ):
+            if buttons & mask:
+                painter.setBrush(accent)
+                painter.drawRoundedRect(rect, 3, 3)
+
+        def face(label: str, x: float, y: float, mask: int, color: str) -> None:
+            painter.setBrush(QtGui.QColor(color) if buttons & mask else QtGui.QColor("#171c23"))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(QtCore.QPointF(x, y), 10, 10)
+            painter.setPen(QtGui.QColor("white"))
+            painter.drawText(QtCore.QRectF(x - 10, y - 10, 20, 20), QtCore.Qt.AlignCenter, label)
+
+        face("Y", 248, 70, XInputGamepad.BUTTON_Y, "#e2b52b")
+        face("X", 230, 88, XInputGamepad.BUTTON_X, "#287dc1")
+        face("B", 266, 88, XInputGamepad.BUTTON_B, "#d94b45")
+        face("A", 248, 106, XInputGamepad.BUTTON_A, "#43a85b")
+
+        painter.setPen(QtCore.Qt.NoPen)
+        for x, key, label in ((42, "lt", "LT"), (264, "rt", "RT")):
+            painter.setBrush(QtGui.QColor("#15191f"))
+            painter.drawRoundedRect(QtCore.QRectF(x, 17, 14, 48), 5, 5)
+            fill = 44 * float(state[key])
+            painter.setBrush(accent)
+            painter.drawRoundedRect(QtCore.QRectF(x + 2, 63 - fill, 10, fill), 3, 3)
+            painter.setPen(QtGui.QColor("#cbd2dc"))
+            painter.drawText(QtCore.QRectF(x - 7, 0, 28, 16), QtCore.Qt.AlignCenter, label)
+            painter.setPen(QtCore.Qt.NoPen)
+
+        painter.setPen(QtGui.QColor("#cbd2dc"))
+        status = f"XInput 手柄 {self.controller_index + 1}" if active and self.controller_index is not None else "未检测到手柄"
+        painter.drawText(QtCore.QRectF(105, 158, 110, 24), QtCore.Qt.AlignCenter, status)
 
 
 class AutoConnectWorker(QtCore.QThread):
@@ -192,6 +372,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serial_port: serial.Serial | None = None
         self.auto_connect_worker: AutoConnectWorker | None = None
         self.input_state = InputState()
+        self.gamepad_reader = XInputGamepad()
+        self.gamepad_state: dict[str, float | int] | None = None
+        self.previous_gamepad_buttons = 0
         self.direct_pwm_active = False
         self.last_rx_time = 0.0
         self.data: dict[str, deque[float]] = {
@@ -248,8 +431,25 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_scroll.setWidget(controls_panel)
         controls_scroll.setMinimumWidth(370)
         body.addWidget(controls_scroll)
-        controls.addWidget(QtWidgets.QLabel("W/S：前进/倒车    A/D：转向    空格：切换稳定器"))
-        controls.addWidget(QtWidgets.QLabel("在控制区拖动：控制炮塔方位/俯仰；松开后自动回中"))
+        source_row = QtWidgets.QHBoxLayout()
+        self.input_source_combo = QtWidgets.QComboBox()
+        self.input_source_combo.addItem("键盘与鼠标", "keyboard")
+        self.input_source_combo.addItem("Xbox 手柄（XInput）", "gamepad")
+        source_row.addWidget(QtWidgets.QLabel("控制输入"))
+        source_row.addWidget(self.input_source_combo, 1)
+        controls.addLayout(source_row)
+        controls.addWidget(QtWidgets.QLabel("键盘：W/S 前进/倒车，A/D 转向，空格切换稳定器"))
+        controls.addWidget(QtWidgets.QLabel("手柄：RT前进、LT倒车/刹车、左摇杆转向、右摇杆控制炮塔、A稳定器、B急停、Y恢复"))
+
+        self.gamepad_display = GamepadDisplay()
+        controls.addWidget(self.gamepad_display)
+        self.gamepad_values_label = QtWidgets.QLabel("手柄未启用")
+        self.gamepad_values_label.setAlignment(QtCore.Qt.AlignCenter)
+        controls.addWidget(self.gamepad_values_label)
+        self.input_source_combo.currentIndexChanged.connect(self._input_source_changed)
+
+        self.mouse_help_label = QtWidgets.QLabel("在控制区拖动：控制炮塔方位/俯仰；松开后自动回中")
+        controls.addWidget(self.mouse_help_label)
 
         self.mouse_pad = MousePad()
         self.mouse_pad.changed.connect(self._mouse_changed)
@@ -545,6 +745,9 @@ class MainWindow(QtWidgets.QMainWindow):
         diagnostic_enabled = self.direct_pwm_check.isChecked()
         if diagnostic_enabled:
             self.input_state.zero_motion()
+            self.gamepad_state = None
+        elif self.input_source_combo.currentData() == "gamepad":
+            self._update_from_gamepad()
         else:
             self.input_state.update_from_keys()
         direct_left = self.left_pwm_spin.value() if self.direct_pwm_active else 0
@@ -572,6 +775,47 @@ class MainWindow(QtWidgets.QMainWindow):
             self.connect_btn.setText("连接")
             self.input_state.zero_motion()
             self.input_state.stop = True
+
+    def _input_source_changed(self) -> None:
+        self.input_state.zero_motion()
+        self.gamepad_state = None
+        self.previous_gamepad_buttons = 0
+        gamepad_mode = self.input_source_combo.currentData() == "gamepad"
+        self.mouse_pad.setEnabled(not gamepad_mode)
+        self.mouse_help_label.setEnabled(not gamepad_mode)
+        self.gamepad_display.set_state(None)
+        self.gamepad_values_label.setText("正在检测 XInput 手柄……" if gamepad_mode else "手柄未启用")
+
+    def _update_from_gamepad(self) -> None:
+        state = self.gamepad_reader.poll()
+        self.gamepad_state = state
+        self.gamepad_display.set_state(state, self.gamepad_reader.index)
+        self.input_state.keys.clear()
+        if state is None:
+            self.input_state.zero_motion()
+            self.previous_gamepad_buttons = 0
+            self.gamepad_values_label.setText("未检测到 XInput 手柄（输出已归零）")
+            return
+        self.input_state.trigger_l = float(state["lt"])
+        self.input_state.trigger_r = float(state["rt"])
+        self.input_state.joy_lx = float(state["lx"])
+        self.input_state.joy_rx = float(state["rx"])
+        self.input_state.joy_ry = float(state["ry"])
+        self.input_state.a_pressed = bool(int(state["buttons"]) & XInputGamepad.BUTTON_A)
+        buttons = int(state["buttons"])
+        pressed_edges = buttons & ~self.previous_gamepad_buttons
+        self.previous_gamepad_buttons = buttons
+        # 急停优先；只有新的按键沿才触发，按住Y不会持续重复解除。
+        if pressed_edges & XInputGamepad.BUTTON_B:
+            self._emergency_stop()
+        elif pressed_edges & XInputGamepad.BUTTON_Y:
+            self._clear_stop()
+        self.gamepad_values_label.setText(
+            f"左摇杆 X/Y：{float(state['lx']):+.2f} / {float(state['ly']):+.2f}    "
+            f"右摇杆 X/Y：{float(state['rx']):+.2f} / {float(state['ry']):+.2f}\n"
+            f"LT：{float(state['lt']) * 100:5.1f}%    RT：{float(state['rt']) * 100:5.1f}%    "
+            f"B急停 / Y恢复"
+        )
 
     def _update_plots(self) -> None:
         x = list(self.data["t"])

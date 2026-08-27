@@ -116,21 +116,6 @@ void TankTrack::stop() {
         motor.drive(0);
     }
 
-ThrottleSmoother::ThrottleSmoother(float rise, float fall) : rise_rate(rise), fall_rate(fall) {}
-
-float ThrottleSmoother::update(float target, float dt) {
-        if (target > current_val) {
-            // 踩油门：缓慢建立扭矩
-            current_val = min(current_val + rise_rate * dt, target);
-        } else {
-            // 松油门/刹车：极其迅速地卸载扭矩
-            current_val = max(current_val - fall_rate * dt, target);
-        }
-        return current_val;
-    }
-
-void ThrottleSmoother::reset() { current_val = 0.0f; }
-
 float TankChassis::moveToward(float current, float target, float maxDelta) {
         float delta = target - current;
         if (delta > maxDelta) return current + maxDelta;
@@ -226,9 +211,7 @@ TankChassis::TankChassis() :
                    "right", false),
         leftTrack (DCMotor(Config::L_IN1, Config::L_IN2, Config::L_PWM, Config::PWM_CH_L, true),
                    CustomEncoder(Config::L_ENCA, Config::L_ENCB, PCNT_UNIT_1, Config::L_ENCODER_SIGN),
-                   "left", true),
-        engineSmoother(0.8f, 10.0f),
-        brakeSmoother(4.0f, 10.0f)
+                   "left", true)
 {}
 
 void TankChassis::init() { rightTrack.init(); leftTrack.init(); }
@@ -265,45 +248,92 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         // 纵向动力学 (游戏式 RT 前进 / LT 倒车)
         // ==========================================
         
-        // 1. 获取平滑后的油门与刹车输入 (0.0 ~ 1.0)
-        // trigger 做了平方处理，模拟摇杆的指数曲线，增加微操手感
+        // 1. 获取油门与刹车输入 (0.0 ~ 1.0)。trigger做平方处理以增加微操手感；
+        // 发动机响应在后面的物理状态中建立，刹车则直接使用当前扳机值。
         float forwardInput = (triggerR > Config::TRIGGER_DEADZONE) ? (triggerR * triggerR) : 0.0f;
         float reverseInput = (triggerL > Config::TRIGGER_DEADZONE) ? (triggerL * triggerL) : 0.0f;
         float driveInput = forwardInput - reverseInput;
         int8_t requestedDir = (driveInput > 0.001f) ? 1 : ((driveInput < -0.001f) ? -1 : 0);
 
+        // 静止起步意图必须连续保持500ms才生效。确认期间不推进虚拟速度，也不触发
+        // 单侧履带起步状态机；行驶中的油门、制动和原地转向不受这个确认影响。
+        bool nearlyStationaryForStart = abs(v_real) <= Config::DIRECTION_CHANGE_STOP_SPEED_KMH;
+        bool oppositeDirectionRequest = requestedDir != 0 && driveDirection != 0 &&
+                                        requestedDir != driveDirection;
+        bool startConfirmationRequired = requestedDir != 0 && nearlyStationaryForStart &&
+                                         !oppositeDirectionRequest;
+        if (requestedDir == 0) {
+            startIntentDirection = 0;
+            startIntentSinceMs = 0;
+            startIntentTiming = false;
+            startIntentConfirmed = false;
+        } else if (startConfirmationRequired &&
+                   (!startIntentConfirmed || startIntentDirection != requestedDir)) {
+            uint32_t nowMs = millis();
+            if (!startIntentTiming || startIntentDirection != requestedDir) {
+                startIntentDirection = requestedDir;
+                startIntentSinceMs = nowMs;
+                startIntentTiming = true;
+                startIntentConfirmed = false;
+            } else if ((uint32_t)(nowMs - startIntentSinceMs) >=
+                       Config::TRACK_START_INPUT_CONFIRM_MS) {
+                startIntentTiming = false;
+                startIntentConfirmed = true;
+            }
+        } else if (!startConfirmationRequired && !oppositeDirectionRequest) {
+            startIntentDirection = requestedDir;
+            startIntentTiming = false;
+            startIntentConfirmed = true;
+        }
+        bool startInputBlocked = startConfirmationRequired && !startIntentConfirmed;
+
         if (driveDirection == 0) {
             if (v_real > Config::DIRECTION_CHANGE_STOP_SPEED_KMH) driveDirection = 1;
             else if (v_real < -Config::DIRECTION_CHANGE_STOP_SPEED_KMH) driveDirection = -1;
-            else if (requestedDir != 0) driveDirection = requestedDir;
+            else if (requestedDir != 0 && !startInputBlocked) driveDirection = requestedDir;
         }
 
         float raw_throttle = abs(driveInput);
         float raw_brake = 0.0f;
+        if (startInputBlocked) raw_throttle = 0.0f;
+
+        // 刹车优先：当前前进时LT是刹车，当前倒车时RT是刹车。超过既有死区后
+        // 立即切断发动机牵引；制动力仍按扳机平方值连续变化。
+        bool pedalBrakeActive = (driveDirection > 0 && reverseInput > 0.0f) ||
+                                (driveDirection < 0 && forwardInput > 0.0f);
+        if (pedalBrakeActive) {
+            raw_brake = driveDirection > 0 ? reverseInput : forwardInput;
+            raw_throttle = 0.0f;
+            engineCmd = 0.0f;
+        }
 
         // 相反扳机先只充当刹车。必须连续保持2秒且车辆接近停稳，才授权新方向。
         bool directionChangeBraking = requestedDir != 0 && driveDirection != 0 &&
                                       requestedDir != driveDirection;
         if (directionChangeBraking) {
             uint32_t nowMs = millis();
-            if (pendingDriveDirection != requestedDir) {
+            raw_brake = max(raw_brake, abs(driveInput));
+            raw_throttle = 0.0f;
+            engineCmd = 0.0f;
+            bool nearlyStopped = abs(v_real) <= Config::DIRECTION_CHANGE_STOP_SPEED_KMH;
+            // 反向输入在车辆仍运动时只负责刹车；真正的2秒确认从接近静止后才开始。
+            if (!nearlyStopped) {
+                pendingDriveDirection = requestedDir;
+                directionChangeSinceMs = 0;
+            } else if (pendingDriveDirection != requestedDir || directionChangeSinceMs == 0) {
                 pendingDriveDirection = requestedDir;
                 directionChangeSinceMs = nowMs;
             }
-            raw_brake = raw_throttle;
-            raw_throttle = 0.0f;
-            engineSmoother.reset();
-            bool heldLongEnough = (uint32_t)(nowMs - directionChangeSinceMs) >=
-                                  Config::DIRECTION_CHANGE_HOLD_MS;
-            bool nearlyStopped = abs(v_real) <= Config::DIRECTION_CHANGE_STOP_SPEED_KMH;
+            bool heldLongEnough = nearlyStopped && directionChangeSinceMs != 0 &&
+                (uint32_t)(nowMs - directionChangeSinceMs) >= Config::DIRECTION_CHANGE_HOLD_MS;
             if (heldLongEnough && nearlyStopped) {
                 driveDirection = requestedDir;
                 pendingDriveDirection = 0;
                 directionChangeSinceMs = 0;
                 directionChangeBraking = false;
+                pedalBrakeActive = false;
                 raw_brake = 0.0f;
                 raw_throttle = abs(driveInput);
-                brakeSmoother.reset();
             }
         } else {
             pendingDriveDirection = 0;
@@ -313,69 +343,76 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
         float commandedDriveInput = directionChangeBraking ? 0.0f
             : raw_throttle * (float)driveDirection;
 
-        float eff_throttle = engineSmoother.update(raw_throttle, dt);
-        float eff_brake    = brakeSmoother.update(raw_brake, dt);
+        // 方向输入保留现有死区和手感曲线，再加入很短的TN12转向响应。
+        constexpr float turnDeadzone = 0.12f;
+        float turnMagnitude = (abs(joyX) <= turnDeadzone) ? 0.0f
+            : (abs(joyX) - turnDeadzone) / (1.0f - turnDeadzone);
+        float shapedMagnitude = Config::TURN_INPUT_LINEAR_BLEND * turnMagnitude +
+            (1.0f - Config::TURN_INPUT_LINEAR_BLEND) * turnMagnitude * turnMagnitude;
+        float steerCommand = copysign(shapedMagnitude, joyX);
+        steerState += (dt / (Config::STEER_FILTER_TAU_S + dt)) * (steerCommand - steerState);
+        if (abs(steerState) < 0.001f) steerState = 0.0f;
 
-        // 2. 计算各独立作用力（换算为加速度，单位 km/h/s）
-        float force_engine = eff_throttle * Config::REAL_ACCEL * driveDirection;
+        // 刹车优先时立即卸载动力；正常驾驶时以0.6s一阶状态模拟发动机/TN12。
+        if (directionChangeBraking || pedalBrakeActive) engineCmd = 0.0f;
+        else engineCmd += (raw_throttle - engineCmd) * dt / Config::ENGINE_TAU_S;
+        engineCmd = constrain(engineCmd, 0.0f, 1.0f);
+        float eff_brake = raw_brake;
+        bool serviceBrakeActive = directionChangeBraking || pedalBrakeActive || eff_brake > 0.01f;
 
-        float force_brake = eff_brake * Config::REAL_BRAKE;
+        // 最大牵引力/恒功率模型及路面阻力全部使用SI制。
+        float speedMps = v_real / 3.6f;
+        float absSpeedMps = abs(speedMps);
+        float availableTraction = min(Config::TRACTION_MAX_N,
+            Config::TRACK_POWER_W / max(absSpeedMps, 1.0f));
+        float forceEngine = engineCmd * availableTraction * (float)driveDirection;
+        float rollingCoeff = Config::DRIVE_ROAD_PROFILE == Config::RoadProfile::Unpaved
+            ? Config::UNPAVED_ROLLING_COEFF : Config::ROAD_ROLLING_COEFF;
+        float terrainK = Config::DRIVE_ROAD_PROFILE == Config::RoadProfile::Unpaved
+            ? Config::UNPAVED_TERRAIN_K_N_PER_MPS : Config::ROAD_TERRAIN_K_N_PER_MPS;
+        float cda = Config::DRIVE_ROAD_PROFILE == Config::RoadProfile::Unpaved
+            ? Config::UNPAVED_CDA_M2 : Config::ROAD_CDA_M2;
+        float forceRolling = rollingCoeff * Config::VEHICLE_MASS_KG * 9.81f;
+        float forceTerrain = terrainK * absSpeedMps;
+        float forceAir = 0.5f * Config::AIR_DENSITY_KG_M3 * cda * absSpeedMps * absSpeedMps;
+        float forceTurn = Config::TURN_RESIST_K_N_PER_MPS *
+            pow(abs(steerState), Config::TURN_RESIST_EXP) * absSpeedMps;
+        float forceSlope = -Config::VEHICLE_MASS_KG *
+            (Config::SLOPE_GRAVITY_MAX / 3.6f) * sin(gradePitch * DEG_TO_RAD);
+        float forceBrakeMagnitude = Config::BRAKE_MAX_N * eff_brake;
 
-        // 阻力：运动时始终与当前运动方向相反。
-        float resDir = (v_real > 0.1f) ? 1.0f : ((v_real < -0.1f) ? -1.0f : (v_real / 0.1f));
-        float airResist = Config::AIR_RESIST_COEFF * v_real * v_real;
-        float rollResist = Config::ROLL_RESIST_ACCEL * constrain(abs(v_real) / 1.0f, 0.0f, 1.0f);
-        float force_resist = -(airResist + rollResist) * resDir;
+        float motionDirection = speedMps > 0.03f ? 1.0f : (speedMps < -0.03f ? -1.0f : 0.0f);
+        float forceBeforeResistance = forceEngine + forceSlope;
+        if (motionDirection == 0.0f && abs(forceBeforeResistance) > 1.0f)
+            motionDirection = copysign(1.0f, forceBeforeResistance);
+        float forceResistance = -motionDirection *
+            (forceRolling + forceTerrain + forceAir + forceTurn);
+        float forceBrake = -motionDirection * forceBrakeMagnitude;
 
-        // 坡度重力分量
-        float force_slope = -Config::SLOPE_GRAVITY_MAX * sin(gradePitch * DEG_TO_RAD);
-
-        // 松开油门且近乎静止时，用有限的静阻力抵消小坡重力；超过阈值仍会按剩余坡力溜车。
-        // 该分支不伪造电机 PWM，只改变动力学目标，因此坡上溜车仍由速度闭环真实执行。
-        bool neutralCoast = raw_throttle <= 0.001f && raw_brake <= 0.001f;
-        if (neutralCoast && abs(v_real) <= 0.1f) {
-            if (abs(force_slope) <= Config::COAST_STATIC_RESIST_ACCEL) {
-                force_slope = 0.0f;
-                force_resist = 0.0f;
-                longitudinalAccel = 0.0f;
-                v_real = 0.0f;
-            } else {
-                // 刚开始溜车时速度还没有方向，用坡力方向决定静阻力方向。
-                force_resist = -copysign(Config::COAST_STATIC_RESIST_ACCEL, force_slope);
-            }
-        }
-
-        // 3. 施加刹车力的方向判定
-        // 刹车力是没有主动方向的，它只能去“抵消”当前的速度。
-        if (v_real > 0.1f) {
-            force_brake = -force_brake; // 车往前走，刹车向后拉
-        } else if (v_real < -0.1f) {
-            force_brake = force_brake;  // 车往后走，刹车向前拉
+        bool staticHold = abs(speedMps) < (0.05f / 3.6f) &&
+            abs(forceBeforeResistance) <= forceRolling + forceBrakeMagnitude;
+        if (staticHold) {
+            v_real = 0.0f;
+            longitudinalAccel = 0.0f;
         } else {
-            // 速度极小时，重力可能导致溜车。如果刹车踩得够死，静摩擦力接管，抵消所有外力。
-            if (eff_brake > 0.1f && abs(force_engine + force_slope) < (force_brake)) {
-                force_engine = 0; force_slope = 0; force_resist = 0; force_brake = 0; 
-                v_real = 0; // 死死刹停
-            } else {
-                force_brake = 0;
+            float forceNet = forceBeforeResistance + forceResistance + forceBrake;
+            float rawAccel = forceNet / Config::VEHICLE_MASS_KG;
+            bool acceleratesExistingMotion = abs(speedMps) > 0.01f
+                ? rawAccel * speedMps > 0.0f
+                : rawAccel * (float)driveDirection > 0.0f;
+            float accelLimit = acceleratesExistingMotion
+                ? Config::MAX_DRIVE_ACCEL_MPS2
+                : Config::MAX_BRAKE_ACCEL_MPS2;
+            longitudinalAccel = constrain(rawAccel, -accelLimit, accelLimit);
+            float previousSpeedMps = speedMps;
+            speedMps += longitudinalAccel * dt;
+            if (previousSpeedMps * speedMps < 0.0f &&
+                abs(forceBeforeResistance) <= forceRolling + forceBrakeMagnitude) {
+                speedMps = 0.0f;
+                longitudinalAccel = 0.0f;
             }
+            v_real = speedMps * 3.6f;
         }
-
-        // 4. 净力求和
-        float a_net = force_engine + force_brake + force_resist + force_slope;
-
-        // 5. jerk 限制后的实际纵向加速度。明确刹车时必须始终使用较快的制动 jerk；
-        // 否则减速度一旦与目标净加速度同号，就会被误判成普通加速建立并切回慢 jerk。
-        bool accelerationBuilds = (a_net * longitudinalAccel >= 0.0f) && (abs(a_net) > abs(longitudinalAccel));
-        bool serviceBrakeActive = directionChangeBraking || eff_brake > 0.01f;
-        float jerkLimit = serviceBrakeActive
-            ? Config::LINEAR_JERK_BRAKE
-            : (accelerationBuilds ? Config::LINEAR_JERK_ACCEL : Config::LINEAR_JERK_BRAKE);
-        longitudinalAccel = moveToward(longitudinalAccel, a_net, jerkLimit * dt);
-        if (abs(a_net) < 0.02f && abs(longitudinalAccel) < 0.02f) longitudinalAccel = 0.0f;
-
-        // 6. 积分计算最终纵向速度
-        v_real += longitudinalAccel * dt;
 
         // 极限速度钳制
         v_real = constrain(v_real, -Config::REAL_V_REV_MAX, Config::REAL_V_MAX);
@@ -384,59 +421,44 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
             longitudinalAccel = 0.0f;
         }
 
-        // ==========================================
-        // 横向动力学：摇杆直接给目标差速，真实车体的转动惯量由 yaw IMU 反馈补偿。
-        // ==========================================
-        
-        constexpr float turnDeadzone = 0.12f;
-        float turnMagnitude = (abs(joyX) <= turnDeadzone) ? 0.0f
-            : (abs(joyX) - turnDeadzone) / (1.0f - turnDeadzone);
-        float turnShapedMagnitude = Config::TURN_INPUT_LINEAR_BLEND * turnMagnitude +
-            (1.0f - Config::TURN_INPUT_LINEAR_BLEND) * turnMagnitude * turnMagnitude;
-        // 手柄/PC 正X应当对应车辆向右转。履带混合为 L=v+spin、R=v-spin，
-        // 因此这里翻转输入符号，修正此前左右方向相反的问题。
-        float joyX_squared = copysign(turnShapedMagnitude, -joyX);
-        
-        // 随速感应灵敏度
-        float dynamic_sens = Config::YAW_SENSITIVITY / (1.0f + abs(v_real) * Config::SPEED_SENS_K);
-        
-        // 行进转向和原地中心转向使用不同的履带差速上限。若原地也直接沿用
-        // YAW_SENSITIVITY=25 km/h，理论一圈只有约 4.7 秒，明显失去重车感。
-        float movingTargetSpin = joyX_squared * dynamic_sens;
-        float pivotCommandSpin = joyX_squared * Config::PIVOT_SPIN_MAX_KMH;
-        // 低速/原地转向更像另一组“转向油门”：先克服履带搓地阻力，反向输入先刹到接近 0。
-        // 行进中则更接近双流传动的速度分配，允许更快跟随目标差速。
-        float movingBlend = constrain(abs(v_real) / Config::TURN_MOVING_BLEND_KMH, 0.0f, 1.0f);
-        float pivotBlend = 1.0f - movingBlend;
-        bool turnInputActive = turnMagnitude > 0.0f;
-        bool pivotReverseBrake = turnInputActive &&
-                                 (pivotCommandSpin * spinV < 0.0f) &&
-                                 (abs(spinV) > Config::TRACK_STOP_DEADZONE_KMH);
+        // 只有无纵向输入且接近静止时才进入中心转向；油门+方向按DRIVE弧线起步。
+        bool longitudinalDemand = requestedDir != 0;
+        if (!pivotMode) {
+            if (!longitudinalDemand && abs(v_real) < Config::PIVOT_ENTER_SPEED_KMH &&
+                abs(steerState) > Config::PIVOT_ENTER_STEER) pivotMode = true;
+        } else if (longitudinalDemand || abs(v_real) > Config::PIVOT_EXIT_SPEED_KMH ||
+                   abs(steerState) < Config::PIVOT_EXIT_STEER) {
+            pivotMode = false;
+        }
 
-        float pivotTargetSpin = pivotReverseBrake ? 0.0f : pivotCommandSpin;
-        float effectiveTargetSpin = pivotTargetSpin * pivotBlend + movingTargetSpin * movingBlend;
-
-        float turnAccelLimit = Config::TURN_ACCEL_PIVOT +
-                               (Config::TURN_ACCEL_MOVING - Config::TURN_ACCEL_PIVOT) * movingBlend;
-        float turnBrakeLimit = Config::TURN_BRAKE_PIVOT +
-                               (Config::TURN_BRAKE_MOVING - Config::TURN_BRAKE_PIVOT) * movingBlend;
-        bool turnBuilds = (effectiveTargetSpin * spinV >= 0.0f) &&
-                          (abs(effectiveTargetSpin) > abs(spinV)) &&
-                          !pivotReverseBrake;
-        float turnRateLimit = turnBuilds ? turnAccelLimit : turnBrakeLimit;
-        spinV = moveToward(spinV, effectiveTargetSpin, turnRateLimit * dt);
-
-        // ==========================================
-        // 双流耦合输出 (保持不变)
-        // ==========================================
-        float Lv_tgt = v_real + spinV;
-        float Rv_tgt = v_real - spinV;
+        float Lv_tgt = 0.0f;
+        float Rv_tgt = 0.0f;
+        if (pivotMode) {
+            // 正方向输入对应右转：左履带前进、右履带后退。
+            float pivotCommandSpin = steerState * Config::PIVOT_SPIN_MAX_KMH;
+            bool reverseBrake = pivotCommandSpin * spinV < 0.0f &&
+                                abs(spinV) > Config::TRACK_STOP_DEADZONE_KMH;
+            float pivotTargetSpin = reverseBrake ? 0.0f : pivotCommandSpin;
+            bool builds = pivotTargetSpin * spinV >= 0.0f &&
+                          abs(pivotTargetSpin) > abs(spinV) && !reverseBrake;
+            spinV = moveToward(spinV, pivotTargetSpin,
+                (builds ? Config::TURN_ACCEL_PIVOT : Config::TURN_BRAKE_PIVOT) * dt);
+            Lv_tgt = spinV;
+            Rv_tgt = -spinV;
+        } else {
+            // q(v)随速降低差速比例；q<1天然禁止行进中的内侧履带反转。
+            float q = Config::STEER_Q0 /
+                (1.0f + abs(v_real / 3.6f) / Config::STEER_VS_MPS);
+            Lv_tgt = v_real * (1.0f + q * steerState);
+            Rv_tgt = v_real * (1.0f - q * steerState);
+            spinV = 0.5f * (Lv_tgt - Rv_tgt);
+        }
 
         // 重车动力学可以让目标速度缓慢建立，但电机克服静摩擦的扭矩不应因此延迟数秒。
         // 用原始驾驶意图只提供方向性的小种子目标，低速状态机会立即开始120ms起步PWM斜坡；
         // 真正闭环目标和后续加速仍由 v_real/spinV 的重车动力学决定。
-        float leftDriveIntent = commandedDriveInput + joyX_squared;
-        float rightDriveIntent = commandedDriveInput - joyX_squared;
+        float leftDriveIntent = pivotMode ? steerState : commandedDriveInput;
+        float rightDriveIntent = pivotMode ? -steerState : commandedDriveInput;
         if (abs(Lv_tgt) < Config::TRACK_STOP_DEADZONE_KMH &&
             abs(leftDriveIntent) > 0.01f) {
             Lv_tgt = copysign(Config::TRACK_STOP_DEADZONE_KMH, leftDriveIntent);
@@ -473,8 +495,7 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
 
         bool leftMotionDemand = abs(leftDriveIntent) > 0.01f;
         bool rightMotionDemand = abs(rightDriveIntent) > 0.01f;
-        bool pivotLaunch = turnInputActive && abs(commandedDriveInput) <= 0.01f &&
-                           abs(v_real) < 1.0f;
+        bool pivotLaunch = pivotMode;
         leftTrack.update(Lv_tgt, dt, leftInertiaPwm, batteryVoltage, serviceBrakeActive,
                          leftMotionDemand, pivotLaunch);
         rightTrack.update(Rv_tgt, dt, rightInertiaPwm, batteryVoltage, serviceBrakeActive,
@@ -502,6 +523,13 @@ void TankChassis::processDirectTrackTargets(float leftTarget, float rightTarget,
         driveDirection = 0;
         pendingDriveDirection = 0;
         directionChangeSinceMs = 0;
+        startIntentDirection = 0;
+        startIntentSinceMs = 0;
+        startIntentTiming = false;
+        startIntentConfirmed = false;
+        engineCmd = 0.0f;
+        steerState = 0.0f;
+        pivotMode = false;
         leftTrack.update(leftTarget, dt, 0.0f, Config::TRACK_FF_REFERENCE_VOLTAGE,
                          false, abs(leftTarget) >= Config::TRACK_STOP_DEADZONE_KMH, false);
         rightTrack.update(rightTarget, dt, 0.0f, Config::TRACK_FF_REFERENCE_VOLTAGE,
@@ -525,6 +553,9 @@ void TankChassis::processDirectTrackPwm(float leftPwm, float rightPwm) {
         spinV = 0.0f;
         longitudinalAccel = 0.0f;
         bothTracksWereClosedLoop = false;
+        engineCmd = 0.0f;
+        steerState = 0.0f;
+        pivotMode = false;
         leftTrack.driveDirect(leftPwm);
         rightTrack.driveDirect(rightPwm);
     }
@@ -551,11 +582,18 @@ void TankChassis::getTrackTelemetry(float& leftTarget, float& leftControlActual,
 void TankChassis::stop() { 
         v_real = 0; spinV = 0; 
         longitudinalAccel = 0.0f;
-        driveDirection = 0;
+        // 保留最近一次行驶方向。普通安全停车后请求相反方向时，仍必须走完整
+        // 的静止2秒确认；上电初始值为0，可自由选择首个方向。
         pendingDriveDirection = 0;
         directionChangeSinceMs = 0;
+        startIntentDirection = 0;
+        startIntentSinceMs = 0;
+        startIntentTiming = false;
+        startIntentConfirmed = false;
         bothTracksWereClosedLoop = false;
         resetImuCompensation();
-        engineSmoother.reset(); brakeSmoother.reset();
+        engineCmd = 0.0f;
+        steerState = 0.0f;
+        pivotMode = false;
         leftTrack.stop(); rightTrack.stop(); 
     }

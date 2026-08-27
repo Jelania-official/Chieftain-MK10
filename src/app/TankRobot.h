@@ -46,6 +46,7 @@ private:
     uint32_t lastBatteryCutoffLogMs = 0;
     bool chassisReady = false;
     bool turretReady = false;
+    bool controllerEmergencyStop = false;
     float batteryVoltage = 0.0f;
     bool batteryValid = false;
 

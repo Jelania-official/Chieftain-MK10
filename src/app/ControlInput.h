@@ -9,4 +9,6 @@ struct ControlInput {
     float joyRX = 0.0f;    // 右摇杆 X，-1.0~1.0，用作炮塔 yaw 手动输入
     float joyRY = 0.0f;    // 右摇杆 Y，-1.0~1.0，用作炮管 pitch 手动输入
     bool aPressed = false; // A 键，作为炮塔稳定模式开关
+    bool bPressed = false; // B 键，锁存整车急停
+    bool yPressed = false; // Y 键，解除手柄急停
 };

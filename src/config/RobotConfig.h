@@ -63,12 +63,15 @@ namespace Config {
     // 这里只保留静止起步门槛，避免与表格中的运行摩擦重复相加。
     const float TRACK_FF_REFERENCE_VOLTAGE = 11.57f;
     // 起步/维持门槛原测于12.11V，已等效换算到11.57V并向上取整。
-    const float TRACK_FF_START_FORWARD_PWM = 35.0f;
-    const float TRACK_FF_START_REVERSE_PWM = 36.0f;
+    const float TRACK_FF_START_FORWARD_PWM = 38.0f;
+    const float TRACK_FF_START_REVERSE_PWM = 39.0f;
     const float TRACK_FF_RUN_FORWARD_PWM = 30.0f;
     const float TRACK_FF_RUN_REVERSE_PWM = 31.0f;
     const float TRACK_FF_BATTERY_SCALE_MIN = 0.85f;
     const float TRACK_FF_BATTERY_SCALE_MAX = 1.20f;
+    // 静止起步前要求驾驶输入连续保持，过滤误碰和很短的扳机脉冲。
+    // 只作用于首次起步，不延迟行驶中的油门、刹车或原地转向。
+    const uint32_t TRACK_START_INPUT_CONFIRM_MS = 500;
     // 机构最低连续速度约2.8km/h。低于该速度不让PI反复启停，而由开环起步/停车状态接管。
     const float TRACK_MIN_CLOSED_LOOP_SPEED_KMH = 2.8f;
     // 起步分三段：先快速跨过无效 PWM 区，再柔和建立静摩擦扭矩，最后在确实未起步时增力。
@@ -150,18 +153,28 @@ namespace Config {
     // ---------- 纵向动力学 ----------
     const float REAL_V_MAX = 48.0f;
     const float REAL_V_REV_MAX = 11.0f;
-    // REAL_ACCEL 是归一化后的发动机牵引项，不等同于车辆瞬时加速度。
-    // 与下方阻力项组合后，平路全油门约 28.5 s 到 38 km/h，并渐近 48 km/h。
-    const float REAL_ACCEL = 2.78f;
-    const float REAL_BRAKE = 8.0f;
+    const float VEHICLE_MASS_KG = 57000.0f;
+    const float TRACK_POWER_W = 455000.0f;
+    const float TRACTION_MAX_N = 125000.0f;
+    const float ENGINE_TAU_S = 0.60f;
+    const float BRAKE_MAX_N = 240000.0f;
+    const float MAX_DRIVE_ACCEL_MPS2 = 1.8f;
+    const float MAX_BRAKE_ACCEL_MPS2 = 4.2f;
     const float TRIGGER_DEADZONE = 0.2f;
-    const float LINEAR_JERK_ACCEL = 0.4f;
-    const float LINEAR_JERK_BRAKE = 2.5f;
-    // 无驾驶输入时的履带/传动静阻力。小坡不自行滑动，坡度重力超过它后才开始溜车。
-    // 单位与其他纵向力一致，均为真车等效 km/h/s。
-    const float COAST_STATIC_RESIST_ACCEL = 0.8f;
-    const float ROLL_RESIST_ACCEL = 0.8f;
-    const float AIR_RESIST_COEFF = 0.00086f;
+    enum class RoadProfile : uint8_t { Unpaved, Road };
+    const RoadProfile DRIVE_ROAD_PROFILE = RoadProfile::Unpaved;
+    // 普通压实非铺装路：平路全油门由动力与阻力自然平衡在约30km/h，48km/h仅为安全上限。
+    const float UNPAVED_ROLLING_COEFF = 0.070f;
+    const float UNPAVED_TERRAIN_K_N_PER_MPS = 1900.0f;
+    const float UNPAVED_CDA_M2 = 9.0f;
+    // 公路参数组先预留；切换 DRIVE_ROAD_PROFILE 后仍使用同一套发动机模型。
+    const float ROAD_ROLLING_COEFF = 0.025f;
+    const float ROAD_TERRAIN_K_N_PER_MPS = 1100.0f;
+    const float ROAD_CDA_M2 = 9.0f;
+    const float AIR_DENSITY_KG_M3 = 1.225f;
+    // 文本转弯损失系数1800的30%，避免与模型履带真实搓地负载完全重复。
+    const float TURN_RESIST_K_N_PER_MPS = 540.0f;
+    const float TURN_RESIST_EXP = 1.5f;
 
     // 预留的换挡模拟参数；当前底盘算法没有使用它们。
     const float SHIFT_12_REAL_KMH = 15.0f;
@@ -171,20 +184,21 @@ namespace Config {
     const uint32_t SHIFT_CUT_TIME_MS = 100;
 
     // ---------- 转向动力学 ----------
-    const float YAW_SENSITIVITY = 25.0f;
     // 死区后采用线性/平方混合：保留中心微操，同时比纯平方映射更灵敏。
     const float TURN_INPUT_LINEAR_BLEND = 0.65f;
+    const float STEER_FILTER_TAU_S = 0.15f;
+    const float STEER_Q0 = 0.85f;
+    const float STEER_VS_MPS = 6.0f;
     // TN12 中心转向的独立履带等效速度上限。按约 2.9 m 真车履带中心距估算，
     // 3.3 km/h 对应稳态 360 度约 10 秒；首次从静止还会更慢一些。
     const float PIVOT_SPIN_MAX_KMH = 3.3f;
-    const float SPEED_SENS_K = 0.08f;
-    // 满转向不应像纵向整车加速那样缓慢：原地约0.55s建立到最大差速，
-    // 行进转向通常约1s量级建立；回中/反向更快，避免转向拖尾。
+    // 中心转向仍保留独立的建立/卸载速率；行进转向改由q(v)直接分配。
     const float TURN_ACCEL_PIVOT = 6.0f;
     const float TURN_BRAKE_PIVOT = 12.0f;
-    const float TURN_ACCEL_MOVING = 12.0f;
-    const float TURN_BRAKE_MOVING = 14.0f;
-    const float TURN_MOVING_BLEND_KMH = 8.0f;
+    const float PIVOT_ENTER_SPEED_KMH = 1.08f; // 0.3m/s
+    const float PIVOT_EXIT_SPEED_KMH = 2.16f;  // 0.6m/s
+    const float PIVOT_ENTER_STEER = 0.20f;
+    const float PIVOT_EXIT_STEER = 0.10f;
     const uint32_t DIRECTION_CHANGE_HOLD_MS = 2000;
     const float DIRECTION_CHANGE_STOP_SPEED_KMH = 0.3f;
 
