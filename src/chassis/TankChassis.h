@@ -127,9 +127,11 @@ public:
     void getTrackPidGains(float& kp, float& ki, float& kd) const;
 
     // 控制速度是 PI/堵转保护实际使用的反馈；显示速度只供上位机平滑绘图。
-    void getTrackTelemetry(float& leftTarget, float& leftControlActual, float& leftDisplayActual,
+    void getTrackTelemetry(float& leftTarget, float& leftFastActual, float& leftControlActual,
+                           float& leftDisplayActual, float& leftPhaseDeg,
                            float& leftPwm, bool& leftStalled,
-                           float& rightTarget, float& rightControlActual, float& rightDisplayActual,
+                           float& rightTarget, float& rightFastActual, float& rightControlActual,
+                           float& rightDisplayActual, float& rightPhaseDeg,
                            float& rightPwm, bool& rightStalled) const;
 
     // 立即停止底盘，并清空所有平滑器、滤波器和履带控制器状态。

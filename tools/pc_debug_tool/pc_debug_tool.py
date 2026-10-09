@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 
-TELEMETRY_FIELDS = [
+BASE_TELEMETRY_FIELDS = [
     "time_ms",
     "left_target", "left_control_actual", "left_display_actual", "left_pwm", "left_stalled",
     "right_target", "right_control_actual", "right_display_actual", "right_pwm", "right_stalled",
@@ -23,6 +23,10 @@ TELEMETRY_FIELDS = [
     "chassis_imu_initialized", "turret_imu_initialized", "yaw_sensor_initialized", "yaw_foc_initialized",
     "chassis_ready", "turret_ready", "battery_voltage", "battery_valid",
 ]
+DIAGNOSTIC_FIELDS = [
+    "left_fast_actual", "left_phase_deg", "right_fast_actual", "right_phase_deg",
+]
+TELEMETRY_FIELDS = BASE_TELEMETRY_FIELDS + DIAGNOSTIC_FIELDS
 
 HANDSHAKE_REQUEST = b"HELLO,3\n"
 HANDSHAKE_RESPONSE = "HELLO,ChieftainMK10,3"
@@ -377,6 +381,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.previous_gamepad_buttons = 0
         self.direct_pwm_active = False
         self.last_rx_time = 0.0
+        self.latest_speed_diagnostic = {
+            name: 0.0 for name in DIAGNOSTIC_FIELDS
+        }
         self.data: dict[str, deque[float]] = {
             name: deque(maxlen=800) for name in TELEMETRY_FIELDS
         }
@@ -531,6 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_display_row = QtWidgets.QHBoxLayout()
         self.actual_speed_combo = QtWidgets.QComboBox()
         self.actual_speed_combo.addItem("控制反馈（PI 实际使用）", "control")
+        self.actual_speed_combo.addItem("40 ms 原始快速测速（机械诊断）", "fast")
         self.actual_speed_combo.addItem("平滑显示", "display")
         speed_display_row.addWidget(QtWidgets.QLabel("履带实际速度显示"))
         speed_display_row.addWidget(self.actual_speed_combo, 1)
@@ -679,6 +687,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.input_state.stop = True
 
     def _handle_line(self, line: str) -> None:
+        if line.startswith("SPD,"):
+            parts = line.split(",")
+            if len(parts) != 6:
+                return
+            try:
+                _, _, left_fast, left_phase, right_fast, right_phase = parts
+                self.latest_speed_diagnostic.update({
+                    "left_fast_actual": float(left_fast),
+                    "left_phase_deg": float(left_phase),
+                    "right_fast_actual": float(right_fast),
+                    "right_phase_deg": float(right_phase),
+                })
+            except ValueError:
+                return
+            return
         if line.startswith("PID,VALUE,"):
             parts = line.split(",")
             if len(parts) != 5:
@@ -706,14 +729,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not line.startswith("TEL,"):
             return
         parts = line.split(",")[1:]
-        if len(parts) != len(TELEMETRY_FIELDS):
+        if len(parts) != len(BASE_TELEMETRY_FIELDS):
             return
         values = {}
-        for name, text in zip(TELEMETRY_FIELDS, parts):
+        for name, text in zip(BASE_TELEMETRY_FIELDS, parts):
             try:
                 values[name] = float(text)
             except ValueError:
                 return
+        values.update(self.latest_speed_diagnostic)
         t0 = values["time_ms"] * 0.001
         if not self.data["t"]:
             self._first_time = t0
@@ -725,7 +749,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_status_text(self, values: dict[str, float]) -> None:
         actual_mode = self.actual_speed_combo.currentData()
-        actual_label = "控制反馈" if actual_mode == "control" else "平滑显示"
+        actual_labels = {"fast": "40ms原始", "control": "控制反馈", "display": "平滑显示"}
+        actual_label = actual_labels.get(actual_mode, actual_mode)
         left_actual = values[f"left_{actual_mode}_actual"]
         right_actual = values[f"right_{actual_mode}_actual"]
         self.telemetry_label.setText(
@@ -734,8 +759,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"初始化：底盘IMU={int(values['chassis_imu_initialized'])}  炮塔IMU={int(values['turret_imu_initialized'])}  AS5600={int(values['yaw_sensor_initialized'])}  FOC={int(values['yaw_foc_initialized'])}\n"
             f"运行健康：底盘IMU={int(values['chassis_imu_healthy'])}  炮塔IMU={int(values['turret_imu_healthy'])}  AS5600={int(values['yaw_sensor_healthy'])}  双IMU={int(values['imu_healthy'])}\n"
             f"稳定器={int(values['stabilization'])}  方位堵转={int(values['yaw_stalled'])}\n"
-            f"左履带 目标/{actual_label}/PWM={values['left_target']:.2f}/{left_actual:.2f}/{values['left_pwm']:.1f}\n"
-            f"右履带 目标/{actual_label}/PWM={values['right_target']:.2f}/{right_actual:.2f}/{values['right_pwm']:.1f}\n"
+            f"左履带 目标/{actual_label}/PWM={values['left_target']:.2f}/{left_actual:.2f}/{values['left_pwm']:.1f}  相位={values['left_phase_deg']:.0f}°\n"
+            f"右履带 目标/{actual_label}/PWM={values['right_target']:.2f}/{right_actual:.2f}/{values['right_pwm']:.1f}  相位={values['right_phase_deg']:.0f}°\n"
             f"左右履带堵转={int(values['left_stalled'])}/{int(values['right_stalled'])}\n"
             f"电池={values['battery_voltage']:.2f}V  有效={int(values['battery_valid'])}\n"
             f"最近接收={time.monotonic() - self.last_rx_time:.2f}s"

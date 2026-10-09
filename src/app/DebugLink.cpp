@@ -206,6 +206,15 @@ void DebugLink::sendTelemetry(const DebugTelemetry& t, uint32_t intervalMs) {
     if ((uint32_t)(nowMs - lastTelemetryMs) < intervalMs) return;
     lastTelemetryMs = nowMs;
 
+    // 机械诊断数据使用独立帧，避免改变既有 TEL v3 字段位置。
+    // 旧版 PC 工具会忽略 SPD 帧，仍可正常连接并读取包括电池电压在内的遥测。
+    serial.printf(
+        "SPD,%lu,%.3f,%.3f,%.3f,%.3f\n",
+        (unsigned long)t.timeMs,
+        t.leftFastActual, t.leftPhaseDeg,
+        t.rightFastActual, t.rightPhaseDeg
+    );
+
     serial.printf(
         "TEL,%lu,%.3f,%.3f,%.3f,%.1f,%d,%.3f,%.3f,%.3f,%.1f,%d,"
         "%.3f,%.3f,%.1f,%.3f,%.3f,%.3f,%.3f,%d,"

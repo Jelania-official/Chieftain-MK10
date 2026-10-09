@@ -103,10 +103,10 @@ void TankRobot::publishDebugTelemetry() {
     t.yawSensorHealthy = turret.yawSensorIsHealthy();
 
     if (chassisReady) {
-        chassis.getTrackTelemetry(t.leftTarget, t.leftControlActual, t.leftDisplayActual,
-                                  t.leftPwm, t.leftStalled,
-                                  t.rightTarget, t.rightControlActual, t.rightDisplayActual,
-                                  t.rightPwm, t.rightStalled);
+        chassis.getTrackTelemetry(t.leftTarget, t.leftFastActual, t.leftControlActual,
+                                  t.leftDisplayActual, t.leftPhaseDeg, t.leftPwm, t.leftStalled,
+                                  t.rightTarget, t.rightFastActual, t.rightControlActual,
+                                  t.rightDisplayActual, t.rightPhaseDeg, t.rightPwm, t.rightStalled);
     }
 
     if (turretReady) {

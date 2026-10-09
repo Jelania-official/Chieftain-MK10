@@ -116,17 +116,18 @@ namespace Config {
     const uint32_t ENCODER_UPDATE_US = 10000;
     const uint8_t ENCODER_ROLLING_BINS = 4;
     const uint32_t ENCODER_STOP_TIMEOUT_US = 150000;
-    // 实测5.8km/h时约8Hz，对应主动轮每圈约9次啮合扰动；PI支路只抑制该9阶。
-    // 快速速度仍供停车和堵转使用，不经过陷波。
+    // 拆除履带后的主动轮单独测试确认：主要波动随主动轮每圈出现一次。
+    // PI支路先抑制该1阶；快速速度仍供停车和堵转使用，不经过陷波。
     const bool ENCODER_NOTCH_ENABLED = true;
     const float ENCODER_NOTCH_Q = 3.0f;
-    const float ENCODER_NOTCH_ORDER = 9.0f;
-    const float ENCODER_NOTCH_CENTER_TAU_S = 0.080f;
+    const float ENCODER_NOTCH_ORDER = 1.0f;
+    // 中心频率只需跟随平均转速，不能跟着一圈纹波本身快速摆动。
+    const float ENCODER_NOTCH_CENTER_TAU_S = 0.50f;
     const float ENCODER_NOTCH_FADE_START_KMH = 1.5f;
     const float ENCODER_NOTCH_FADE_FULL_KMH = 2.0f;
-    // 50Hz采样的奈奎斯特频率为25Hz；9阶在高速区接近该边界，提前渐退。
-    const float ENCODER_NOTCH_HIGH_FADE_START_KMH = 14.0f;
-    const float ENCODER_NOTCH_HIGH_FADE_END_KMH = 16.0f;
+    // 100Hz采样下1阶在车辆正常速度范围内远低于奈奎斯特频率；仅在异常高速渐退。
+    const float ENCODER_NOTCH_HIGH_FADE_START_KMH = 70.0f;
+    const float ENCODER_NOTCH_HIGH_FADE_END_KMH = 80.0f;
     const float ENCODER_NOTCH_MAX_MIX = 1.0f;
     const float ENCODER_NOTCH_BLEND_TAU_S = 0.10f;
     // 由17mm主动轮周长和1:35速度映射得到：每1 km/h真车等效速度约0.1486圈/秒。
@@ -199,7 +200,8 @@ namespace Config {
     const float PIVOT_EXIT_SPEED_KMH = 2.16f;  // 0.6m/s
     const float PIVOT_ENTER_STEER = 0.20f;
     const float PIVOT_EXIT_STEER = 0.10f;
-    const uint32_t DIRECTION_CHANGE_HOLD_MS = 2000;
+    // 游戏式驾驶手感：相反扳机先负责制动；接近停稳后继续保持0.5秒即可授权反向。
+    const uint32_t DIRECTION_CHANGE_HOLD_MS = 500;
     const float DIRECTION_CHANGE_STOP_SPEED_KMH = 0.3f;
 
     // ---------- yaw 虚拟惯量 ----------

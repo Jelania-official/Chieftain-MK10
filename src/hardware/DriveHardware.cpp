@@ -151,6 +151,7 @@ void CustomEncoder::init() {
     displayMeasuredSpeed = 0.0f;
     lastSpeed = 0.0f;
     displaySpeed = 0.0f;
+    cumulativeOutputCount = 0;
     controlSampleId = 0;
     controlSampleDt = 0.0f;
     stopTimeoutPublished = false;
@@ -164,12 +165,16 @@ float CustomEncoder::getRealSpeedKMH() {
     if (dtUs >= Config::ENCODER_UPDATE_US) {
         int16_t count = 0;
 
-        // 每20ms结算一次硬件计数。短片段随后进入两个bin的重叠滚动窗口，
+        // 每10ms结算一次硬件计数。短片段随后进入四个bin的重叠滚动窗口，
         // 不让PCNT长期累计，避免16位计数器达到上下限。
         pcnt_counter_pause(unit);
         pcnt_get_counter_value(unit, &count);
         pcnt_counter_clear(unit);
         pcnt_counter_resume(unit);
+
+        // PCNT每个测速片段都会清零，因此另存本次启动内的累计计数。
+        // 乘方向符号后，正相位统一对应车辆前进方向。
+        cumulativeOutputCount += (int64_t)count * directionSign;
 
         pushSpeedWindow(count, dtUs);
 
@@ -207,10 +212,10 @@ float CustomEncoder::getRealSpeedKMH() {
             rawMeasurementValid = abs(rawMeasuredSpeed) <= Config::ENCODER_MAX_VALID_SPEED_KMH;
         }
 
-        // 控制链直接使用40ms快速速度，不再叠加原有60ms一阶低通。
-        // 陷波目前明确旁路，待确认波动阶次后再接在此处。
+        // 编码器层直接输出40ms快速速度，不叠加原有60ms一阶低通；
+        // 控制器另行生成中值/陷波反馈，安全判断始终保留这里的快速速度。
         if (count != 0) {
-            // PCNT不给出单个边沿时间戳；用当前20ms结算时刻近似最后活动时间，
+            // PCNT不给出单个边沿时间戳；用当前10ms结算时刻近似最后活动时间，
             // 误差上限约一个发布周期，不再被前一bin中的旧计数反复续期。
             lastPulseUs = now;
             stopTimeoutPublished = false;
@@ -290,4 +295,11 @@ uint32_t CustomEncoder::getControlSampleId() const {
 
 float CustomEncoder::getControlSampleDt() const {
     return controlSampleDt;
+}
+
+float CustomEncoder::getRelativeSprocketPhaseDeg() const {
+    const int64_t countsPerRev = Config::ENCODER_COUNTS_PER_SPROCKET_REV;
+    int64_t phaseCount = cumulativeOutputCount % countsPerRev;
+    if (phaseCount < 0) phaseCount += countsPerRev;
+    return phaseCount * (360.0f / (float)countsPerRev);
 }

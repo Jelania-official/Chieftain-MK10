@@ -307,7 +307,7 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
             engineCmd = 0.0f;
         }
 
-        // 相反扳机先只充当刹车。必须连续保持2秒且车辆接近停稳，才授权新方向。
+        // 相反扳机先只充当刹车。车辆接近停稳后继续保持设定时间，才授权新方向。
         bool directionChangeBraking = requestedDir != 0 && driveDirection != 0 &&
                                       requestedDir != driveDirection;
         if (directionChangeBraking) {
@@ -316,7 +316,7 @@ void TankChassis::processKinematics(float triggerL, float triggerR, float joyX, 
             raw_throttle = 0.0f;
             engineCmd = 0.0f;
             bool nearlyStopped = abs(v_real) <= Config::DIRECTION_CHANGE_STOP_SPEED_KMH;
-            // 反向输入在车辆仍运动时只负责刹车；真正的2秒确认从接近静止后才开始。
+            // 反向输入在车辆仍运动时只负责刹车；换向确认从接近静止后才开始计时。
             if (!nearlyStopped) {
                 pendingDriveDirection = requestedDir;
                 directionChangeSinceMs = 0;
@@ -561,18 +561,24 @@ void TankChassis::processDirectTrackPwm(float leftPwm, float rightPwm) {
     }
 
 // 输出 telemetry 时不直接暴露 TankTrack 对象，避免上层误改底盘内部状态。
-void TankChassis::getTrackTelemetry(float& leftTarget, float& leftControlActual, float& leftDisplayActual,
-                           float& leftPwm, bool& leftStalled,
-                           float& rightTarget, float& rightControlActual, float& rightDisplayActual,
-                           float& rightPwm, bool& rightStalled) const {
+void TankChassis::getTrackTelemetry(float& leftTarget, float& leftFastActual,
+                           float& leftControlActual, float& leftDisplayActual,
+                           float& leftPhaseDeg, float& leftPwm, bool& leftStalled,
+                           float& rightTarget, float& rightFastActual,
+                           float& rightControlActual, float& rightDisplayActual,
+                           float& rightPhaseDeg, float& rightPwm, bool& rightStalled) const {
         leftTarget = leftTrack.targetSpeed;
+        leftFastActual = leftTrack.fastSpeed;
         leftControlActual = leftTrack.currentSpeed;
         leftDisplayActual = leftTrack.telemetrySpeed;
+        leftPhaseDeg = leftTrack.encoder.getRelativeSprocketPhaseDeg();
         leftPwm = leftTrack.lastPwm;
         leftStalled = leftTrack.stallLatched;
         rightTarget = rightTrack.targetSpeed;
+        rightFastActual = rightTrack.fastSpeed;
         rightControlActual = rightTrack.currentSpeed;
         rightDisplayActual = rightTrack.telemetrySpeed;
+        rightPhaseDeg = rightTrack.encoder.getRelativeSprocketPhaseDeg();
         rightPwm = rightTrack.lastPwm;
         rightStalled = rightTrack.stallLatched;
 }

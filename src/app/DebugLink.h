@@ -12,14 +12,18 @@ struct DebugTelemetry {
     uint32_t timeMs = 0;
 
     float leftTarget = 0.0f;
+    float leftFastActual = 0.0f;
     float leftControlActual = 0.0f;
     float leftDisplayActual = 0.0f;
+    float leftPhaseDeg = 0.0f;
     float leftPwm = 0.0f;
     bool leftStalled = false;
 
     float rightTarget = 0.0f;
+    float rightFastActual = 0.0f;
     float rightControlActual = 0.0f;
     float rightDisplayActual = 0.0f;
+    float rightPhaseDeg = 0.0f;
     float rightPwm = 0.0f;
     bool rightStalled = false;
 

@@ -52,6 +52,7 @@ private:
     float displayMeasuredSpeed = 0.0f;
     float lastSpeed = 0.0f;
     float displaySpeed = 0.0f;
+    int64_t cumulativeOutputCount = 0;
     uint32_t controlSampleId = 0;
     float controlSampleDt = 0.0f;
     bool stopTimeoutPublished = false;
@@ -72,7 +73,7 @@ public:
     // 配置 PCNT 计数模式、滤波和初始采样时间。
     void init();
 
-    // 每20ms发布一次最近40ms的重叠窗口速度；最近一圈平均仅用于平滑显示。
+    // 每10ms发布一次最近40ms的重叠窗口速度；最近一圈平均仅用于平滑显示。
     float getRealSpeedKMH();
 
     // 返回额外平滑的遥测速度，不参与 PI 和堵转判断。
@@ -81,4 +82,8 @@ public:
     // 每产生一个新的有效控制测速（含首次超时归零）就递增，用于同步 PID 的 D 项。
     uint32_t getControlSampleId() const;
     float getControlSampleDt() const;
+
+    // 增量编码器没有绝对零位；返回本次启动内0~360度的主动轮相对相位。
+    // 该值只用于机械周期诊断，不参与速度控制和安全判断。
+    float getRelativeSprocketPhaseDeg() const;
 };
